@@ -15,6 +15,43 @@
 
 namespace {
 
+// NtQueryObject is resolved at run time so the probe builds unchanged with
+// MSVC and MinGW toolchains (winternl.h does not declare it everywhere).
+using NtQueryObjectFn = NTSTATUS_(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+
+NtQueryObjectFn nt_query_object() {
+    static NtQueryObjectFn fn = reinterpret_cast<NtQueryObjectFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject"));
+    return fn;
+}
+
+// NtQueryObject(ObjectBasicInformation) is strict about the buffer length:
+// a mismatch is answered with STATUS_INFO_LENGTH_MISMATCH and the call
+// carries no length hint back. The accepted size differs between Windows
+// builds, so it is discovered by probing.
+ULONG query_granted_access(HANDLE h, NtQueryObjectFn nqobj, const char* tag) {
+    if (!h || !nqobj) return 0;
+    UCHAR buf[0x40]{};
+    for (ULONG len = 8; len <= sizeof(buf); len += 4) {
+        ULONG need = 0;
+        NTSTATUS_ st = nqobj(h, 0, buf, len, &need);
+        if (st >= 0) {
+            printf("  NtQueryObject[%s] ok len=%lu need=%lu\n", tag, len, need);
+            return reinterpret_cast<OBJECT_BASIC_INFORMATION_*>(buf)->GrantedAccess;
+        }
+        if (need && need <= sizeof(buf) && need != len) {
+            ULONG need2 = 0;
+            NTSTATUS_ st2 = nqobj(h, 0, buf, need, &need2);
+            if (st2 >= 0) {
+                printf("  NtQueryObject[%s] ok len=%lu need=%lu\n", tag, need, need2);
+                return reinterpret_cast<OBJECT_BASIC_INFORMATION_*>(buf)->GrantedAccess;
+            }
+        }
+    }
+    printf("  NtQueryObject[%s] no accepted length in 8..%lu\n", tag, sizeof(buf));
+    return 0;
+}
+
 DWORD find_pid() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -941,15 +978,52 @@ int wmain(int argc, wchar_t** argv) {
 
         printf("SeDebugPrivilege=%d\n", enable_debug_privilege() ? 1 : 0);
 
+        // --- Elevation check: err=5 is only interpretable once we know
+        // whether this process is elevated (unelevated vs protected). ---
+        {
+            HANDLE tok = nullptr;
+            DWORD elevated = 0;
+            BOOL have_tok = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok);
+            if (have_tok) {
+                TOKEN_ELEVATION te{};
+                DWORD tl = sizeof(te);
+                if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &tl)) {
+                    elevated = te.TokenIsElevated;
+                }
+                CloseHandle(tok);
+            }
+            printf("elevated=%d tok=%d\n", elevated ? 1 : 0, have_tok ? 1 : 0);
+        }
+
         HANDLE ph = OpenProcess(PROCESS_ALL_ACCESS, FALSE, hp);
         printf("open host=%p err=%lu\n", ph, GetLastError());
         // Continue even if PROCESS_ALL_ACCESS fails — the probe gathers
         // granted-mask and open-path data even without full rights.
         if (!ph) ph = nullptr;
 
+        // Read-only fallback: PROCESS_QUERY_LIMITED_INFORMATION is enough for
+        // IsWow64Process and GetProcessMitigationPolicy, so the probe still
+        // reports the host architecture and mitigations when the full mask
+        // is denied (unelevated run).
+        HANDLE h_lim = nullptr;
+        if (!ph) {
+            h_lim = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, hp);
+            printf("open_limited host=%p err=%lu\n", h_lim, GetLastError());
+        }
+
         BOOL wow = FALSE;
-        IsWow64Process(ph, &wow);
-        printf("wow64=%d\n", wow ? 1 : 0);
+        HANDLE wow_handle = ph ? ph : h_lim;
+        if (!wow_handle) {
+            // IsWow64Process(NULL, ...) silently fails and reports a
+            // perfectly good 32-bit host as wow64=0.
+            printf("wow64=unknown (no handle to host)\n");
+        } else {
+            if (!IsWow64Process(wow_handle, &wow)) {
+                printf("wow64=query_failed err=%lu\n", GetLastError());
+            } else {
+                printf("wow64=%d\n", wow ? 1 : 0);
+            }
+        }
 
         uint64_t peb32 = 0;
         uint32_t ret = 0;
@@ -962,7 +1036,7 @@ int wmain(int argc, wchar_t** argv) {
 
         uint32_t k32 = wow_module32(ph, peb32, L"kernel32.dll");
         printf("kernel32_32=0x%X\n", k32);
-        if (!k32) { CloseHandle(ph); return 1; }
+        if (!k32) printf("warning: kernel32 32-bit module not found\n");
 
         uint32_t p_open = wow_export32(ph, k32, "OpenProcess");
         uint32_t p_alloc = wow_export32(ph, k32, "VirtualAllocEx");
@@ -973,23 +1047,21 @@ int wmain(int argc, wchar_t** argv) {
         DWORD game = pid_by_name(L"FortniteClient-Win64-Shipping.exe");
         printf("game pid=%lu\n", static_cast<unsigned long>(game));
 
+        NtQueryObjectFn nqobj = nt_query_object();
+        if (!nqobj) printf("warning: NtQueryObject not exported by ntdll\n");
+
         HANDLE gh = nullptr;
         ULONG granted_mask = 0;
         if (game) {
             gh = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, game);
             if (gh) {
-                // NtQueryObject with ObjectBasicInformation (info class 0)
-                // on a 0x40-byte buffer; this works on a valid handle regardless of mask
-                UCHAR basic_buf[0x40]{};
-                NTSTATUS_ qst = NtQueryObject(gh, 0, basic_buf, sizeof(basic_buf), nullptr);
-                if (qst >= 0) {
-                    // Parse OBJECT_BASIC_INFORMATION at the start of the buffer
-                    auto* basic = reinterpret_cast<OBJECT_BASIC_INFORMATION_*>(basic_buf);
-                    granted_mask = basic->GrantedAccess;
+                // NtQueryObject with ObjectBasicInformation (info class 0).
+                // The kernel is strict about the length, so the accepted size
+                // is discovered at run time.
+                granted_mask = query_granted_access(gh, nqobj, "game");
+                if (granted_mask) {
                     printf("granted_mask=0x%08lX (via NtQueryObject ObjectBasicInformation)\n",
                            static_cast<unsigned long>(granted_mask));
-                } else {
-                    printf("NtQueryObject failed 0x%08lX\n", static_cast<unsigned long>(qst));
                 }
                 CloseHandle(gh);
             } else {
@@ -1005,76 +1077,112 @@ int wmain(int argc, wchar_t** argv) {
                                                          "GetProcessMitigationPolicy"));
         auto query_policies = [&](HANDLE h, const char* label) {
             if (!gpm) { printf("%s: GetProcessMitigationPolicy unavailable\n", label); return; }
+            if (!h) { printf("--- %s mitigations ---\nno handle\n", label); return; }
             printf("--- %s mitigations ---\n", label);
-            // Policy indices: 0=MitigationPolicies, 2=ControlFlowGuardPolicy, 7=SignaturePolicy
-            const int ps[] = { 0, 2, 7 };
-            for (int i = 0; i < 3; ++i) {
+            // Policy indices: 0=MitigationPolicies, 2=ACG/DynamicCode, 6=ImageLoad, 7=CFG, 8=Signature, 10=StrictCriteria,
+            const int ps[] = { 0, 2, 6, 7, 8, 10 };
+            for (int i = 0; i < 6; ++i) {
                 DWORD v = 0;
                 BOOL ok = gpm(h, ps[i], &v, sizeof(v));
                 printf("policy[%2d] = 0x%08lX%s\n", ps[i], static_cast<unsigned long>(v),
                        ok ? "" : " (query failed)");
             }
         };
-        query_policies(ph, "EAC");
+        query_policies(ph ? ph : h_lim, "EAC");
         if (game) {
             HANDLE gh2 = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, game);
             if (gh2) { query_policies(gh2, "GAME"); CloseHandle(gh2); }
         }
 
-        // --- Both open paths: NtOpenProcess with PROCESS_ALL_ACCESS and 0x11F145 ---
-        // We use the NtApi variant since OpenProcess wraps NtOpenProcess
-        NTSTATUS_ nt_all = STATUS_SUCCESS, nt_11f145 = STATUS_SUCCESS;
-        HANDLE h_all = nullptr, h_11f145 = nullptr;
+        // --- Both open paths: full mask and the EAC whitelist mask ---
+        // NtOpenProcess is used so the real NTSTATUS is reported instead of a
+        // Win32 error code; each path also prints the mask the kernel granted.
+        using NtOpenProcessFn = NTSTATUS_(NTAPI*)(HANDLE*, ACCESS_MASK,
+                                                   OBJECT_ATTRIBUTES_*, CLIENT_ID_*);
+        auto nop = reinterpret_cast<NtOpenProcessFn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenProcess"));
 
-        // Path 1: PROCESS_ALL_ACCESS
-        {
-            using QIP2 = NTSTATUS_(__stdcall*)(HANDLE, ACCESS_MASK, ULONG, ACCESS_MASK*, ULONG, HANDLE*, ACCESS_MASK);
-            // Simpler: just try OpenProcess and capture NTSTATUS via RtlNtStatus
-            h_all = OpenProcess(PROCESS_ALL_ACCESS, FALSE, hp);
-            nt_all = (h_all ? STATUS_SUCCESS : GetLastError());
-            printf("open_path ALL_ACCESS=%p ntstatus=0x%08lX err=%lu\n",
-                   h_all, static_cast<unsigned long>(nt_all), GetLastError());
-        }
-
-        // Path 2: exact 0x11F145
-        {
-            h_11f145 = OpenProcess(0x11F145, FALSE, hp);
-            nt_11f145 = (h_11f145 ? STATUS_SUCCESS : GetLastError());
-            printf("open_path 0x11F145=%p ntstatus=0x%08lX err=%lu\n",
-                   h_11f145, static_cast<unsigned long>(nt_11f145), GetLastError());
-        }
-
-        // If ALL_ACCESS succeeded, also check the granted mask on that handle
-        ULONG granted_all = 0, granted_11f145 = 0;
-        if (h_all) {
-            // NtQueryObject on the ALL_ACCESS handle to get actual granted mask
-            struct { ULONG Attributes; ACCESS_MASK GrantedAccess; ULONG HandleCount;
-                     ULONG PointerCount; } basic{};
-            NTSTATUS_ qst = NtQueryObject(h_all, 0, &basic, sizeof(basic), nullptr);
-            if (qst >= 0) {
-                granted_all = basic.GrantedAccess;
-                printf("granted_mask ALL_ACCESS handle=0x%08lX\n", static_cast<unsigned long>(granted_all));
+        auto probe_open = [&](DWORD target_pid, ACCESS_MASK mask, const char* label) {
+            HANDLE h = nullptr;
+            NTSTATUS_ sts = static_cast<NTSTATUS_>(-1);
+            if (nop) {
+                OBJECT_ATTRIBUTES_ oa{};
+                CLIENT_ID_ cid{};
+                cid.UniqueProcess = target_pid;
+                cid.UniqueThread = 0;
+                oa.Length = sizeof(oa);
+                sts = nop(&h, mask, &oa, &cid);
+            } else {
+                h = OpenProcess(mask, FALSE, target_pid);
+                sts = h ? STATUS_SUCCESS : static_cast<NTSTATUS_>(GetLastError());
             }
-            CloseHandle(h_all);
-        }
-        if (h_11f145) {
-            struct { ULONG Attributes; ACCESS_MASK GrantedAccess; ULONG HandleCount;
-                     ULONG PointerCount; } basic{};
-            NTSTATUS_ qst = NtQueryObject(h_11f145, 0, &basic, sizeof(basic), nullptr);
-            if (qst >= 0) {
-                granted_11f145 = basic.GrantedAccess;
-                printf("granted_mask 0x11F145 handle=0x%08lX\n", static_cast<unsigned long>(granted_11f145));
+            ULONG granted = 0;
+            if (h) {
+                granted = query_granted_access(h, nqobj, label);
+                printf("open_path %s pid=%lu mask=0x%08lX handle=%p ntstatus=0x%08lX granted=0x%08lX\n",
+                       label, static_cast<unsigned long>(target_pid),
+                       static_cast<unsigned long>(mask), h,
+                       static_cast<unsigned long>(sts), static_cast<unsigned long>(granted));
+            } else {
+                printf("open_path %s pid=%lu mask=0x%08lX handle=null ntstatus=0x%08lX\n",
+                       label, static_cast<unsigned long>(target_pid),
+                       static_cast<unsigned long>(mask), static_cast<unsigned long>(sts));
             }
-            CloseHandle(h_11f145);
+            return h;
+        };
+
+        probe_open(hp, PROCESS_ALL_ACCESS, "EAC ALL_ACCESS");
+        probe_open(hp, 0x11F145, "EAC 0x11F145");
+
+        if (game) {
+            probe_open(game, PROCESS_ALL_ACCESS, "GAME ALL_ACCESS");
+            probe_open(game, 0x11F145, "GAME 0x11F145");
+            // Minimum rights a classic injector needs: VM op/write/read plus
+            // thread creation.
+            probe_open(game, 0x0008 | 0x0010 | 0x0020 | 0x0004, "GAME vm+thread");
+
+            // Does the mask we hold actually allow VM operations on the game?
+            HANDLE hg = OpenProcess(PROCESS_ALL_ACCESS, FALSE, game);
+            if (hg) {
+                void* mem = VirtualAllocEx(hg, nullptr, 0x1000,
+                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                printf("game vm alloc=%p err=%lu\n", mem, GetLastError());
+                if (mem) VirtualFreeEx(hg, mem, 0, MEM_RELEASE);
+                CloseHandle(hg);
+            } else {
+                printf("game vm alloc skipped: no full handle (err=%lu)\n", GetLastError());
+            }
         }
 
         // --- Build and run the stub (existing logic continues below) ---
-        uint8_t* code = static_cast<uint8_t*>(
-            VirtualAllocEx(ph, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-        printf("stub alloc=%p err=%lu\n", code, GetLastError());
-        if (!code) { CloseHandle(ph); return 1; }
+        // The stub is 32-bit code and addresses everything with absolute
+        // imm32, so the allocation must land below 4 GB. Reserve with a low
+        // hint instead of letting the allocator choose.
+        uint8_t* code = nullptr;
+        if (ph) {
+            static const ULONG_PTR kHints[] = { 0x10000000, 0x18000000, 0x20000000,
+                                                0x28000000, 0x30000000, 0x40000000,
+                                                0x50000000 };
+            for (size_t i = 0; i < _countof(kHints); ++i) {
+                code = static_cast<uint8_t*>(
+                    VirtualAllocEx(ph, reinterpret_cast<LPVOID>(kHints[i]), 0x2000,
+                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                if (code) break;
+            }
+            printf("stub alloc=%p err=%lu\n", code, GetLastError());
+            if (code && (reinterpret_cast<uintptr_t>(code) + 0x2000ull) > 0xFFFFFFFFull) {
+                printf("stub alloc too high for 32-bit imm32 addressing: %p\n", code);
+                VirtualFreeEx(ph, code, 0, MEM_RELEASE);
+                code = nullptr;
+            }
+        } else {
+            printf("stub alloc skipped: no host handle\n");
+        }
+        if (!code) { if (ph) CloseHandle(ph); return 1; }
 
-        uint32_t buf = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(code)) + 0x100;
+        // The stub writes its results back, so the results live on their own
+        // read-write page; only the code page is flipped to execute-read.
+        uint32_t buf = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(code)) + 0x1000;
         std::vector<uint8_t> b;
         auto imm32 = [&](uint32_t v) {
             b.push_back(v & 0xFF);
@@ -1083,25 +1191,93 @@ int wmain(int argc, wchar_t** argv) {
             b.push_back((v >> 24) & 0xFF);
         };
 
+        // 32-bit ntdll gives the stub NtQueryObject so it can report the
+        // access mask the kernel actually granted EAC on the game.
+        uint32_t n32 = wow_module32(ph, peb32, L"ntdll.dll");
+        uint32_t p_ntq = wow_export32(ph, n32, "NtQueryObject");
+        printf("ntdll_32=0x%X NtQueryObject=0x%X\n", n32, p_ntq);
+
+        // Result block (32-bit, in the data page):
+        //   [0x00] handle  = OpenProcess(game, PROCESS_ALL_ACCESS)
+        //   [0x04] status  = NtQueryObject status for that handle
+        //   [0x08] granted = access mask the kernel granted on that handle
+        //   [0x0C] alloc   = VirtualAllocEx result with that handle
+        //   [0x10] lasterr = GetLastError after that VirtualAllocEx
+        //   [0x14] handle_w = OpenProcess(game, 0x11F145)
+        //   [0x18] granted_w = access mask granted on the 0x11F145 handle
+        //   [0x1C] status_w  = NtQueryObject status for that handle
+        //   [0x20] alloc_w   = VirtualAllocEx result with the 0x11F145 handle
+        //   [0x24] lasterr_w = GetLastError after that VirtualAllocEx
+        //   [0x40] OBJECT_BASIC_INFORMATION buffer (56 bytes)
+        //   [0x60] second OBJECT_BASIC_INFORMATION buffer (56 bytes)
+
         b.push_back(0x68); imm32(game);        // push game pid
-        b.push_back(0x6A); b.push_back(0x00);  // push 0
+        b.push_back(0x6A); b.push_back(0x00);  // push 0 (bInheritHandle)
         b.push_back(0x68); imm32(0x1FFFFF);    // push PROCESS_ALL_ACCESS
         b.push_back(0xB8); imm32(p_open);      // mov eax, OpenProcess
         b.push_back(0xFF); b.push_back(0xD0);  // call eax
-        b.push_back(0xA3); imm32(buf + 0);     // mov [buf], eax
+        b.push_back(0xA3); imm32(buf + 0x00);  // mov [buf+0x00], eax
+
+        if (p_ntq) {
+            // NtQueryObject(handle, 0, buf+0x40, 56, &need)
+            b.push_back(0x68); imm32(buf + 0x58);  // push &need
+            b.push_back(0x68); imm32(56);          // push length
+            b.push_back(0x68); imm32(buf + 0x40);  // push ObjectInformation
+            b.push_back(0x6A); b.push_back(0x00);  // push class 0
+            b.push_back(0xFF); b.push_back(0x35); imm32(buf + 0x00);  // push [buf]
+            b.push_back(0xB8); imm32(p_ntq);        // mov eax, NtQueryObject
+            b.push_back(0xFF); b.push_back(0xD0);    // call eax
+            b.push_back(0xA3); imm32(buf + 0x04);    // mov [buf+0x04], eax
+            b.push_back(0xA1); imm32(buf + 0x44);    // mov eax, [buf+0x44] (granted)
+            b.push_back(0xA3); imm32(buf + 0x08);    // mov [buf+0x08], eax
+        }
 
         b.push_back(0x6A); b.push_back(0x04);  // PAGE_READWRITE
         b.push_back(0x68); imm32(0x3000);      // MEM_COMMIT|MEM_RESERVE
         b.push_back(0x68); imm32(0x1000);      // 4 KB
         b.push_back(0x6A); b.push_back(0x00);  // lpAddress = 0
-        b.push_back(0xFF); b.push_back(0x35); imm32(buf + 0);  // push [buf]
+        b.push_back(0xFF); b.push_back(0x35); imm32(buf + 0x00);  // push [buf]
         b.push_back(0xB8); imm32(p_alloc);     // mov eax, VirtualAllocEx
         b.push_back(0xFF); b.push_back(0xD0);  // call eax
-        b.push_back(0xA3); imm32(buf + 4);     // mov [buf+4], eax
+        b.push_back(0xA3); imm32(buf + 0x0C);  // mov [buf+0x0C], eax
 
         b.push_back(0xB8); imm32(p_gle);       // mov eax, GetLastError
         b.push_back(0xFF); b.push_back(0xD0);  // call eax
-        b.push_back(0xA3); imm32(buf + 8);     // mov [buf+8], eax
+        b.push_back(0xA3); imm32(buf + 0x10);  // mov [buf+0x10], eax
+
+        // --- same again with the whitelist mask 0x11F145 ---
+        b.push_back(0x68); imm32(game);        // push game pid
+        b.push_back(0x6A); b.push_back(0x00);  // push 0
+        b.push_back(0x68); imm32(0x11F145);    // push 0x11F145
+        b.push_back(0xB8); imm32(p_open);      // mov eax, OpenProcess
+        b.push_back(0xFF); b.push_back(0xD0);  // call eax
+        b.push_back(0xA3); imm32(buf + 0x14);  // mov [buf+0x14], eax
+
+        if (p_ntq) {
+            b.push_back(0x68); imm32(buf + 0x5C);  // push &need
+            b.push_back(0x68); imm32(56);          // push length
+            b.push_back(0x68); imm32(buf + 0x60);  // push ObjectInformation
+            b.push_back(0x6A); b.push_back(0x00);  // push class 0
+            b.push_back(0xFF); b.push_back(0x35); imm32(buf + 0x14);  // push [buf+0x14]
+            b.push_back(0xB8); imm32(p_ntq);        // mov eax, NtQueryObject
+            b.push_back(0xFF); b.push_back(0xD0);    // call eax
+            b.push_back(0xA3); imm32(buf + 0x1C);    // mov [buf+0x1C], eax
+            b.push_back(0xA1); imm32(buf + 0x64);    // mov eax, [buf+0x64] (granted)
+            b.push_back(0xA3); imm32(buf + 0x18);    // mov [buf+0x18], eax
+        }
+
+        b.push_back(0x6A); b.push_back(0x04);  // PAGE_READWRITE
+        b.push_back(0x68); imm32(0x3000);      // MEM_COMMIT|MEM_RESERVE
+        b.push_back(0x68); imm32(0x1000);      // 4 KB
+        b.push_back(0x6A); b.push_back(0x00);  // lpAddress = 0
+        b.push_back(0xFF); b.push_back(0x35); imm32(buf + 0x14);  // push [buf+0x14]
+        b.push_back(0xB8); imm32(p_alloc);     // mov eax, VirtualAllocEx
+        b.push_back(0xFF); b.push_back(0xD0);  // call eax
+        b.push_back(0xA3); imm32(buf + 0x20);  // mov [buf+0x20], eax
+
+        b.push_back(0xB8); imm32(p_gle);       // mov eax, GetLastError
+        b.push_back(0xFF); b.push_back(0xD0);  // call eax
+        b.push_back(0xA3); imm32(buf + 0x24);  // mov [buf+0x24], eax
 
         b.push_back(0x33); b.push_back(0xC0);  // xor eax, eax
         b.push_back(0xC3);                     // ret
@@ -1109,12 +1285,42 @@ int wmain(int argc, wchar_t** argv) {
         printf("stub len=%u\n", static_cast<unsigned>(b.size()));
         WriteProcessMemory(ph, code, b.data(), b.size(), nullptr);
 
+        // Flip to execute-only-read: a writable+executable page trips ACG
+        // and is rejected by hardened processes.
+        {
+            DWORD old_prot = 0;
+            BOOL pok = VirtualProtectEx(ph, code, 0x1000, PAGE_EXECUTE_READ, &old_prot);
+            printf("stub protect RX=%d err=%lu\n", pok ? 1 : 0, GetLastError());
+        }
+
         using SPVCT = BOOL(__stdcall*)(HANDLE, void*, SIZE_T, ULONG, void*);
         auto spv = reinterpret_cast<SPVCT>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessValidCallTargets"));
+        if (!spv) {
+            spv = reinterpret_cast<SPVCT>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "SetProcessValidCallTargets"));
+            if (spv) printf("cfg api from ntdll\n");
+        }
         if (spv) {
-            CFG_CALL_TARGET_INFO info{};
-            BOOL ok = spv(ph, code, 0x1000, 1, &info);
+            // Register the stub entry as a valid CFG call target: EAC runs
+            // with Control Flow Guard enabled (policy[7] = 1), so an
+            // unregistered indirect call target kills the thread.
+            struct CFG_CTI {
+                ULONG  Flags;
+                ULONG  Target;
+                ULONG  FunctionCount;
+                PVOID  Targets;
+                ULONG  Metadata;
+                ULONG  ProcessTag;
+            } info{};
+            ULONG target = static_cast<ULONG>(reinterpret_cast<uintptr_t>(code));
+            info.Flags = 0;
+            info.Target = target;
+            info.FunctionCount = 1;
+            info.Targets = &target;
+            info.Metadata = 0;
+            info.ProcessTag = 0;
+            BOOL ok = spv(ph, nullptr, 0, 0, &info);
             printf("cfg mark=%d err=%lu\n", ok ? 1 : 0, GetLastError());
         } else {
             printf("no SetProcessValidCallTargets\n");
@@ -1123,20 +1329,120 @@ int wmain(int argc, wchar_t** argv) {
         HANDLE th = CreateRemoteThread(ph, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(code),
                                        nullptr, 0, nullptr);
         printf("thread=%p err=%lu\n", th, GetLastError());
+        uint32_t res[10]{};
+        bool stub_ok = false;
+        auto print_stub_results = [&](const char* tag, const uint32_t* r) {
+            printf("%s handle=0x%X granted=0x%08lX ntq_status=0x%08lX alloc=0x%X lasterr=%lu\n",
+                   tag, r[0], static_cast<unsigned long>(r[2]),
+                   static_cast<unsigned long>(r[1]), r[3], static_cast<unsigned long>(r[4]));
+            printf("%s whitelist_handle=0x%X whitelist_granted=0x%08lX whitelist_ntq=0x%08lX "
+                   "whitelist_alloc=0x%X whitelist_lasterr=%lu\n",
+                   tag, r[5], static_cast<unsigned long>(r[6]),
+                   static_cast<unsigned long>(r[7]), r[8], static_cast<unsigned long>(r[9]));
+        };
         if (th) {
             WaitForSingleObject(th, 10000);
             DWORD ec = 0;
             GetExitCodeThread(th, &ec);
 
-            uint32_t res[3]{};
             ReadProcessMemory(ph, reinterpret_cast<void*>(static_cast<uintptr_t>(buf)), res, sizeof(res), nullptr);
-            printf("thread exit=0x%08lX handle=0x%X alloc=0x%X lasterr=%lu\n",
-                   static_cast<unsigned>(ec), res[0], res[1], static_cast<unsigned long>(res[2]));
+            printf("thread exit=0x%08lX\n", static_cast<unsigned>(ec));
+            print_stub_results("stub", res);
+            stub_ok = (res[0] != 0);
             CloseHandle(th);
+        }
+
+        // --- Fallback: WOW64 thread start ---
+        // A 64-bit caller that starts a thread in a 32-bit process can end up
+        // with a mismatched startup context. The reliable route is a
+        // suspended thread whose WOW64 context is installed with
+        // NtSetContextThread before the thread is resumed.
+        if (!stub_ok && wow) {
+            printf("--- wow64 fallback: suspended thread + NtSetContextThread ---\n");
+
+            // x86 CONTEXT as the kernel expects it for a WOW64 thread.
+            struct X86_CONTEXT {
+                DWORD ContextFlags;
+                DWORD Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+                BYTE  FloatSave[112];
+                DWORD SegGs, SegFs, SegEs, SegDs;
+                DWORD Edi, Esi, Ebx, Edx, Ecx, Eax;
+                DWORD Ebp, Eip, SegCs, EFlags, Esp, SegSs;
+                BYTE  ExtendedRegisters[512];
+            };
+
+            // 32-bit stack and context block inside the target.
+            void* stack32 = VirtualAllocEx(ph, reinterpret_cast<LPVOID>(0x00030000), 0x10000,
+                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            void* ctx32 = VirtualAllocEx(ph, reinterpret_cast<LPVOID>(0x00050000), 0x1000,
+                                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            printf("wow64 stack=%p ctx=%p err=%lu\n", stack32, ctx32, GetLastError());
+
+            if (stack32 && ctx32) {
+                uint32_t exit_thunk = wow_export32(ph, k32, "ExitThread");
+                uint32_t stub_addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(code));
+                uint32_t stack_top = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(stack32)) + 0x10000;
+
+                // return address + argument for the stub's `ret`
+                uint32_t frame[2] = { exit_thunk, 0 };
+                WriteProcessMemory(ph, reinterpret_cast<void*>(stack_top - 8), frame, sizeof(frame), nullptr);
+
+                X86_CONTEXT c{};
+                c.ContextFlags = 0x00010001;   // WOW64_CONTEXT_CONTROL
+                c.Dr0 = c.Dr1 = c.Dr2 = c.Dr3 = c.Dr6 = c.Dr7 = 0;
+                c.SegGs = c.SegFs = c.SegEs = c.SegDs = 0x23;
+                c.SegCs = 0x1B;
+                c.SegSs = 0x23;
+                c.EFlags = 0x246;              // IF set
+                c.Eip = stub_addr;
+                c.Esp = stack_top - 8;
+                c.Ebp = 0;
+                WriteProcessMemory(ph, ctx32, &c, sizeof(c), nullptr);
+
+                using NtCTE = NTSTATUS_(NTAPI*)(HANDLE*, ACCESS_MASK, void*, HANDLE, void*,
+                                                void*, ULONG, ULONG, ULONG, ULONG, void*);
+                using NtSCT = NTSTATUS_(NTAPI*)(HANDLE, void*);
+                using NtRT = DWORD(WINAPI*)(HANDLE);
+                auto cte = reinterpret_cast<NtCTE>(
+                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx"));
+                auto sct = reinterpret_cast<NtSCT>(
+                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetContextThread"));
+                auto rt = reinterpret_cast<NtRT>(
+                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtResumeThread"));
+
+                HANDLE th2 = nullptr;
+                if (cte) {
+                    NTSTATUS_ st2 = cte(&th2, 0x1FFFFF, nullptr, ph,
+                                        reinterpret_cast<void*>(static_cast<uintptr_t>(stub_addr)),
+                                        nullptr, 1 /* CREATE_SUSPENDED */, 0, 0, 0, ctx32);
+                    printf("wow64 NtCreateThreadEx status=0x%08lX thread=%p\n",
+                           static_cast<unsigned>(st2), th2);
+                }
+                if (th2 && sct) {
+                    NTSTATUS_ st3 = sct(th2, ctx32);
+                    printf("wow64 NtSetContextThread status=0x%08lX\n", static_cast<unsigned>(st3));
+                }
+                if (th2 && rt) {
+                    rt(th2);
+                    WaitForSingleObject(th2, 10000);
+                    DWORD ec2 = 0;
+                    GetExitCodeThread(th2, &ec2);
+                    uint32_t res2[10]{};
+                    ReadProcessMemory(ph, reinterpret_cast<void*>(static_cast<uintptr_t>(buf)),
+                                      res2, sizeof(res2), nullptr);
+                    printf("wow64 thread exit=0x%08lX\n", static_cast<unsigned>(ec2));
+                    print_stub_results("wow64", res2);
+                    stub_ok = (res2[0] != 0);
+                    CloseHandle(th2);
+                }
+            }
+            if (stack32) VirtualFreeEx(ph, stack32, 0, MEM_RELEASE);
+            if (ctx32) VirtualFreeEx(ph, ctx32, 0, MEM_RELEASE);
         }
 
         VirtualFreeEx(ph, code, 0, MEM_RELEASE);
         CloseHandle(ph);
+        if (h_lim) CloseHandle(h_lim);
         return 0;
     }
 

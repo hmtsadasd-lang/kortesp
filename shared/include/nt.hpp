@@ -1,4 +1,5 @@
 #pragma once
+#include <windows.h>
 #include <cstdint>
 
 using NTSTATUS_ = int32_t;
@@ -14,6 +15,25 @@ struct OBJECT_BASIC_INFORMATION_ {
     ULONG HandleCount;
     ULONG PointerCount;
 };
+
+struct CLIENT_ID_ { UPTR UniqueProcess, UniqueThread; };
+
+struct OBJECT_ATTRIBUTES_ {
+    ULONG       Length;
+    HANDLE      RootDirectory;
+    UNICODE_STRING_* ObjectName;
+    ULONG       Attributes;
+    PVOID       SecurityDescriptor;
+    PVOID       SecurityQualityOfService;
+};
+
+// STATUS_SUCCESS is not declared by every toolchain's headers.
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS_)0)
+#endif
+#ifndef STATUS_ACCESS_DENIED
+#define STATUS_ACCESS_DENIED ((NTSTATUS_)0xC0000022)
+#endif
 
 struct LDR_DATA_TABLE_ENTRY_ {
     void*    InLoadOrderLinks[2];
