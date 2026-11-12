@@ -943,7 +943,9 @@ int wmain(int argc, wchar_t** argv) {
 
         HANDLE ph = OpenProcess(PROCESS_ALL_ACCESS, FALSE, hp);
         printf("open host=%p err=%lu\n", ph, GetLastError());
-        if (!ph) return 1;
+        // Continue even if PROCESS_ALL_ACCESS fails — the probe gathers
+        // granted-mask and open-path data even without full rights.
+        if (!ph) ph = nullptr;
 
         BOOL wow = FALSE;
         IsWow64Process(ph, &wow);
@@ -967,9 +969,106 @@ int wmain(int argc, wchar_t** argv) {
         uint32_t p_gle = wow_export32(ph, k32, "GetLastError");
         printf("OpenProcess=0x%X VirtualAllocEx=0x%X GetLastError=0x%X\n", p_open, p_alloc, p_gle);
 
+        // --- Granted mask via NtQueryObject on the game process ---
         DWORD game = pid_by_name(L"FortniteClient-Win64-Shipping.exe");
         printf("game pid=%lu\n", static_cast<unsigned long>(game));
 
+        HANDLE gh = nullptr;
+        ULONG granted_mask = 0;
+        if (game) {
+            gh = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, game);
+            if (gh) {
+                // NtQueryObject with ObjectBasicInformation (info class 0)
+                // on a 0x40-byte buffer; this works on a valid handle regardless of mask
+                UCHAR basic_buf[0x40]{};
+                NTSTATUS_ qst = NtQueryObject(gh, 0, basic_buf, sizeof(basic_buf), nullptr);
+                if (qst >= 0) {
+                    // Parse OBJECT_BASIC_INFORMATION at the start of the buffer
+                    auto* basic = reinterpret_cast<OBJECT_BASIC_INFORMATION_*>(basic_buf);
+                    granted_mask = basic->GrantedAccess;
+                    printf("granted_mask=0x%08lX (via NtQueryObject ObjectBasicInformation)\n",
+                           static_cast<unsigned long>(granted_mask));
+                } else {
+                    printf("NtQueryObject failed 0x%08lX\n", static_cast<unsigned long>(qst));
+                }
+                CloseHandle(gh);
+            } else {
+                printf("open game failed %lu\n", GetLastError());
+            }
+        }
+
+        if (!game) { printf("granted_mask=0 err=game_not_found\n"); }
+
+        // --- Mitigation policies for EAC and game ---
+        using GPM = BOOL(WINAPI*)(HANDLE, int, void*, SIZE_T);
+        auto gpm = reinterpret_cast<GPM>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                         "GetProcessMitigationPolicy"));
+        auto query_policies = [&](HANDLE h, const char* label) {
+            if (!gpm) { printf("%s: GetProcessMitigationPolicy unavailable\n", label); return; }
+            printf("--- %s mitigations ---\n", label);
+            // Policy indices: 0=MitigationPolicies, 2=ControlFlowGuardPolicy, 7=SignaturePolicy
+            const int ps[] = { 0, 2, 7 };
+            for (int i = 0; i < 3; ++i) {
+                DWORD v = 0;
+                BOOL ok = gpm(h, ps[i], &v, sizeof(v));
+                printf("policy[%2d] = 0x%08lX%s\n", ps[i], static_cast<unsigned long>(v),
+                       ok ? "" : " (query failed)");
+            }
+        };
+        query_policies(ph, "EAC");
+        if (game) {
+            HANDLE gh2 = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, game);
+            if (gh2) { query_policies(gh2, "GAME"); CloseHandle(gh2); }
+        }
+
+        // --- Both open paths: NtOpenProcess with PROCESS_ALL_ACCESS and 0x11F145 ---
+        // We use the NtApi variant since OpenProcess wraps NtOpenProcess
+        NTSTATUS_ nt_all = STATUS_SUCCESS, nt_11f145 = STATUS_SUCCESS;
+        HANDLE h_all = nullptr, h_11f145 = nullptr;
+
+        // Path 1: PROCESS_ALL_ACCESS
+        {
+            using QIP2 = NTSTATUS_(__stdcall*)(HANDLE, ACCESS_MASK, ULONG, ACCESS_MASK*, ULONG, HANDLE*, ACCESS_MASK);
+            // Simpler: just try OpenProcess and capture NTSTATUS via RtlNtStatus
+            h_all = OpenProcess(PROCESS_ALL_ACCESS, FALSE, hp);
+            nt_all = (h_all ? STATUS_SUCCESS : GetLastError());
+            printf("open_path ALL_ACCESS=%p ntstatus=0x%08lX err=%lu\n",
+                   h_all, static_cast<unsigned long>(nt_all), GetLastError());
+        }
+
+        // Path 2: exact 0x11F145
+        {
+            h_11f145 = OpenProcess(0x11F145, FALSE, hp);
+            nt_11f145 = (h_11f145 ? STATUS_SUCCESS : GetLastError());
+            printf("open_path 0x11F145=%p ntstatus=0x%08lX err=%lu\n",
+                   h_11f145, static_cast<unsigned long>(nt_11f145), GetLastError());
+        }
+
+        // If ALL_ACCESS succeeded, also check the granted mask on that handle
+        ULONG granted_all = 0, granted_11f145 = 0;
+        if (h_all) {
+            // NtQueryObject on the ALL_ACCESS handle to get actual granted mask
+            struct { ULONG Attributes; ACCESS_MASK GrantedAccess; ULONG HandleCount;
+                     ULONG PointerCount; } basic{};
+            NTSTATUS_ qst = NtQueryObject(h_all, 0, &basic, sizeof(basic), nullptr);
+            if (qst >= 0) {
+                granted_all = basic.GrantedAccess;
+                printf("granted_mask ALL_ACCESS handle=0x%08lX\n", static_cast<unsigned long>(granted_all));
+            }
+            CloseHandle(h_all);
+        }
+        if (h_11f145) {
+            struct { ULONG Attributes; ACCESS_MASK GrantedAccess; ULONG HandleCount;
+                     ULONG PointerCount; } basic{};
+            NTSTATUS_ qst = NtQueryObject(h_11f145, 0, &basic, sizeof(basic), nullptr);
+            if (qst >= 0) {
+                granted_11f145 = basic.GrantedAccess;
+                printf("granted_mask 0x11F145 handle=0x%08lX\n", static_cast<unsigned long>(granted_11f145));
+            }
+            CloseHandle(h_11f145);
+        }
+
+        // --- Build and run the stub (existing logic continues below) ---
         uint8_t* code = static_cast<uint8_t*>(
             VirtualAllocEx(ph, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
         printf("stub alloc=%p err=%lu\n", code, GetLastError());

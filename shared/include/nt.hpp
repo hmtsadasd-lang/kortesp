@@ -8,6 +8,13 @@ using UPTR = uintptr_t;
 
 struct UNICODE_STRING_ { uint16_t Length, MaxLength; wchar_t* Buffer; };
 
+struct OBJECT_BASIC_INFORMATION_ {
+    ULONG Attributes;
+    ACCESS_MASK GrantedAccess;
+    ULONG HandleCount;
+    ULONG PointerCount;
+};
+
 struct LDR_DATA_TABLE_ENTRY_ {
     void*    InLoadOrderLinks[2];
     void*    InMemoryOrderLinks[2];

@@ -1,0 +1,15 @@
+﻿powershell : msbuild : The term 'msbuild' is not recognized as the name of a cmdlet, function, script file, or operable
+ program. Che
+At line:1 char:1
++ powershell -NoProfile -ExecutionPolicy Bypass -Command "cd 'C:\dev\fo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (msbuild : The t...le program. Che:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ck the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:22
++ cd 'C:\dev\fortesp'; msbuild 'fortesp.sln' /m /nologo /p:Configuratio ...
++                      ~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (msbuild:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
