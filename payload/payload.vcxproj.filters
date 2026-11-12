@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="src"><UniqueIdentifier>{C1C1C1C1-0000-0000-0000-000000000001}</UniqueIdentifier></Filter>
+    <Filter Include="shared"><UniqueIdentifier>{C1C1C1C1-0000-0000-0000-000000000002}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\entry.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\game.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\hide.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\log.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\render.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="..\shared\src\crt.cpp"><Filter>shared</Filter></ClCompile>
+    <ClCompile Include="..\shared\src\syscall.cpp"><Filter>shared</Filter></ClCompile>
+    <MASM Include="..\shared\src\stubs.asm"><Filter>shared</Filter></MASM>
+  </ItemGroup>
+</Project>

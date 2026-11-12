@@ -1,0 +1,24 @@
+out/
+.vs/
+*.user
+*.suo
+*.log
+
+# build artifacts
+*.obj
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.VC.db
+*.ipch
+Debug/
+Release/
+x64/
+x86/
+
+# analysis / probe artifacts
+*.out
+*.disasm*.txt
