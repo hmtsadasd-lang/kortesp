@@ -2,3 +2,6 @@ LIBRARY FortHook
 EXPORTS
     HookProc
     StartPinger
+    WinEventProc
+    CbtProc
+    IdleProc

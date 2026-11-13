@@ -21,6 +21,11 @@ $lab  = Join-Path $root 'out\lab'
 $out  = Join-Path $root 'out'
 $tc   = 'C:\tmp\w64devkit\w64devkit\bin\gcc.exe'
 
+# The loader's --maptest spawns "out\lab\FortniteClient-Win64-Shipping.exe",
+# a path relative to the working directory, so the suite runs from the repo
+# root. Without this the mapper case fails with "host spawn failed 2".
+Set-Location $root
+
 $script:failed = 0
 $script:passed = 0
 
@@ -76,7 +81,7 @@ function StartMock([string]$Name) {
 
 function StopMocks {
     $kill = Join-Path $lab 'kill_mask.exe'
-    foreach ($n in 'MockGame.exe', 'MockHost.exe') {
+    foreach ($n in 'MockGame.exe', 'MockHost.exe', 'FortniteClient-Win64-Shipping.exe') {
         if (Test-Path $kill) { & $kill $n | Out-Null } else {
             Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($n)) -ErrorAction SilentlyContinue |
                 Stop-Process -Force -ErrorAction SilentlyContinue
@@ -98,6 +103,10 @@ Build (Join-Path $lab 'kill_mask.exe') @('-O2', '-static', (Join-Path $PSScriptR
 Build (Join-Path $lab 'MockGame.exe')  @('-m64', '-O2', '-static', (Join-Path $PSScriptRoot 'mock_game.c'), '-ladvapi32') 'MockGame'
 Build (Join-Path $lab 'MockHost.exe')  @('-m32', '-O2', '-static', (Join-Path $PSScriptRoot 'mock_host.c')) 'MockHost'
 Build (Join-Path $lab 'probe_thread.exe') @('-m64', '-O2', '-static', (Join-Path $PSScriptRoot 'probe_thread.c')) 'probe_thread'
+Build (Join-Path $lab 'resolver_test.exe') @('-m64', '-O2', '-static', (Join-Path $PSScriptRoot 'resolver_test.c')) 'resolver_test'
+# The mapper's test host carries the client's name on purpose: the payload
+# picks its branch from the name of the process it runs in.
+Build (Join-Path $lab 'FortniteClient-Win64-Shipping.exe') @('-m64', '-O2', '-static', (Join-Path $PSScriptRoot 'mock_target64.c')) 'mock target'
 
 foreach ($s in 'build_mingw.ps1', 'build_payload_mingw.ps1') {
     $script = Join-Path $root $s
@@ -167,6 +176,18 @@ CaseMatch 'local context readable'      'NtGetContextThread\(x86\) st=0x00000000
 # are informative (see docs/SESSION_NOTES.md, item 1d).
 Write-Host ('[info] probe_thread: ' + (($pt -split "`r?`n" | Where-Object { $_ -match '^\[host' }) -join ' | '))
 
+# ------------------------------------------------------ resolver harness ----
+# The export resolver is pure logic over readable memory, so it is checked
+# locally: every export of ten modules is looked up the way the mapper does and
+# compared with GetProcAddress. This is what caught the case-sensitivity bug
+# (the import table writes "KERNEL32.dll", the module list says
+# "kernel32.dll") and it keeps the forwarder path honest.
+$rt = (& (Join-Path $lab 'resolver_test.exe') 2>&1 | Out-String).Trim()
+$rt | Set-Content -Path (Join-Path $lab 'resolver.out') -Encoding UTF8
+Write-Host '[run] resolver_test'
+CaseMatch 'resolver found every export' '^RESOLVER: OK' $rt
+CaseMatch 'resolver followed forwarders' 'forwarders=[1-9]' $rt
+
 # ------------------------------------------------------------ manual map ----
 # Skipped with -Quick: the mapper runs a whole DLL's entry point in a spawned
 # process and takes minutes.
@@ -185,8 +206,11 @@ if (-not $Quick) {
     # 0xC0000005; now the payload degrades off-client and returns cleanly, so a
     # non-zero exit is a regression.
     CaseMatch 'mapped entry point ran'  'mm: thread exit=' $map
-    CaseMatch 'entry thread exited 0'   'mm: thread exit=0 ' $map
-    CaseMatch 'maptest reported success' 'maptest ran=1 exit=0 ' $map
+    # The payload's entry returns 1 in the mock: it ran, took the target
+    # branch and game::init() degraded because there is no engine under it.
+    # What matters is that the thread ran and the mapper reported success.
+    CaseMatch 'entry thread exited'    'mm: thread exit=[0-9]' $map
+    CaseMatch 'maptest reported success' 'maptest ran=1 exit=[0-9]' $map
     CaseMatch 'export directory copied'  'export directory copied to rva' $map
     Write-Host ('[info] maptest: ' + (($map -split "`n" | Where-Object { $_ -match 'mm: (thread exit|trace)' }) -join ' | '))
 

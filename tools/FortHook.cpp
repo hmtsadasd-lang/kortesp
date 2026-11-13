@@ -82,12 +82,71 @@ static DWORD WINAPI pinger(LPVOID) {
     return 0;
 }
 
+// Where the payload lives.
+//
+// The loader that injects this DLL maps the *file* this DLL was loaded from,
+// and that file keeps its own path inside the target - so the payload can be
+// read from the directory this DLL came from, and the target's directory
+// never has to hold anything of ours. That matters for the game: a foreign
+// file in the game directory is what made the client refuse to start
+// ("EAC unload timeout"), and the game directory stays pristine this way.
+//
+// Order: this DLL's own directory, then the target's directory (the old
+// behaviour, kept for the lab targets that stage the payload next to them).
+static void find_payload(wchar_t* out, size_t cap) {
+    // The handle of *this* module, found from the address of one of our own
+    // variables (GetModuleHandleEx FROM_ADDRESS).
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)(const void*)&g_dir, &self)) {
+        self = nullptr;
+    }
+
+    wchar_t here[MAX_PATH] = L"";
+    if (self) GetModuleFileNameW(self, here, MAX_PATH);
+    if (!here[0]) lstrcpynW(here, L"C:\\dev\\fortesp\\out\\FortHook.dll", MAX_PATH);
+
+    wchar_t* slash = wcsrchr(here, L'\\');
+    if (slash) {
+        *slash = 0;
+        lstrcatW(here, L"\\payload.dll");
+        if (GetFileAttributesW(here) != INVALID_FILE_ATTRIBUTES) {
+            lstrcpynW(out, here, cap);
+            return;
+        }
+    }
+
+    lstrcpynW(out, g_dir, cap);
+    lstrcatW(out, L"\\payload.dll");
+}
+
+// Only the client gets the payload.
+//
+// A global hook injects this DLL into every process that triggers it, and the
+// payload is an overlay - it must not start in Discord or the launcher. The
+// guard is the host's own executable name: the client is
+// FortniteClient-Win64-Shipping.exe, and the lab mock carries the same name
+// so the harness still works. Everything else only produces a log line, which
+// is exactly what proves the injection mechanism reached that process.
+static bool host_is_client() {
+    wchar_t self[MAX_PATH] = L"";
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return false;
+    wchar_t* slash = wcsrchr(self, L'\\');
+    const wchar_t* name = slash ? slash + 1 : self;
+    return wcsicmp(name, L"FortniteClient-Win64-Shipping.exe") == 0;
+}
+
 static DWORD WINAPI map_payload(LPVOID) {
     hlog("[+] FortHook: worker in the client, tid=%lu", GetCurrentThreadId());
 
+    if (!host_is_client()) {
+        hlog("[*] payload skipped - this process is not the client");
+        return 2;
+    }
+
     wchar_t path[MAX_PATH] = L"";
-    lstrcpynW(path, g_dir, MAX_PATH);
-    lstrcatW(path, L"\\payload.dll");
+    find_payload(path, MAX_PATH);
     hlog("[*] payload path: %ls", path);
 
     size_t size = 0;
@@ -111,20 +170,87 @@ static DWORD WINAPI map_payload(LPVOID) {
     return 0;
 }
 
+// One entry point for every hook this DLL exports. The first call starts the
+// mapping; the rest only count, so the log says how often each route fires.
+static void hook_fired(const char* which, int code) {
+    InterlockedIncrement(&g_calls);
+    hlog("[*] %s fired (code=%d) in pid %lu tid %lu", which, code,
+         GetCurrentProcessId(), GetCurrentThreadId());
+
+    if (code >= 0 && InterlockedCompareExchange(&g_mapped, 1, 0) == 0) {
+        GetModuleFileNameW(nullptr, g_dir, MAX_PATH);
+        wchar_t* s = wcsrchr(g_dir, L'\\');
+        if (s) *s = 0;
+        hlog("[+] %s mapping in pid %lu dir %ls", which, GetCurrentProcessId(), g_dir);
+        CreateThread(nullptr, 0, map_payload, nullptr, 0, nullptr);
+    }
+}
+
 // The exported hook. WH_GETMESSAGE only: the client's loop asks for the next
 // message, this runs before it gets one, and the mapping is handed to a thread
 // so the hook returns immediately (an inline map would block the message loop
 // for the whole mapping, and the client would look hung).
 extern "C" __declspec(dllexport) LRESULT CALLBACK HookProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("HookProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// The CBT hook.
+//
+// WH_CBT is a *thread-local* hook whose target is the thread that created
+// the window, and the callback runs in that thread's context. The client
+// owns its 'UnrealWindow', so a WH_CBT hook on the client's window thread
+// puts this DLL inside the client the moment the client dispatches a
+// WM_MOVE / WM_SIZE / WM_ACTIVATE / WM_SETFOCUS - none of which need a
+// message *loop* that calls GetMessage.
+extern "C" __declspec(dllexport) LRESULT CALLBACK CbtProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("CbtProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// The foreground-idle hook.
+//
+// WH_FOREGROUNDIDLE fires when the foreground thread's queue runs dry and the
+// thread is about to wait - which a game does between every frame. The
+// foreground thread is the client's window thread (the game window has the
+// focus), so this needs no help from the user at all.
+extern "C" __declspec(dllexport) void CALLBACK IdleProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("IdleProc", code);
+}
+
+// The win-event callback.
+//
+// This is the door that does not need the client to walk a message queue:
+// SetWinEventHook with WINEVENT_INCONTEXT delivers the callback *inside the
+// process that raised the event*, so the client's own loader maps this DLL
+// into the client and calls us on the client's thread. No handle is involved
+// anywhere, so the 0x11F145 mask never enters the picture.
+//
+// The event is EVENT_OBJECT_SHOW: the client raises it when its window is
+// created, which is why the hook has to be installed before the client
+// starts.
+extern "C" __declspec(dllexport) void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook,
+                                                          DWORD event, HWND hwnd,
+                                                          LONG idObject, LONG idChild,
+                                                          DWORD idEventThread,
+                                                          DWORD dwmsEventTime) {
+    (void)hWinEventHook; (void)hwnd; (void)idObject; (void)idChild;
+    (void)idEventThread; (void)dwmsEventTime;
+
     InterlockedIncrement(&g_calls);
-    if (code >= 0 && InterlockedCompareExchange(&g_mapped, 1, 0) == 0) {
+    hlog("[*] WinEventProc event=0x%lX in pid %lu tid %lu",
+         static_cast<unsigned long>(event), GetCurrentProcessId(), GetCurrentThreadId());
+
+    if (InterlockedCompareExchange(&g_mapped, 1, 0) == 0) {
         GetModuleFileNameW(nullptr, g_dir, MAX_PATH);
         wchar_t* s = wcsrchr(g_dir, L'\\');
         if (s) *s = 0;
-        hlog("[*] HookProc in pid %lu dir %ls", GetCurrentProcessId(), g_dir);
+        hlog("[+] WinEventProc mapping in pid %lu dir %ls", GetCurrentProcessId(), g_dir);
         CreateThread(nullptr, 0, map_payload, nullptr, 0, nullptr);
     }
-    return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 // Called from DllMain only. The stand-in driver in EAC's kernel DPC is a DPC

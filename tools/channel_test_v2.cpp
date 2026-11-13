@@ -45,22 +45,48 @@ static void show_answers() {
 }
 
 // Resolve an export of the *mapped* image by walking its export directory: the
-// mapper places the image at an arbitrary base, so GetProcAddress cannot be used.
-static void* mapped_export(void* base, const char* want) {
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(reinterpret_cast<char*>(base) + dos->e_lfanew);
+// mapper places the image at an arbitrary base, so GetProcAddress cannot be
+// used. The image lives in the target's address space, so it has to be read
+// with ReadProcessMemory - a plain read here faults.
+static void* mapped_export(HANDLE proc, uint64_t base, const char* want) {
+    UCHAR dos[64] = { 0 };
+    if (!ReadProcessMemory(proc, (void*)(uintptr_t)base, dos, sizeof(dos), nullptr)) return nullptr;
+
+    DWORD lfanew = *(DWORD*)(dos + 0x3C);
+    UCHAR ntbuf[0x200] = { 0 };
+    if (!ReadProcessMemory(proc, (void*)(uintptr_t)(base + lfanew), ntbuf, sizeof(ntbuf), nullptr)) return nullptr;
+
+    auto* nt = (IMAGE_NT_HEADERS64*)ntbuf;
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.VirtualAddress) return nullptr;
-    auto* exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(reinterpret_cast<char*>(base) + dir.VirtualAddress);
-    auto* names = reinterpret_cast<DWORD*>(reinterpret_cast<char*>(base) + exp->AddressOfNames);
-    auto* ords = reinterpret_cast<WORD*>(reinterpret_cast<char*>(base) + exp->AddressOfNameOrdinals);
-    auto* funcs = reinterpret_cast<DWORD*>(reinterpret_cast<char*>(base) + exp->AddressOfFunctions);
+
+    UCHAR edbuf[1024] = { 0 };
+    if (!ReadProcessMemory(proc, (void*)(uintptr_t)(base + dir.VirtualAddress), edbuf, sizeof(edbuf), nullptr))
+        return nullptr;
+    auto* exp = (IMAGE_EXPORT_DIRECTORY*)edbuf;
+
+    UCHAR nbuf[4096] = { 0 };
+    if (!ReadProcessMemory(proc, (void*)(uintptr_t)(base + exp->AddressOfNames), nbuf, sizeof(nbuf), nullptr))
+        return nullptr;
+    auto* names = (DWORD*)nbuf;
+
+    UCHAR obuf[2048] = { 0 };
+    if (!ReadProcessMemory(proc, (void*)(uintptr_t)(base + exp->AddressOfNameOrdinals), obuf, sizeof(obuf), nullptr))
+        return nullptr;
+    auto* ords = (WORD*)obuf;
+
+    UCHAR fbuf[4096] = { 0 };
+    if (!ReadProcessMemory(proc, (void*)(uintptr_t)(base + exp->AddressOfFunctions), fbuf, sizeof(fbuf), nullptr))
+        return nullptr;
+    auto* funcs = (DWORD*)fbuf;
+
     printf("mapped image exports: %lu\n", (unsigned long)exp->NumberOfNames);
-    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
-        const char* nm = reinterpret_cast<const char*>(base) + names[i];
+    for (DWORD i = 0; i < exp->NumberOfNames && i < 1024; ++i) {
+        char nm[128] = { 0 };
+        if (!ReadProcessMemory(proc, (void*)(uintptr_t)(base + names[i]), nm, sizeof(nm) - 1, nullptr)) break;
         const char* a = nm; const char* b = want;
         while (*a && *b && *a == *b) { ++a; ++b; }
-        if (!*a && !*b) return reinterpret_cast<char*>(base) + funcs[ords[i]];
+        if (!*a && !*b) return (void*)(uintptr_t)(base + funcs[ords[i]]);
     }
     return nullptr;
 }
@@ -89,16 +115,18 @@ int wmain() {
     Sleep(600);
 
     map_result mr; ZeroMemory(&mr, sizeof(mr));
+    // keep_mapped: the test reads the mapped image's export table below, so
+    // the image has to survive the entry thread.
     bool ran = manual_map_host(pi.hProcess, img.data(), static_cast<size_t>(sz),
-                               L"C:\\dev\\fortesp\\out\\payload.dll", "channel_test",
-                               false, &mr, 20000, nullptr);
+                               L"C:\\dev\\fortesp\\out\\payload.dll", "channel_start",
+                               true, &mr, 20000, nullptr);
     printf("map ran=%d exit=0x%08lX remote=%p\n", ran ? 1 : 0,
            (unsigned long)mr.exit_code, (void*)mr.remote);
     if (!ran) return 1;
 
     Sleep(1500);
     printf("log %lld answers %lld\n", fsize(kIn), fsize(kOut));
-    void* ch = mapped_export(reinterpret_cast<void*>(mr.remote), "channel_start");
+    void* ch = mapped_export(pi.hProcess, mr.remote, "channel_start");
     printf("channel_start in image: %p\n", ch);
 
     send_line("PING");

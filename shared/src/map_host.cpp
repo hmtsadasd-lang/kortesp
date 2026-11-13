@@ -29,36 +29,56 @@ void emit(map_log_fn log, const char* fmt, ...) {
 
 // --- target process module walking -----------------------------------------
 
-uint8_t* remote_module(HANDLE ph, uint32_t hash) {
+// Walk the target's module list. The target may still be loading its own
+// modules when the mapper starts, so a miss is retried for a moment: the
+// very first lookup of a freshly spawned process can see only two modules.
+uint8_t* remote_module(HANDLE ph, uint32_t hash, int attempts = 40) {
     using QIP = NTSTATUS_(__stdcall*)(HANDLE, uint32_t, void*, uint32_t, uint32_t*);
     auto qip = reinterpret_cast<QIP>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
-    if (!qip) return nullptr;
 
-    PROCESS_BASIC_INFORMATION_ pbi{};
-    if (qip(ph, 0, &pbi, sizeof(pbi), nullptr) < 0 || !pbi.PebBaseAddress) return nullptr;
-
-    uint64_t ldr = 0;
-    if (!ReadProcessMemory(ph, reinterpret_cast<uint8_t*>(pbi.PebBaseAddress) + 0x18, &ldr, 8, nullptr))
-        return nullptr;
-    if (!ldr) return nullptr;
-
-    uint64_t head = ldr + 0x10, cur = 0;
-    if (!ReadProcessMemory(ph, reinterpret_cast<void*>(head), &cur, 8, nullptr)) return nullptr;
-
-    for (int guard = 0; cur && cur != head && guard < 512; ++guard) {
-        LDR_DATA_TABLE_ENTRY_ e{};
-        if (!ReadProcessMemory(ph, reinterpret_cast<void*>(cur), &e, sizeof(e), nullptr)) break;
-
-        if (e.BaseDllName.Buffer) {
-            wchar_t name[64]{};
-            ReadProcessMemory(ph, e.BaseDllName.Buffer, name, sizeof(name) - 2, nullptr);
-            if (h::fnv1a_w(name) == hash) return static_cast<uint8_t*>(e.DllBase);
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        PROCESS_BASIC_INFORMATION_ pbi{};
+        if (!qip || qip(ph, 0, &pbi, sizeof(pbi), nullptr) < 0 || !pbi.PebBaseAddress) {
+            if (attempt + 1 == attempts) return nullptr;
+            Sleep(25);
+            continue;
         }
-        ReadProcessMemory(ph, reinterpret_cast<void*>(cur), &cur, 8, nullptr);
+
+        uint64_t ldr = 0;
+        if (!ReadProcessMemory(ph, reinterpret_cast<uint8_t*>(pbi.PebBaseAddress) + 0x18, &ldr, 8, nullptr) ||
+            !ldr) {
+            if (attempt + 1 == attempts) return nullptr;
+            Sleep(25);
+            continue;
+        }
+
+        uint64_t head = ldr + 0x10, cur = 0;
+        if (!ReadProcessMemory(ph, reinterpret_cast<void*>(head), &cur, 8, nullptr)) {
+            if (attempt + 1 == attempts) return nullptr;
+            Sleep(25);
+            continue;
+        }
+
+        for (int guard = 0; cur && cur != head && guard < 512; ++guard) {
+            LDR_DATA_TABLE_ENTRY_ e{};
+            if (!ReadProcessMemory(ph, reinterpret_cast<void*>(cur), &e, sizeof(e), nullptr)) break;
+
+            if (e.BaseDllName.Buffer) {
+                wchar_t name[64]{};
+                ReadProcessMemory(ph, e.BaseDllName.Buffer, name, sizeof(name) - 2, nullptr);
+                if (h::fnv1a_ci_w(name) == hash) return static_cast<uint8_t*>(e.DllBase);
+            }
+            ReadProcessMemory(ph, reinterpret_cast<void*>(cur), &cur, 8, nullptr);
+        }
+
+        if (attempt + 1 < attempts) Sleep(25);
     }
     return nullptr;
 }
+
+uint64_t remote_proc_by_name(HANDLE ph, uint32_t mod_hash, const char* name, int depth);
+uint64_t remote_proc_by_ordinal(HANDLE ph, uint32_t mod_hash, uint16_t ordinal, int depth);
 
 uint64_t remote_proc(HANDLE ph, uint32_t mod_hash, uint32_t fn_hash) {
     auto* base = remote_module(ph, mod_hash);
@@ -76,13 +96,16 @@ uint64_t remote_proc(HANDLE ph, uint32_t mod_hash, uint32_t fn_hash) {
     IMAGE_EXPORT_DIRECTORY_ ed{};
     ReadProcessMemory(ph, base + dir.VirtualAddress, &ed, sizeof(ed), nullptr);
 
+    // Linear scan, case sensitive compare: the export name table is sorted
+    // bytewise (uppercase before lowercase), so a case folding search lands in
+    // the wrong half for some names. 1700 entries cost microseconds.
     for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
         uint32_t rva = 0;
         ReadProcessMemory(ph, base + ed.AddressOfNames + i * 4, &rva, 4, nullptr);
 
-        char name[128]{};
-        ReadProcessMemory(ph, base + rva, name, sizeof(name) - 1, nullptr);
-        if (h::fnv1a(name) != fn_hash) continue;
+        char ename[160]{};
+        ReadProcessMemory(ph, base + rva, ename, sizeof(ename) - 1, nullptr);
+        if (h::fnv1a(ename) != fn_hash) continue;
 
         uint16_t ord = 0;
         ReadProcessMemory(ph, base + ed.AddressOfNameOrdinals + i * 2, &ord, 2, nullptr);
@@ -92,6 +115,97 @@ uint64_t remote_proc(HANDLE ph, uint32_t mod_hash, uint32_t fn_hash) {
         return reinterpret_cast<uint64_t>(base + fn);
     }
     return 0;
+}
+
+// An export whose RVA points into the export directory is a forwarder:
+// "Dll.Func" or "Dll.#123". Resolve it one more level.
+uint64_t resolve_forwarder(HANDLE ph, uint8_t* base, uint32_t fwd_rva,
+                           uint32_t dir_rva, uint32_t dir_size, int depth) {
+    if (depth >= 2) return 0;
+    if (fwd_rva < dir_rva || fwd_rva >= dir_rva + dir_size) return 0;
+
+    char text[160]{};
+    ReadProcessMemory(ph, base + fwd_rva, text, sizeof(text) - 1, nullptr);
+
+    char* dot = strrchr(text, '.');
+    if (!dot) return 0;
+    *dot = 0;
+
+    uint32_t dll_hash = h::fnv1a_ci(text);
+    if (dot[1] == '#') {
+        uint16_t ordinal = static_cast<uint16_t>(atoi(dot + 2));
+        return remote_proc_by_ordinal(ph, dll_hash, ordinal, depth + 1);
+    }
+    return remote_proc_by_name(ph, dll_hash, dot + 1, depth + 1);
+}
+
+uint64_t remote_proc_by_name(HANDLE ph, uint32_t mod_hash, const char* name, int depth) {
+    auto* base = remote_module(ph, mod_hash);
+    if (!base) return 0;
+
+    IMAGE_DOS_HEADER_ dos{};
+    ReadProcessMemory(ph, base, &dos, sizeof(dos), nullptr);
+
+    IMAGE_NT_HEADERS64_ nt{};
+    ReadProcessMemory(ph, base + dos.e_lfanew, &nt, sizeof(nt), nullptr);
+
+    auto& dir = nt.OptionalHeader.DataDirectory[DIR_EXPORT_];
+    if (!dir.VirtualAddress) return 0;
+
+    IMAGE_EXPORT_DIRECTORY_ ed{};
+    ReadProcessMemory(ph, base + dir.VirtualAddress, &ed, sizeof(ed), nullptr);
+
+    uint32_t fn_hash = h::fnv1a(name);
+
+    for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
+        uint32_t rva = 0;
+        ReadProcessMemory(ph, base + ed.AddressOfNames + i * 4, &rva, 4, nullptr);
+
+        char ename[160]{};
+        ReadProcessMemory(ph, base + rva, ename, sizeof(ename) - 1, nullptr);
+        if (h::fnv1a(ename) != fn_hash) continue;
+
+        uint16_t ord = 0;
+        ReadProcessMemory(ph, base + ed.AddressOfNameOrdinals + i * 2, &ord, 2, nullptr);
+
+        uint32_t fn = 0;
+        ReadProcessMemory(ph, base + ed.AddressOfFunctions + ord * 4, &fn, 4, nullptr);
+        if (fn & 0x80000000u) continue;
+
+        uint64_t fwd = resolve_forwarder(ph, base, fn, dir.VirtualAddress, dir.Size, depth);
+        if (fwd) return fwd;
+        return reinterpret_cast<uint64_t>(base + fn);
+    }
+    return 0;
+}
+
+uint64_t remote_proc_by_ordinal(HANDLE ph, uint32_t mod_hash, uint16_t ordinal, int depth) {
+    auto* base = remote_module(ph, mod_hash);
+    if (!base) return 0;
+
+    IMAGE_DOS_HEADER_ dos{};
+    ReadProcessMemory(ph, base, &dos, sizeof(dos), nullptr);
+
+    IMAGE_NT_HEADERS64_ nt{};
+    ReadProcessMemory(ph, base + dos.e_lfanew, &nt, sizeof(nt), nullptr);
+
+    auto& dir = nt.OptionalHeader.DataDirectory[DIR_EXPORT_];
+    if (!dir.VirtualAddress) return 0;
+
+    IMAGE_EXPORT_DIRECTORY_ ed{};
+    ReadProcessMemory(ph, base + dir.VirtualAddress, &ed, sizeof(ed), nullptr);
+
+    if (ordinal < ed.Base) return 0;
+    uint32_t index = static_cast<uint32_t>(ordinal) - ed.Base;
+    if (index >= ed.NumberOfFunctions) return 0;
+
+    uint32_t fn = 0;
+    ReadProcessMemory(ph, base + ed.AddressOfFunctions + index * 4, &fn, 4, nullptr);
+    if (fn & 0x80000000u) return 0;
+
+    uint64_t fwd = resolve_forwarder(ph, base, fn, dir.VirtualAddress, dir.Size, depth);
+    if (fwd) return fwd;
+    return reinterpret_cast<uint64_t>(base + fn);
 }
 
 // Fill the image's import table with addresses taken from the target process.
@@ -106,13 +220,29 @@ bool resolve_imports(HANDLE ph, IMAGE_NT_HEADERS64_* nt, uint8_t* img, map_log_f
         char dll[128]{};
         memcpy(dll, img + imp->Name, sizeof(dll) - 1);
 
+        // The import table writes "KERNEL32.dll", the loader's module list
+        // says "kernel32.dll" - the module hash has to be case insensitive.
+        uint32_t dll_hash = h::fnv1a_ci(dll);
+
         for (auto* thunk = reinterpret_cast<uint64_t*>(img + imp->FirstThunk); *thunk; ++thunk) {
-            if (*thunk & 0x8000000000000000ull) continue;   // import by ordinal
+            uint64_t slot = *thunk;
 
-            char fn[128]{};
-            memcpy(fn, img + *thunk + 2, sizeof(fn) - 1);
+            if (slot & 0x8000000000000000ull) {
+                // import by ordinal
+                uint16_t ordinal = static_cast<uint16_t>(slot >> 16);
+                uint64_t addr = remote_proc_by_ordinal(ph, dll_hash, ordinal, 0);
+                if (!addr) {
+                    emit(log, "[!] unresolved %s!#%u (ordinal)", dll, ordinal);
+                    return false;
+                }
+                *thunk = addr;
+                continue;
+            }
 
-            uint64_t addr = remote_proc(ph, h::fnv1a(dll), h::fnv1a(fn));
+            char fn[160]{};
+            memcpy(fn, img + slot + 2, sizeof(fn) - 1);
+
+            uint64_t addr = remote_proc_by_name(ph, dll_hash, fn, 0);
             if (!addr && self) {
                 // The target does not have the module loaded. When the mapper
                 // runs inside the target (the proxy case) a local load is
@@ -121,12 +251,17 @@ bool resolve_imports(HANDLE ph, IMAGE_NT_HEADERS64_* nt, uint8_t* img, map_log_f
                 wchar_t wdll[160]{};
                 MultiByteToWideChar(CP_ACP, 0, dll, -1, wdll, 160);
                 if (LoadLibraryW(wdll)) {
-                    addr = remote_proc(ph, h::fnv1a(dll), h::fnv1a(fn));
+                    addr = remote_proc_by_name(ph, dll_hash, fn, 0);
                     if (addr) emit(log, "[*] mm: loaded %s for the target", dll);
                 }
             }
             if (!addr) {
-                emit(log, "[!] unresolved %s!%s", dll, fn);
+                // Say which half failed: the module or the export.
+                uint8_t* mb = remote_module(ph, dll_hash);
+                emit(log, "[!] unresolved dll='%s' thunk=0x%llX byOrd=0 name='%s' -> 0 "
+                            "(module=%p hash=0x%08lX)",
+                     dll, static_cast<unsigned long long>(slot), fn,
+                     mb, static_cast<unsigned long>(dll_hash));
                 return false;
             }
             *thunk = addr;
