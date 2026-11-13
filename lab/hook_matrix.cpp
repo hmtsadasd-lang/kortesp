@@ -22,16 +22,22 @@
  * sender-side CALLWNDPROC hook), then parses the hook log into a table.
  *
  *   usage: hook_matrix.exe <target.exe> <class> [mode] [seconds] [tl|global]
+ *          hook_matrix.exe --attach <exeName> <class> [seconds] [tl|global]
  *
  *   class   window class to watch: MockClientWindow | MockGuiTarget | UnrealWindow
  *   mode    passed to the target as an argument (mock_client: raw|peek|get)
  *   seconds how long to stimulate (default 20)
  *   tl|global  thread-local to the target's window thread, or a global sweep
  *
+ *   --attach finds a process that is already running by image name instead of
+ *   launching one - the live client cannot be launched by us (it needs the Epic
+ *   protocol and its high-integrity manifest).
+ *
  * The hook DLL is injected from its own file path, so no copy of ours has to
  * live next to the target.
  */
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -63,6 +69,21 @@ static const char* kFamilies[] = {
 };
 
 struct found { HWND hwnd; DWORD pid; DWORD tid; wchar_t cls[128]; };
+
+static DWORD pid_of(const wchar_t* exe) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    DWORD hit = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exe) == 0) { hit = pe.th32ProcessID; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return hit;
+}
 
 static BOOL CALLBACK find_win(HWND h, LPARAM l) {
     found* f = (found*)l;
@@ -96,49 +117,79 @@ static std::string slurp(const wchar_t* path) {
 int wmain(int argc, wchar_t** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    if (argc < 3) {
-        printf("usage: hook_matrix.exe <target.exe> <class> [mode] [seconds] [tl|global]\n");
-        return 2;
-    }
-    const wchar_t* target = argv[1];
+    /* Two modes: launch a fixture, or attach to a process that is already
+     * running (the live client cannot be launched by us - it needs the Epic
+     * protocol and its own high-integrity manifest). */
+    bool attach = (argc > 1) && (wcscmp(argv[1], L"--attach") == 0);
+    const wchar_t* target = nullptr;
     wchar_t want_cls[128] = L"MockClientWindow";
-    lstrcpynW(want_cls, argv[2], 128);
-    const wchar_t* mode = (argc > 3) ? argv[3] : L"";
-    int seconds = (argc > 4) ? _wtoi(argv[4]) : 20;
-    bool global = (argc > 5) && (wcscmp(argv[5], L"global") == 0);
+    const wchar_t* mode = L"";
+    int seconds = 20;
+    bool global = false;
+    DWORD attach_pid = 0;
+
+    if (attach) {
+        if (argc < 4) {
+            printf("usage: hook_matrix.exe --attach <exeName> <class> [seconds] [tl|global]\n");
+            return 2;
+        }
+        target = argv[2];
+        lstrcpynW(want_cls, argv[3], 128);
+        seconds = (argc > 4) ? _wtoi(argv[4]) : 20;
+        global = (argc > 5) && (wcscmp(argv[5], L"global") == 0);
+        attach_pid = pid_of(target);
+        if (!attach_pid) { printf("[!] %ls is not running\n", target); return 1; }
+    } else {
+        if (argc < 3) {
+            printf("usage: hook_matrix.exe <target.exe> <class> [mode] [seconds] [tl|global]\n");
+            return 2;
+        }
+        target = argv[1];
+        lstrcpynW(want_cls, argv[2], 128);
+        mode = (argc > 3) ? argv[3] : L"";
+        seconds = (argc > 4) ? _wtoi(argv[4]) : 20;
+        global = (argc > 5) && (wcscmp(argv[5], L"global") == 0);
+    }
     if (seconds <= 0) seconds = 20;
 
     /* Fresh log: without this the table would count the previous run's lines. */
     DeleteFileW(g_log);
 
-    /* Start the target. The mode, when given, is appended to its command line -
-     * mock_client reads it from GetCommandLine. */
-    std::wstring cmd = L"\"";
-    cmd += target;
-    cmd += L"\"";
-    if (mode[0]) { cmd += L" "; cmd += mode; }
-    std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
-    cmdline.push_back(0);
-
     STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
-    if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, 0,
-                        nullptr, nullptr, &si, &pi)) {
-        printf("[!] target start failed %lu\n", GetLastError());
-        return 1;
-    }
-    printf("[*] target pid %lu\n", (unsigned long)pi.dwProcessId);
-    Sleep(1500);
+    DWORD target_pid = attach_pid;
+    if (attach) {
+        printf("[*] attached to %ls pid %lu\n", target, (unsigned long)target_pid);
+        Sleep(500);
+    } else {
+        /* Start the target. The mode, when given, is appended to its command
+         * line - mock_client reads it from GetCommandLine. */
+        std::wstring cmd = L"\"";
+        cmd += target;
+        cmd += L"\"";
+        if (mode[0]) { cmd += L" "; cmd += mode; }
+        std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
+        cmdline.push_back(0);
 
-    found f{}; f.pid = pi.dwProcessId;
+        if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, 0,
+                            nullptr, nullptr, &si, &pi)) {
+            printf("[!] target start failed %lu\n", GetLastError());
+            return 1;
+        }
+        target_pid = pi.dwProcessId;
+        printf("[*] target pid %lu\n", (unsigned long)target_pid);
+        Sleep(1500);
+    }
+
+    found f{}; f.pid = target_pid;
     lstrcpynW(f.cls, want_cls, 128);
     for (int i = 0; i < 20 && !f.hwnd; ++i) {
         EnumWindows(find_win, (LPARAM)&f);
         if (!f.hwnd) Sleep(300);
     }
     if (!f.hwnd) {
-        printf("[!] no window of class %ls in pid %lu\n", want_cls, (unsigned long)pi.dwProcessId);
-        TerminateProcess(pi.hProcess, 0);
+        printf("[!] no window of class %ls in pid %lu\n", want_cls, (unsigned long)target_pid);
+        if (!attach) TerminateProcess(pi.hProcess, 0);
         return 1;
     }
     printf("[*] window %p tid %lu class %ls\n", (void*)f.hwnd, (unsigned long)f.tid, f.cls);
@@ -147,7 +198,7 @@ int wmain(int argc, wchar_t** argv) {
 
     HMODULE d = LoadLibraryW(g_dll);
     printf("[*] dll %p err=%lu\n", (void*)d, GetLastError());
-    if (!d) { TerminateProcess(pi.hProcess, 0); return 1; }
+    if (!d) { if (!attach) TerminateProcess(pi.hProcess, 0); return 1; }
 
     HHOOK hooks[8] = { 0 };
     int n = 0;
@@ -161,7 +212,7 @@ int wmain(int argc, wchar_t** argv) {
         printf("%-6s type=%2d export=%-11s hook=%p err=%lu\n", s.name, s.type, s.exp, (void*)h, e);
         if (h) hooks[n++] = h;
     }
-    if (!n) { printf("[!] nothing installed\n"); TerminateProcess(pi.hProcess, 0); return 1; }
+    if (!n) { printf("[!] nothing installed\n"); if (!attach) TerminateProcess(pi.hProcess, 0); return 1; }
 
     /* The pinger lives in the hook DLL: PostMessage(WM_NULL) + SetWindowPos once
      * a second. That is the stimulus WH_GETMESSAGE and WH_CBT need even when
@@ -214,6 +265,7 @@ int wmain(int argc, wchar_t** argv) {
     /* per family: total count, and a per-pid breakdown */
     std::map<std::string, int> fired;
     std::map<std::string, std::map<unsigned, int>> by_pid;
+    std::map<unsigned, int> dllmain_by_pid;
     int dllmain_target = 0, dllmain_other = 0;
 
     size_t pos = 0;
@@ -233,8 +285,9 @@ int wmain(int argc, wchar_t** argv) {
         if (p != std::string::npos) pid = (unsigned)strtoul(ln.c_str() + p + 5, nullptr, 10);
 
         if (ln.find("DllMain") != std::string::npos) {
-            if (pid == pi.dwProcessId) dllmain_target++;
+            if (pid == target_pid) dllmain_target++;
             else dllmain_other++;
+            dllmain_by_pid[pid]++;
         }
         for (const char* fam : kFamilies) {
             std::string needle = std::string(fam) + " fired";
@@ -245,8 +298,14 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
 
-    printf("--- result: target pid %lu (%ls) ---\n", (unsigned long)pi.dwProcessId, target);
+    printf("--- result: target pid %lu (%ls) ---\n", (unsigned long)target_pid, target);
     printf("DllMain in target=%d other=%d\n", dllmain_target, dllmain_other);
+    {
+        std::string dp;
+        char b[48];
+        for (auto& kv : dllmain_by_pid) { sprintf(b, "%u ", kv.first); dp += b; }
+        printf("DllMain pids: %s\n", dp.c_str());
+    }
     printf("%-13s %8s %s\n", "family", "fired", "pids");
     for (const char* fam : kFamilies) {
         int c = fired[fam];
@@ -256,7 +315,7 @@ int wmain(int argc, wchar_t** argv) {
         printf("%-13s %8d %s\n", fam, c, pids.c_str());
     }
 
-    TerminateProcess(pi.hProcess, 0);
+    if (!attach) TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return 0;
