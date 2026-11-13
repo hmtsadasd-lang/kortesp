@@ -403,3 +403,50 @@ Next step is small and specific: print which import it is looking at and what
 The candidate causes are (a) the ordinal/name table walk in `export_proc`, (b)
 the hint/name RVA arithmetic on the new `.idata`, and (c) `CloseHandle` arriving
 as an ordinal import rather than a name in the rebuilt image.
+
+## Correction, 13.11.2026 (later): the mapper bug is fixed and the channel round trip passes
+
+The `unresolved KERNEL32.dll!CloseHandle` failure was a real mapper bug, and it
+is fixed in `shared/src/map_host.cpp`:
+
+* module hashing folded a **16-bit code unit** in the wide variant while the
+  byte variant hashed **bytes**, so the module hash could never match and the
+  resolver ran against no module at all. `h::fnv1a_ci_w` now hashes byte-wise,
+  the way the byte variant does;
+* the target's module list is incomplete for the first moments after the target
+  starts, so `remote_module` now retries;
+* export **forwarders** are followed (`kernel32!CloseHandle` forwards to
+  `api-ms-win-core-handle-l1-1-0` in the modern layout) and **ordinal imports**
+  are resolved.
+
+Measured after the fix:
+
+```
+lab\resolver_test.exe    checked=8061 missed=0 forwarders=615   RESOLVER: OK
+lab\run_all.ps1          27 passed, 0 failed
+out\channel_test_v2.exe  <- ACK channel up / ACK BASE 0x00007FF6C55D0000 / ACK PING
+```
+
+So the channel was never blocked by the mapper. What is still missing is a first
+entry into the real client - and that is now a complete, closed table.
+
+## Correction, 13.11.2026: the hook vector is not refused - it is never triggered
+
+The line above that says the hook is "refused at the loader, before the hook
+runs" is wrong, and the measurement that corrects it is in section 9 of
+`LIVE_TEST_RESULTS.md`:
+
+* every hook family returns a **valid `HHOOK` with `err=0`** for the client's own
+  thread, elevated and unelevated - there is no refusal;
+* the same DLL, in the same run, is mapped into **26 other processes**, and into
+  our own mock under the sanity control, so the mechanism works;
+* the client is never among them, and the reason is its own I/O design:
+  `PeekMessage` (so no `WH_GETMESSAGE`), no outgoing messages (so no
+  `WH_CALLWNDPROC`), raw input (so no `WH_KEYBOARD`/`WH_MOUSE`), no
+  `WM_MOVE`/`WM_SIZE`/`WM_ACTIVATE` dispatched and no foreground-idle (so no
+  `WH_CBT`/`WH_FOREGROUNDIDLE`), and `WINEVENT_INCONTEXT` does not inject here
+  even against a plain GUI control.
+
+"Refused" and "never fires" are different findings, and only the second one is
+true. The practical consequence is the same, but the door is the client's input
+design rather than an anti-cheat gate.

@@ -137,3 +137,93 @@ out\loader.exe --maptest        :: mapper self-test against a spawned cmd.exe
 tools\deploy_hijack.bat          :: install a proxy (needs the game closed)
 tools\restore_game_files.bat     :: put the game directory back
 ```
+
+## 9. In-game delivery, 13.11.2026: every vector, measured
+
+Second round, with the client **running** and its `UnrealWindow`
+(`hwnd 0x5061C`, `tid 23232`) in the **foreground** - confirmed with
+`GetForegroundWindow` at the time of the run, so the input and activation
+questions below were really put to the client and not to some other window.
+
+Each hook family is exported by one DLL (`out\FortHook.dll`) and writes a line
+to `C:\Users\Public\fortesp_hook.log` from inside **whatever process the system
+maps it into**, so "did the client reach our module" is a log line, not an
+inference. The DLL is injected from its own path, so nothing of ours has to be
+in the game directory.
+
+### The two positive controls, because they are what make the negatives mean something
+
+* `lab\hook_dll_sanity.exe` - `WH_GETMESSAGE` + `FortHook.dll` against
+  `out\lab\mock_gui.exe` (a plain `GetMessage` loop). The DLL **is** mapped into
+  the target (`DllMain in pid 3864`, then `HookProc in pid 3864`) and the worker
+  starts. Only the payload read failed, because that mock has no `payload.dll`
+  next to it. **The hook mechanism and the injection path work.**
+* the **global sweep** below reached **26 processes** with the same DLL and the
+  same `SetWindowsHookEx` calls in one run - explorer, Chrome, PowerShell,
+  `ctfmon`, OneDrive, `sihost`, NVIDIA Overlay, `nvsphelper64`, the Realtek
+  audio service, `GameInputRawInputProxy` (35 132 callbacks), Riot Vanguard's
+  tray, the Epic launcher and the `EAC_EOS` shim - 47 654 log lines in total.
+
+| # | vector (all using `out\FortHook.dll`) | install | DLL mapped into the **client**? | callback in the client? | what the log / the return code shows |
+|---|---|---|---|---|---|
+| 1 | `OpenProcess` + `VirtualAllocEx` / `WriteProcessMemory` | — | no | n/a | granted mask `0x1004` only; `VirtualAllocEx` → err 5 (also from SYSTEM inside EAC) |
+| 2 | `ReadProcessMemory` through that handle | — | no | n/a | a real read is refused, err 5 |
+| 3 | proxy `version.dll` in the game dir | deploys | no | no | `DllMain` never ran; the anti-cheat refuses the load |
+| 4 | proxy `EOSSDK-Win64-Shipping.dll` | deploys | no | no | self-validating; the client crash-loops |
+| 5 | proxy `CRYPT32.dll` (the one shim import that is not a KnownDLL) | deploys | no | no | the app directory is not searched at all |
+| 6 | plant `vulkan-1.dll` | deploys | no | no | the name list is libpng's, not a loader list |
+| 7 | `WH_GETMESSAGE` + DLL, client `tid` | `err=0` | no | **never** | the client's loop is `PeekMessage` |
+| 8 | `WH_GETMESSAGE` + DLL, global | `err=0` | no | never in client | fired in 16 other processes |
+| 9 | `WH_CALLWNDPROC` + DLL, client `tid` | `err=0` | no | **never** | the client sends no messages |
+| 10 | `WH_CALLWNDPROC` + DLL, global | `err=0` | no | never in client | mapped into Discord, Chrome, Nvidia, Vanguard, the launcher, the EAC shim |
+| 11 | `WH_KEYBOARD` + DLL, client `tid` | `err=0` | no | **never** | **raw input only**: no legacy `WM_KEYDOWN` is generated for it |
+| 12 | `WH_MOUSE` + DLL, client `tid` | `err=0` | no | **never** | raw input only |
+| 13 | `WH_CBT` + DLL, client `tid` | `err=0` | no | **never** | the client dispatches no `WM_MOVE`/`WM_SIZE`/`WM_ACTIVATE` |
+| 14 | `WH_CBT` + DLL, global | `err=0` | no | never in client | fired in 11 other processes (Chrome 139, explorer 75, PowerShell, ...) |
+| 15 | `WH_FOREGROUNDIDLE` + DLL, client `tid` | `err=0` | no | **never** | the client's queue never reports foreground-idle |
+| 16 | `WH_HARDWARE` + DLL, global | `err=0` | no | never in client | 35 132 callbacks in `GameInputRawInputProxy`, none in the client |
+| 17 | `SetWinEventHook(WINEVENT_INCONTEXT)` | handle non-null | no | never | does not inject even against our own mock target |
+| 18 | `SetWinEventHook(OUTOFCONTEXT)` | handle non-null | n/a (no injection) | fires (`event=0x8002`) | a control channel only |
+
+`WH_MSGFILTER` is `-1` (disabled) on this build; it was tried and rejected by the
+OS itself.
+
+### What the table says
+
+The tooling is not the variable. The same DLL is injected by 26 live processes
+in one run, and by our own mock under the sanity control - so when the client is
+absent from the log, what is being measured is the **client's behaviour**, and
+that behaviour is consistent across six hook families:
+
+1. it never calls `GetMessage` - so `WH_GETMESSAGE` is never raised;
+2. it never **sends** a message - `WH_CALLWNDPROC` fires in the *sender's*
+   context, and the client is never the sender;
+3. it consumes **raw input** only - `WH_KEYBOARD`/`WH_MOUSE` are never raised
+   for it, so the input path never delivers the DLL either;
+4. it dispatches no `WM_MOVE`/`WM_SIZE`/`WM_ACTIVATE` for `WH_CBT`, and never
+   reports foreground-idle;
+5. it refuses an unknown module load (`version.dll`), and
+6. a handle to it carries `0x1004` - no `VM_*`, no `CREATE_THREAD` - for every
+   caller, elevated admin and SYSTEM included.
+
+Every one of (1)-(3) is a *positive* property of a shipped game rather than a
+misconfiguration: raw input, a `PeekMessage` pump and no cross-thread sends are
+what a game does to keep input latency low. The anti-cheat does not have to
+block the hook - the client's own I/O design never gives the hook anything to
+fire on, and the one family that needs no message (`WINEVENT_INCONTEXT`) does
+not inject here even against our own control.
+
+### Reproduce
+
+```bat
+out\hook_types.exe out\FortHook.dll 120 cbt,idle,get      :: thread-local, the client's own tid
+out\hook_types.exe out\FortHook.dll 120 get,hw,cbt,msg 0  :: global sweep (26 processes reached)
+out\hook_input.exe out\FortHook.dll 120 both              :: WH_KEYBOARD + WH_MOUSE, client tid
+tools\run_types_elevated.bat                             :: the same, elevated - the client is high-integrity
+```
+
+The hook DLL resolves `payload.dll` from **its own directory** first, so nothing
+of ours needs to exist in the game directory, and it maps the payload only when
+the host is `FortniteClient-Win64-Shipping.exe` - so a global sweep can never
+start the overlay in an unrelated process. The game directory was verified back
+to its normal 68 entries after every run.

@@ -81,6 +81,11 @@ is no remote call anywhere in that path, so the handle cap is not on it.
 2. If the client's thread really never pumps, the same DLL can be delivered by
    the *other* hook family — `WH_CBT`/`WH_SHELL` install on the whole desktop
    and fire without a message — which is the next measurement, not a guess.
+   **Measured 13.11.2026: it does not reach the client either.** `WH_CBT` and
+   `WH_FOREGROUNDIDLE` (and `WH_HARDWARE`, `WH_KEYBOARD`, `WH_MOUSE`) all install
+   with `err=0`, and the same DLL is mapped into 26 other processes in one run,
+   but never into the client. Section 9 of `LIVE_TEST_RESULTS.md` has the whole
+   table.
 3. `SetWinEventHook(OUTOFCONTEXT)` is confirmed available and is the fallback
    control channel for a payload that is already inside.
 
