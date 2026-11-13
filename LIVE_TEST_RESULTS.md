@@ -311,3 +311,47 @@ powershell -NoProfile -ExecutionPolicy Bypass -File lab\run_hook_matrix.ps1
 
 No elevation is needed for the fixtures (they are not elevated). The client run
 is the high-integrity one and is measured with `tools\run_*_elevated.bat`.
+
+## 11. Live confirmation, 13.11.2026: the client's row, same harness
+
+Same harness, same DLL, same stimuli, now against the **running** client. The
+matrix attached to `FortniteClient-Win64-Shipping.exe` (pid 7840, window
+`UnrealWindow` `hwnd 0xC02B2`, `tid 25488`) with `--attach`, run **elevated**
+(the client's manifest raises it), the full family set installed thread-local
+to the client's window thread, then a global (`tid=0`) sweep.
+
+| run | install | `DllMain` in the **client** | GETMSG | CALLWND | CBT | FGIDLE | KBD | MOUSE |
+|---|---|---|---|---|---|---|---|---|
+| fixture `mock_client.exe raw`, `tl` | `err=0` | **yes** | 935 | 232 | 9 | 0 | 0 | 0 |
+| **live client**, `tl` (elevated, 60 s) | `err=0` | **no** | **0** | **0** | **0** | **0** | **0** | **0** |
+| **live client**, `global` (elevated, 60 s) | `err=0` | **no** | **0** | **0** | **0** | **0** | **0** | **0** |
+
+In the global pass the DLL was mapped into **19 other processes** (2 877 406 log
+lines; `GetMsgProc` alone fired 21 896 times across 16 of them) - and the
+client's pid appears in **none** of the family tables and in **none** of the
+`DllMain` lines. Not one of the game's own processes (`FortniteClient-...`,
+`..._EAC_EOS`, `FortniteLauncher`, `FortniteBootstrapper`, `EasyAntiCheat_EOS`)
+received it either.
+
+The client's absence from the `DllMain` line - the one line every mapped module
+writes - is the whole finding: the callbacks cannot fire because the module the
+callbacks live in is never there. Same DLL, same call, same stimuli that drive
+the fixture 935 times. The gap is delivery, and it is inside the client.
+
+### Reproduce
+
+```bat
+:: client running; approve the UAC prompt
+tools\run_matrix_elevated.bat
+:: -> hook_matrix_client.out, hook_matrix_client_global.out
+```
+
+### Incidental, and a correction: the `.local` marker is the game's
+
+While checking the game directory after the run, it had **69** entries, the
+extra one being `FortniteClient-Win64-Shipping.exe.local` - created at
+`18:18:41`, the **same second the client started**. So the marker is created by
+the game (`FortniteLauncher`/client) at start-up, not by this project's earlier
+experiments, and it is present whenever the game runs. The directory holds no
+file of ours; the `.local` marker was reported as ours by mistake in
+`docs/DELIVERY_STATUS.md`, and that note is corrected there.

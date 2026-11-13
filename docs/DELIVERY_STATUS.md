@@ -105,9 +105,10 @@ The game directory also holds `FortniteClient-Win64-Shipping.exe.local`
 (0 bytes, 13.11 08:00) - an application-directory redirection marker. `.local`
 makes the loader prefer the application directory over the system directory for
 *every* name, which is the one loader switch that would let a planted system-DLL
-name win. It was not created by this project's scripts; it appeared during the
-`version.dll` experiments and is 0 bytes. It is worth one deliberate test with a
-name the client asks for late, and worth deleting if the test is negative.
+name win. **Corrected later (section 11 of `LIVE_TEST_RESULTS.md`): the marker is
+created by the game itself at start-up** - its timestamp matches the client
+launch to the second - so it is present whenever the game runs and is not ours.
+It is worth one deliberate test with a name the client asks for late.
 
 Directories next to the binary that a late load would search:
 `D3D12\`, `DML\`, `EasyAntiCheat\`, and
@@ -131,9 +132,9 @@ planted in the game directory would satisfy the *Windows* loader, not this one.
 Two facts measured at the same time and worth keeping:
 
 * the game directory is **writable by the user** (`BUILTIN\Users: FullControl`);
-* a `FortniteClient-Win64-Shipping.exe.local` marker (0 bytes, created during the
-  `version.dll` experiments) was present in that directory and has been
-  **removed**; the client was restarted afterwards and runs normally.
+* a `FortniteClient-Win64-Shipping.exe.local` marker (0 bytes) was present in
+  that directory; it is created by the game at start-up (see the correction
+  under the `.local` note above), and the client runs normally with it there.
 
 ## Where this leaves the delivery problem
 
@@ -488,3 +489,10 @@ fixture does not: EAC's `LdrpLoadDll`/`LdrRegisterDllNotification` hooks, i.e. a
 `version.dll` and that caps a handle to the client at `0x1004` for every caller.
 This is a delivery problem, not a hook-selection problem, and it is the piece
 that was missing from the "the client just doesn't pump" reading.
+
+Confirmed against the **live** client the same day (section 11 of
+`LIVE_TEST_RESULTS.md`): attached to the running client, elevated, the full
+family set installs `err=0`, and after 60 s **no callback fires and `DllMain`
+never runs in the client's pid** - while a global pass maps the DLL into **19
+other processes** and none of the game's own processes. Same call that drives
+the fixture 935 times; the client never receives the module.
