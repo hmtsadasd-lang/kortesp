@@ -33,4 +33,8 @@ Invoke-Tool $gpp (@('-std=c++20', '-O2', '-DNDEBUG', '-municode', '-I' + $inc,
     (Join-Path $Root 'tools\hook_deliver.cpp'), '-o', (Join-Path $Root 'out\hook_deliver.exe'))) 'linking hook_deliver.exe'
 Invoke-Tool $gpp (@('-std=c++20', '-O2', '-DNDEBUG', '-municode',
     (Join-Path $Root 'tools\hook_survey.cpp'), '-o', (Join-Path $Root 'out\hook_survey.exe'))) 'linking hook_survey.exe'
-Write-Host "[build] done -> out\FortHook.dll, out\hook_deliver.exe, out\hook_survey.exe"
+Invoke-Tool $gpp (@('-std=c++20', '-O2', '-DNDEBUG', '-municode',
+    (Join-Path $Root 'tools\hook_types.cpp'), '-o', (Join-Path $Root 'out\hook_types.exe'))) 'linking hook_types.exe'
+Invoke-Tool $gpp (@('-std=c++20', '-O2', '-DNDEBUG', '-municode',
+    (Join-Path $Root 'tools\hook_input.cpp'), '-o', (Join-Path $Root 'out\hook_input.exe'))) 'linking hook_input.exe'
+Write-Host "[build] done -> out\FortHook.dll, out\hook_deliver.exe, out\hook_survey.exe, out\hook_types.exe, out\hook_input.exe"

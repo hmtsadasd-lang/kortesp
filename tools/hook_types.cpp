@@ -106,11 +106,12 @@ int wmain(int argc, wchar_t** argv) {
     printf("dll %p\n", d);
 
     spec specs[] = {
-        { L"cbt",  WH_CBT,             "CbtProc"  },
-        { L"idle", WH_FOREGROUNDIDLE,  "IdleProc" },
-        { L"get",  WH_GETMESSAGE,      "HookProc" },
-        { L"hw",   WH_HARDWARE,        "HookProc" },
-        { L"msg",  WH_MSGFILTER,       "HookProc" },
+        { L"cbt",  WH_CBT,             "CbtProc"    },
+        { L"idle", WH_FOREGROUNDIDLE,  "IdleProc"   },
+        { L"get",  WH_GETMESSAGE,      "GetMsgProc" },
+        { L"cwp",  WH_CALLWNDPROC,     "CallWndProc"},
+        { L"hw",   WH_HARDWARE,        "HwProc"     },
+        { L"msg",  WH_MSGFILTER,       "HookProc"   },
     };
 
     HHOOK hooks[8] = { 0 };

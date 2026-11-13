@@ -92,3 +92,27 @@ is no remote call anywhere in that path, so the handle cap is not on it.
 The tools and the DLL are built and runnable:
 `out\hook_deliver.exe` (delivers), `out\FortHook.dll` (loads into the client),
 `out\loader.exe --lateral` (re-runs this whole table).
+
+## Addendum, 13.11.2026: the mock-client matrix isolates the real cause
+
+The claim above - "the hook installs, so the remaining question is whether the
+client's thread pumps" - is answered, and the answer is *no, the pumping is not
+the problem*. `lab\mock_client.c` is a fixture with the client's exact I/O
+design (`PeekMessage` + `RIDEV_NOLEGACY`), and `lab\hook_matrix.cpp` drives the
+whole family set against it. Full table and reasoning in section 10 of
+`LIVE_TEST_RESULTS.md`; the two lines that matter:
+
+* `WH_GETMESSAGE` fired **935 times** against a `PeekMessage` target that never
+  calls `GetMessage` - so `SetWindowsHookEx(WH_GETMESSAGE, ...)` and a
+  `PeekMessage` loop are not in conflict;
+* `WH_CBT` fired against the same raw-input target, while `WH_KEYBOARD`/
+  `WH_MOUSE` did **not** (the fixture saw `input=786 legacy=0`).
+
+A target that behaves exactly like the client drives `WH_GETMESSAGE`,
+`WH_CALLWNDPROC` and `WH_CBT`; the client drives none of them. The distinction
+is therefore not "install" versus "walk a message" - it is that `FortHook.dll`
+is never **mapped into the client** (no `DllMain` line ever, in 47 654 lines of
+a global sweep). The hook installs and the message walk happens; the module the
+callback lives in is simply not there. That is a loader/delivery refusal inside
+the client (EAC's `LdrpLoadDll`/`LdrRegisterDllNotification` hooks are the
+measured-consistent candidate), not a property of any hook family.

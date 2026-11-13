@@ -450,3 +450,41 @@ runs" is wrong, and the measurement that corrects it is in section 9 of
 "Refused" and "never fires" are different findings, and only the second one is
 true. The practical consequence is the same, but the door is the client's input
 design rather than an anti-cheat gate.
+
+## Correction, 13.11.2026 (final): the design does *not* explain it - the module is never mapped
+
+The correction above was itself half wrong, and the controlled experiment that
+settles it is section 10 of `LIVE_TEST_RESULTS.md`
+(`lab\run_hook_matrix.ps1`, fixture `lab\mock_client.exe`).
+
+The fixture runs the client's **exact** I/O design - `PeekMessage(PM_REMOVE)`
+plus `RegisterRawInputDevices(RIDEV_NOLEGACY)` - and the matrix installs the
+whole family set against it:
+
+| family | fixture (client's design) | live client |
+|---|---|---|
+| `WH_GETMESSAGE` | **935** (fires on `PeekMessage`) | never |
+| `WH_CALLWNDPROC` | 232 | never |
+| `WH_CBT` | 9 | never |
+| `WH_FOREGROUNDIDLE` | 0 | never |
+| `WH_KEYBOARD` | **0** (`input=786 legacy=0`) | never |
+| `WH_MOUSE` | **0** | never |
+
+So `PeekMessage` suppresses **none** of `WH_GETMESSAGE`/`WH_CALLWNDPROC`/`WH_CBT`;
+a target with the client's design drives all three. The only design reason that
+survives is raw input (`RIDEV_NOLEGACY`) for the input hooks, and foreground-idle
+needing a blocking `GetMessage` wait. The `WH_GETMESSAGE` and `WH_CBT` negatives
+in the live client are therefore **not** design.
+
+Read together with the global sweep (`DllMain` never ran in the client's pid in
+47 654 log lines), the finding is:
+
+> `FortHook.dll` is **never mapped into the client**, so no hook family can run
+> there regardless of how the client pumps messages.
+
+The remaining, measured-consistent candidate is the layer the client has and the
+fixture does not: EAC's `LdrpLoadDll`/`LdrRegisterDllNotification` hooks, i.e. a
+**module-load veto** - the same layer that refuses the byte-identical signed
+`version.dll` and that caps a handle to the client at `0x1004` for every caller.
+This is a delivery problem, not a hook-selection problem, and it is the piece
+that was missing from the "the client just doesn't pump" reading.

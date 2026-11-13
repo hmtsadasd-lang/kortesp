@@ -1,6 +1,11 @@
 LIBRARY FortHook
 EXPORTS
     HookProc
+    GetMsgProc
+    CallWndProc
+    KbdProc
+    MouseProc
+    HwProc
     StartPinger
     WinEventProc
     CbtProc

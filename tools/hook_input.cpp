@@ -95,22 +95,23 @@ int wmain(int argc, wchar_t** argv) {
 
     HMODULE d = LoadLibraryW(dll);
     if (!d) { printf("[!] dll %ls err=%lu\n", dll, GetLastError()); return 1; }
-    HOOKPROC proc = (HOOKPROC)(uintptr_t)GetProcAddress(d, "HookProc");
-    printf("dll %p HookProc %p\n", d, (void*)proc);
-    if (!proc) return 1;
+    HOOKPROC kbd_proc = (HOOKPROC)(uintptr_t)GetProcAddress(d, "KbdProc");
+    HOOKPROC mouse_proc = (HOOKPROC)(uintptr_t)GetProcAddress(d, "MouseProc");
+    printf("dll %p KbdProc %p MouseProc %p\n", d, (void*)kbd_proc, (void*)mouse_proc);
+    if (!kbd_proc || !mouse_proc) return 1;
 
     bool want_kbd = (wcscmp(mode, L"mouse") != 0);
     bool want_mouse = (wcscmp(mode, L"kbd") != 0);
 
     HHOOK hk = nullptr, hm = nullptr;
     if (want_kbd) {
-        hk = SetWindowsHookExW(WH_KEYBOARD, proc, d, hook_tid);
+        hk = SetWindowsHookExW(WH_KEYBOARD, kbd_proc, d, hook_tid);
         DWORD e = GetLastError();
         printf("WH_KEYBOARD   hook=%p err=%lu tid=%lu\n", hk, e, (unsigned long)hook_tid);
         if (!hk) printf("[!] keyboard hook refused err=%lu\n", e);
     }
     if (want_mouse) {
-        hm = SetWindowsHookExW(WH_MOUSE, proc, d, hook_tid);
+        hm = SetWindowsHookExW(WH_MOUSE, mouse_proc, d, hook_tid);
         DWORD e = GetLastError();
         printf("WH_MOUSE      hook=%p err=%lu tid=%lu\n", hm, e, (unsigned long)hook_tid);
         if (!hm) printf("[!] mouse hook refused err=%lu\n", e);

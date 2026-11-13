@@ -213,6 +213,15 @@ block the hook - the client's own I/O design never gives the hook anything to
 fire on, and the one family that needs no message (`WINEVENT_INCONTEXT`) does
 not inject here even against our own control.
 
+> **Correction, later the same day - see section 10.** The mock-client matrix
+> disproves reasons **(1)** and the CBT half of **(4)**: a fixture with the
+> client's exact `PeekMessage` + `RIDEV_NOLEGACY` design *does* drive
+> `WH_GETMESSAGE`, `WH_CALLWNDPROC` and `WH_CBT`. Only the raw-input reason
+> **(3)** survives. The real reading of this table is therefore not "the design
+> never fires the hooks" but "`FortHook.dll` is never mapped into the client":
+> the delivery is refused, and section 10 is the controlled experiment that
+> separates the two.
+
 ### Reproduce
 
 ```bat
@@ -227,3 +236,78 @@ of ours needs to exist in the game directory, and it maps the payload only when
 the host is `FortniteClient-Win64-Shipping.exe` - so a global sweep can never
 start the overlay in an unrelated process. The game directory was verified back
 to its normal 68 entries after every run.
+
+## 10. The mock-client matrix, 13.11.2026: the client's design is not the reason
+
+Section 9 left two explanations for six hook families that install `err=0` and
+then never run, and they are not the same problem:
+
+* **A. design** - the client's `PeekMessage` pump and raw-input path never give
+  those hooks anything to fire on; or
+* **B. delivery** - the injection itself (the loader mapping `FortHook.dll`
+  into the client) is refused inside the client, so no callback can ever run.
+
+They are separated by a **fixture that copies the client's I/O design** and can
+be watched directly: `lab\mock_client.c`. It has three loops on its command
+line, one of which (`raw`) is exactly the client's - `PeekMessage(PM_REMOVE)`
+plus `RegisterRawInputDevices(RIDEV_NOLEGACY)`. `lab\hook_matrix.cpp` starts the
+fixture, installs **every family** (one export per family, so the log names the
+one that fired), applies its own stimuli (posted `WM_NULL`, window moves,
+foreground swaps, real `SendInput`, and a `SendMessage` to drive the sender-side
+`WH_CALLWNDPROC`), then parses the hook log into a table.
+
+`lab\run_hook_matrix.ps1` builds and runs the whole thing. Counts below are one
+run; the pattern is what is stable, not the exact numbers.
+
+| target | loop | legacy input | GETMSG | CALLWND | CBT | FGIDLE | KBD | MOUSE | note |
+|---|---|---|---|---|---|---|---|---|---|
+| `mock_gui.exe` (control) | `GetMessage` | on | 1345 | 2777 | 1014 | 730 | 46 | 939 | everything that can fire, fires |
+| `mock_client.exe get` | `GetMessage` | on | 244 | 228 | 107 | 75 | 98 | 0 | textbook loop |
+| `mock_client.exe peek` | `PeekMessage` | on | 182 | 277 | 48 | 0 | 36 | 0 | `WH_GETMESSAGE` **does** fire on `PeekMessage` |
+| `mock_client.exe raw` | `PeekMessage` | **`RIDEV_NOLEGACY`** | 935 | 232 | 9 | 0 | **0** | **0** | the client's design; `input=786 legacy=0` |
+| `mock_client.exe raw`, global (`tid=0`) | `PeekMessage` | `RIDEV_NOLEGACY` | 1945 | 404 | 9 | 0 | 0 | 0 | reached the fixture **and 8 other processes** |
+
+### What this settles
+
+1. **`PeekMessage` does not suppress `WH_GETMESSAGE`.** The fixture is in `raw`
+   mode, its loop never calls `GetMessage`, yet `GetMsgProc` ran **935 times**.
+   `WH_GETMESSAGE` is raised by `GetMessage` **and** `PeekMessage`. So section
+   9's reason (1) - "it never calls `GetMessage`, so `WH_GETMESSAGE` is never
+   raised" - is **wrong**; the client's loop shape does not explain that silence.
+2. **`RIDEV_NOLEGACY` *does* suppress `WH_KEYBOARD`/`WH_MOUSE`.** In `raw` mode
+   the fixture saw `input=786` with `legacy=0`, and `KbdProc`/`MouseProc` never
+   fired; in `peek`/`get` they did. Section 9's reason (3) **holds**: the input
+   path is a design answer.
+3. **`WH_CBT` fires on a `PeekMessage` + raw-input target** (9 times in `raw`),
+   so section 9's reason (4) does **not** explain the client's silence either.
+4. **`WH_FOREGROUNDIDLE` needs a blocking message wait.** It fired in `get`
+   mode (75) and never in the `PeekMessage`+`Sleep(1)` loops (0). The client's
+   loop shape is consistent with that one negative.
+
+So of section 9's design reasons, only the raw-input one survives. The families
+that a fixture with the client's *exact* design drives - **`WH_GETMESSAGE`,
+`WH_CALLWNDPROC`, `WH_CBT`** - never fire in the client. The fixture also proves
+the same DLL and installs reach it in a **global** sweep that the client is
+absent from. Combined with the global sweep's strongest line - `DllMain` never
+ran in the client's pid in 47 654 log lines - the reading is:
+
+> **The hook families are fine; `FortHook.dll` is never mapped into the client.**
+> The missing piece is delivery into the client, not the choice of hook.
+
+The remaining candidate is the layer the client *does* have and the fixture does
+not: EAC hooks `LdrpLoadDll`/`LdrRegisterDllNotification`, i.e. it can veto a
+module load that a normal process would accept. That is consistent with the rest
+of section 9 - the `version.dll` proxy is refused on the *file* even when
+byte-identical and signed, and a handle to the client carries `0x1004` for every
+caller. What the hook matrix adds is that "the client doesn't pump the right
+message" is no longer an available explanation.
+
+### Reproduce
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File lab\run_hook_matrix.ps1
+:: results land in out\lab\matrix_*.out
+```
+
+No elevation is needed for the fixtures (they are not elevated). The client run
+is the high-integrity one and is measured with `tools\run_*_elevated.bat`.

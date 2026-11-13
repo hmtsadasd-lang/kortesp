@@ -196,6 +196,41 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK HookProc(int code, WPARAM wp, 
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
+// One export per hook family, so the log line names the family that actually
+// fired instead of the generic "HookProc". Every one of them is the same two
+// statements - count, then hand the message on - but the *name* in the log is
+// the whole point of the matrix: "CbtProc fired" and "KbdProc fired" are
+// different answers to "which door opened".
+extern "C" __declspec(dllexport) LRESULT CALLBACK GetMsgProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("GetMsgProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+extern "C" __declspec(dllexport) LRESULT CALLBACK CallWndProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("CallWndProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+extern "C" __declspec(dllexport) LRESULT CALLBACK KbdProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("KbdProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+extern "C" __declspec(dllexport) LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("MouseProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+extern "C" __declspec(dllexport) LRESULT CALLBACK HwProc(int code, WPARAM wp, LPARAM lp) {
+    (void)wp; (void)lp;
+    hook_fired("HwProc", code);
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
 // The CBT hook.
 //
 // WH_CBT is a *thread-local* hook whose target is the thread that created
