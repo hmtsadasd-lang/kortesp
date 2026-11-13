@@ -9,9 +9,36 @@ inline PEB_* self() {
     return reinterpret_cast<PEB_*>(__readgsqword(0x60));
 }
 
-inline void* module_base(uint32_t name_hash) {
+// FLAG ON FAILURE: the module walk used to fail silently (return nullptr),
+// and a caller cannot tell "ntdll is not loaded" from "the PEB was read at the
+// wrong offset". In a manually mapped image this walk is the only way to reach
+// an API, so a silent nullptr hides the bug that kills the payload. The host
+// reads this counter out of the mapped data section and the payload reports it
+// itself; see docs/SESSION_NOTES.md.
+inline volatile uint32_t g_module_walk_miss = 0;
+
+// Loader-list iteration, for callers that need to inspect every module (a
+// hash cannot answer "which module is the client", only "is this name here").
+inline LDR_DATA_TABLE_ENTRY_* first_module() {
     PEB_* p = self();
     if (!p || !p->Ldr) return nullptr;
+    auto* head = reinterpret_cast<uint8_t*>(p->Ldr) + 0x10;
+    auto* cur  = *reinterpret_cast<uint8_t**>(head);
+    return (cur && cur != head) ? reinterpret_cast<LDR_DATA_TABLE_ENTRY_*>(cur) : nullptr;
+}
+
+inline LDR_DATA_TABLE_ENTRY_* next_module(LDR_DATA_TABLE_ENTRY_* e) {
+    if (!e) return nullptr;
+    PEB_* p = self();
+    if (!p || !p->Ldr) return nullptr;
+    auto* head = reinterpret_cast<uint8_t*>(p->Ldr) + 0x10;
+    auto* cur  = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(e));
+    return (cur && cur != head) ? reinterpret_cast<LDR_DATA_TABLE_ENTRY_*>(cur) : nullptr;
+}
+
+inline void* module_base(uint32_t name_hash) {
+    PEB_* p = self();
+    if (!p || !p->Ldr) { ++g_module_walk_miss; return nullptr; }
 
     auto* head = reinterpret_cast<uint8_t*>(p->Ldr) + 0x10;
     auto* cur  = *reinterpret_cast<uint8_t**>(head);
@@ -21,6 +48,7 @@ inline void* module_base(uint32_t name_hash) {
         if (e->BaseDllName.Buffer && h::fnv1a_w(e->BaseDllName.Buffer) == name_hash) return e->DllBase;
         cur = *reinterpret_cast<uint8_t**>(cur);
     }
+    ++g_module_walk_miss;
     return nullptr;
 }
 

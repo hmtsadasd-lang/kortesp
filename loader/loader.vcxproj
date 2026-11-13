@@ -53,6 +53,7 @@
   <ItemGroup>
     <ClCompile Include="src\handle.cpp" />
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="..\shared\src\map_host.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

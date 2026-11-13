@@ -38,7 +38,7 @@ $cxxFlags = @(
     "-I$(Join-Path $Root 'payload\src')"
 )
 
-$units = @('entry', 'game', 'hide', 'log', 'map', 'render', 'libc_min')
+$units = @('entry', 'game', 'hide', 'log', 'map', 'render', 'libc_min', 'probe')
 foreach ($u in $units) {
     Invoke-Tool $gpp ($cxxFlags + @((Join-Path $Root "payload\src\$u.cpp"), '-o', (Join-Path $obj "$u.o"))) "compiling $u.cpp"
 }

@@ -8,34 +8,52 @@ namespace {
 
 using game::Vec;
 
-// 43.00 (CL-59596594) offsets - baked from Underscores dump
+// Fortnite 43.00 (UWorld5 / UE5) offsets.
+// Source: Dumpspace dump "Fortnite", game hash 6b77eceb, uploaded 2025-11-12
+// (OFFSET_GENGINE = 480100824, OFFSET_GOBJECTS = 479620888, OFFSET_APPENDSTRING
+// = 267716) and ClassesInfo from the same dump for every member below.
+// Verified against the client on disk: 0x140000000 + 480100824 falls inside
+// SizeOfImage (0x1E4F50E8), and the 240-byte gap after it covers exactly the
+// 40-byte UObject header + PaddingProperties, which is what a static
+// UEngine** in a UObject-style accessor looks like.
 namespace off {
-    constexpr uintptr_t GEngine             = 0x1C8E2F48;
-    constexpr uintptr_t Engine_GameViewport = 0xB70;
+    // Absolute RVAs from the client's base - *not* module-relative offsets.
+    constexpr uintptr_t GEngine             = 0x1C9DC1D8;
+    constexpr uintptr_t GObjects            = 0x1C966F18;
+
+    // UEngine::GameViewportClient (UEngine 4344 bytes, UGameViewportClient).
+    constexpr uintptr_t Engine_GameViewport = 0xC0;   // UGameViewportClient::World
     constexpr uintptr_t Viewport_World      = 0x78;
 
-    constexpr uintptr_t World_Location      = 0x178;
-    constexpr uintptr_t World_Rotation      = 0x188;
-    constexpr uintptr_t World_GameState     = 0x160;
-    constexpr uintptr_t World_Seconds       = 0x198;
+    // UWorld (2408 bytes)
+    constexpr uintptr_t World_Location      = 0x178;  // unverified (camera loc)
+    constexpr uintptr_t World_Rotation      = 0x188;  // unverified (camera rot)
+    constexpr uintptr_t World_GameState     = 0x1C0;  // UWorld::GameState
+    constexpr uintptr_t World_GameInstance  = 0x238;  // UWorld::OwningGameInstance
+    constexpr uintptr_t World_Seconds       = 0x4A8;  // UWorld::TimeSeconds (unverified)
 
-    constexpr uintptr_t GameState_Players   = 0x290;
+    // AGameStateBase (728 bytes)
+    constexpr uintptr_t GameState_Players   = 0x290;  // AGameStateBase::PlayerArray (656)
 
-    constexpr uintptr_t State_Pawn          = 0x2F0;
-    constexpr uintptr_t State_Team          = 0xF81;
-    constexpr uintptr_t State_Name          = 0x9F0;
-    constexpr uintptr_t Text_String         = 0x28;
+    // APlayerState (816) / AFortPlayerStateAthena (6088)
+    constexpr uintptr_t State_Pawn          = 0x2F0;  // APlayerState::PawnPrivate (752)
+    constexpr uintptr_t State_Name          = 0x310;  // APlayerState::PlayerNamePrivate (784)
+    constexpr uintptr_t State_Team          = 0xF81;  // AFortPlayerStateAthena::TeamIndex (3969)
+    constexpr uintptr_t State_Kills         = 0xF98;  // AFortPlayerStateAthena::KillScore (3992)
+    constexpr uintptr_t Text_String         = 0x28;   // FString inside the TWeakObjectPtr pair
 
-    constexpr uintptr_t Pawn_Mesh           = 0x318;
-    constexpr uintptr_t Pawn_Dying          = 0x738;
-    constexpr uintptr_t Pawn_HealthSet      = 0x1430;
+    // APawn (760) / ACharacter (1600) / AFortPawn (8240)
+    constexpr uintptr_t Pawn_Mesh           = 0x2F8;  // ACharacter::Mesh (760)
+    constexpr uintptr_t Pawn_Dying          = 0x738;  // AFortPawn::bIsDying bit 5 (1848)
+    constexpr uintptr_t Pawn_HealthSet      = 0x1430; // AFortPawn::HealthSet (5168)
 
     constexpr uintptr_t Health_Value        = 0x48;
     constexpr uintptr_t Health_Max          = 0x70;
 
-    constexpr uintptr_t Mesh_C2W            = 0x1C0;
-    constexpr uintptr_t Mesh_Bones          = 0x6F0;
-    constexpr uintptr_t Mesh_RenderTime     = 0x2E8;
+    // USceneComponent / USkeletalMeshComponent (4080)
+    constexpr uintptr_t Mesh_C2W            = 0x1C0;  // ComponentToWorld (unverified)
+    constexpr uintptr_t Mesh_Bones          = 0xA38;  // CachedComponentSpaceTransforms (2624, 96-byte FTransform)
+    constexpr uintptr_t Mesh_RenderTime     = 0x2E8;  // unverified
     constexpr uintptr_t Xform_Trans         = 0x10;
     constexpr uintptr_t Xform_Stride        = 0x60;
 
@@ -46,10 +64,56 @@ namespace off {
 
 uintptr_t g_world{};
 uintptr_t g_base{};
+uintptr_t g_client{};
 bool g_ready{};
 int g_w{}, g_h{};
 
 inline bool okp(uintptr_t p) { return p > 0x10000 && p < 0x7FFFFFFFFFFF && !(p & 3); }
+
+// Base of the shipping client in this process, found by walking the PEB loader
+// list. The mapped payload is not the client, so this is the only base the
+// client's RVAs may be added to.
+uintptr_t client_base() {
+    const wchar_t* want = L"FortniteClient-Win64-Shipping.exe";
+    for (auto* e = peb::first_module(); e; e = peb::next_module(e)) {
+        const wchar_t* n = e->BaseDllName.Buffer;
+        if (!n || !e->DllBase) continue;
+        size_t i = 0;
+        for (; want[i]; ++i) {
+            wchar_t a = n[i], b = want[i];
+            if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+            if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+            if (a != b) break;
+        }
+        if (!want[i] && n[i] == 0) return reinterpret_cast<uintptr_t>(e->DllBase);
+    }
+    return 0;
+}
+
+// okp() only says the pointer looks like an address. The client's offsets are
+// absolute RVAs from the client's base, and when the payload is mapped into
+// something that is not the client, base + offset lands inside the mapped image
+// itself - a valid, committed, writable page. Reading there does not fault at
+// the read; it faults on the *next* hop, when the garbage it produced is used
+// as a pointer. So every hop is checked against the image before it is used.
+bool in_image(uintptr_t p) {
+    // Tests against the *client* image when we know its base: the payload is
+    // mapped elsewhere, so its own image says nothing about the client's pages.
+    void* img = g_client ? reinterpret_cast<void*>(g_client)
+                         : peb::self()->ImageBaseAddress;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER_*>(img);
+    if (!dos || dos->e_magic != 0x5A4D) return true;      // cannot tell: allow
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64_*>(reinterpret_cast<uint8_t*>(dos) + dos->e_lfanew);
+    uintptr_t lo = reinterpret_cast<uintptr_t>(dos);
+    uintptr_t hi = lo + nt->OptionalHeader.SizeOfImage;
+    return p >= lo && p < hi;
+}
+
+template <class T> inline T rdi(uintptr_t base, uintptr_t off_) {
+    uintptr_t a = base + off_;
+    if (!in_image(a) || !okp(a)) return T{};
+    return *reinterpret_cast<T*>(a);
+}
 template <class T> inline T rd(uintptr_t a) { return okp(a) ? *reinterpret_cast<T*>(a) : T{}; }
 
 struct Mat { float m[4][4]; };
@@ -139,22 +203,44 @@ render::Color team_color(int team, int my_team) {
 namespace game {
 
 bool init() {
-    g_base = reinterpret_cast<uintptr_t>(peb::self()->ImageBaseAddress);
-    if (!g_base) { log::w(L"no base"); return false; }
+    // The offsets above are RVAs from the *client's* base. When this image is
+    // mapped into the client, ImageBaseAddress is the mapped payload, not the
+    // client - which is why base+0x1C9DC1D8 landed outside the image and the
+    // whole chain was refused. Find the client module by name instead.
+    g_client = client_base();
+    if (!g_client) { log::w(L"game::init: client module not found"); return false; }
+    log::w(L"game::init: client base:"); log::hex(g_client);
 
-    uintptr_t engine = rd<uintptr_t>(g_base + off::GEngine);
-    if (!engine) { log::w(L"gEngine null"); return false; }
+    g_base = g_client;
+
+    uintptr_t engine_addr = g_base + off::GEngine;
+    uintptr_t img_lo = g_base, img_hi = g_base;
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER_*>(g_base);
+        if (dos->e_magic == 0x5A4D) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64_*>(
+                g_base + dos->e_lfanew);
+            img_hi = g_base + nt->OptionalHeader.SizeOfImage;
+        }
+    }
+    if (engine_addr < img_lo || engine_addr >= img_hi) {
+        log::w(L"game::init: GEngine address outside the client image");
+        return false;
+    }
+    log::w(L"game::init: GEngine inside the client, reading");
+    uintptr_t engine = rd<uintptr_t>(engine_addr);
+    if (!okp(engine)) { log::w(L"game::init: UEngine null (not in a match)"); return false; }
 
     uintptr_t vp = rd<uintptr_t>(engine + off::Engine_GameViewport);
-    if (!vp) { log::w(L"viewport null"); return false; }
+    if (!okp(vp)) { log::w(L"game::init: viewport null"); return false; }
 
     g_world = rd<uintptr_t>(vp + off::Viewport_World);
-    if (!g_world) { log::w(L"world null"); return false; }
+    if (!okp(g_world)) { log::w(L"game::init: world null (not in a match)"); return false; }
 
-    if (!rd<uintptr_t>(g_world + off::World_GameState)) { log::w(L"gamestate null"); return false; }
+    if (!rd<uintptr_t>(g_world + off::World_GameState)) { log::w(L"game::init: gamestate null"); return false; }
 
     g_ready = true;
-    log::w(L"chain resolved");
+    log::w(L"game::init: chain resolved");
     return true;
 }
 

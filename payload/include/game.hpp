@@ -17,6 +17,8 @@ struct Player {
     wchar_t name[32]{};
 };
 
+// The base the client's RVAs are added to: the module list, never
+// ImageBaseAddress (measured wrong on this build).
 bool init();
 void draw();
 bool ready();

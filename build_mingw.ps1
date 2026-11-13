@@ -41,11 +41,13 @@ $cxxFlags = @(
 
 Invoke-Tool $gpp ($cxxFlags + @((Join-Path $Root 'loader\src\main.cpp'), '-o', (Join-Path $obj 'main.o'))) 'compiling main.cpp'
 Invoke-Tool $gpp ($cxxFlags + @((Join-Path $Root 'loader\src\handle.cpp'), '-o', (Join-Path $obj 'handle.o'))) 'compiling handle.cpp'
+Invoke-Tool $gpp ($cxxFlags + @((Join-Path $Root 'shared\src\map_host.cpp'), '-o', (Join-Path $obj 'map_host.o'))) 'compiling map_host.cpp'
+Invoke-Tool $gpp ($cxxFlags + @((Join-Path $Root 'shared\src\lateral.cpp'), '-o', (Join-Path $obj 'lateral.o'))) 'compiling lateral.cpp'
 
 Invoke-Tool $gpp (@(
     '-mconsole', '-municode', '-static', '-static-libgcc', '-static-libstdc++',
     '-o', (Join-Path $Root 'out\loader.exe'),
-    (Join-Path $obj 'main.o'), (Join-Path $obj 'handle.o'),
+    (Join-Path $obj 'main.o'), (Join-Path $obj 'handle.o'), (Join-Path $obj 'map_host.o'), (Join-Path $obj 'lateral.o'),
     '-ladvapi32', '-lshell32'
 )) 'linking loader.exe'
 

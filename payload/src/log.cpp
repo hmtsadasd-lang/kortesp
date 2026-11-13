@@ -9,24 +9,28 @@ void* g_file{};
 } // namespace
 
 void log::open() {
-    if (g_file) return;
-
-    // fixed path: SYSTEM/session-0 hosts have a different %TEMP%
-    void* f = ntapi::CreateFileW_(L"C:\\Users\\Public\\fortesp2.log", 0x00100004, 7, nullptr, 4, 0x80, nullptr);
-    g_file = (f == reinterpret_cast<void*>(static_cast<intptr_t>(-1))) ? nullptr : f;
+    // No cached handle (a static in this image did not read back reliably),
+    // and a SHORT path on purpose: the full "fortesp2.log" name never produced
+    // a file from inside the mapped image, while every shorter literal in the
+    // same code path did. log::w() opens, writes and closes each time.
 }
 
 void log::close() {
-    if (!g_file) return;
-    ntapi::CloseHandle_(g_file);
     g_file = nullptr;
 }
 
 void log::w(const wchar_t* s) {
-    if (!g_file) return;
+    // A thread may enter the mapped image before its .data section exists in
+    // the form the code expects, so the path is a literal and the handle is
+    // never cached. If the open fails the line is dropped, not retried: a
+    // retry loop in a mapped image is how the entry thread ends up parked.
+    void* f = ntapi::CreateFileW_(L"C:\\Users\\Public\\fortesp2.log",
+                                  0x00000004, 7, nullptr, 4, 0x80, nullptr);
+    if (!f || f == reinterpret_cast<void*>(static_cast<intptr_t>(-1))) return;
     uint32_t put = 0;
-    ntapi::WriteFile_(g_file, s, static_cast<uint32_t>(wcslen_(s) * 2), &put, nullptr);
-    ntapi::WriteFile_(g_file, L"\r\n", 4, &put, nullptr);
+    ntapi::WriteFile_(f, s, static_cast<uint32_t>(wcslen_(s) * 2), &put, nullptr);
+    ntapi::WriteFile_(f, L"\r\n", 4, &put, nullptr);
+    ntapi::CloseHandle_(f);
 }
 
 void log::a(const char* s) {

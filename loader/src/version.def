@@ -1,0 +1,19 @@
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA = version_real.dll.GetFileVersionInfoA
+    GetFileVersionInfoByHandle = version_real.dll.GetFileVersionInfoByHandle
+    GetFileVersionInfoExA = version_real.dll.GetFileVersionInfoExA
+    GetFileVersionInfoExW = version_real.dll.GetFileVersionInfoExW
+    GetFileVersionInfoSizeA = version_real.dll.GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeExA = version_real.dll.GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW = version_real.dll.GetFileVersionInfoSizeExW
+    GetFileVersionInfoSizeW = version_real.dll.GetFileVersionInfoSizeW
+    GetFileVersionInfoW = version_real.dll.GetFileVersionInfoW
+    VerFindFileA = version_real.dll.VerFindFileA
+    VerFindFileW = version_real.dll.VerFindFileW
+    VerInstallFileA = version_real.dll.VerInstallFileA
+    VerInstallFileW = version_real.dll.VerInstallFileW
+    VerLanguageNameA = KERNEL32.VerLanguageNameA
+    VerLanguageNameW = KERNEL32.VerLanguageNameW
+    VerQueryValueA = version_real.dll.VerQueryValueA
+    VerQueryValueW = version_real.dll.VerQueryValueW
