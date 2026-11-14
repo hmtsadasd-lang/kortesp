@@ -36,6 +36,7 @@ extern uint64_t  g_gcr3;
 extern uint64_t  g_base;
 extern uint64_t  g_size;
 extern uint64_t  g_eprocess;
+extern uint64_t  g_ntos;      // ntoskrnl base, for export resolution
 extern uint32_t  g_pid;
 extern bool      g_ready;
 extern bool      g_attached;

@@ -13,6 +13,7 @@ uint64_t  vmm::g_gcr3 = 0;
 uint64_t  vmm::g_base = 0;
 uint64_t  vmm::g_size = 0;
 uint64_t  vmm::g_eprocess = 0;
+uint64_t  vmm::g_ntos = 0;   // ntoskrnl base, resolved during init
 uint32_t  vmm::g_pid = 0;
 bool      vmm::g_ready = false;
 bool      vmm::g_attached = false;
