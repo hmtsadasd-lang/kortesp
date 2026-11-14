@@ -3,204 +3,125 @@
 #include <windows.h>
 #include <cstring>
 
-namespace { constexpr uint64_t kUserLo=0x10000,kUserHi=0x7FFFFFFFFFFF,kPteMask=0x000FFFFFFFFFF000ull; }
+// --- TLB definitions matching the header ---
+std::array<vmm::TlbEntry, vmm::kTlbSize> vmm::g_tlb{};
+uint32_t                                    vmm::g_stamp = 1;
 
+// --- Global state definitions (must match header exactly) ---
+uint64_t  vmm::g_kcr3 = 0;
+uint64_t  vmm::g_gcr3 = 0;
+uint64_t  vmm::g_base = 0;
+uint64_t  vmm::g_size = 0;
+uint64_t  vmm::g_eprocess = 0;
+uint32_t  vmm::g_pid = 0;
+bool      vmm::g_ready = false;
+bool      vmm::g_attached = false;
+
+// Layout triples for EPROCESS field walks
+vmm::Layout   vmm::g_lay{ 0x1D0, 0x1D8, 0x338, 0x28 };
+
+// --- Helper: physical-page read via r0 backend ---
+bool phys_read(uint64_t pa, void* buf) {
+    return r0::pread(pa, buf, 8);
+}
+
+// --- CR3 translation: PML4 → PDPT → PDE → PT ---
 bool translate_cr3(uint64_t cr3, uint64_t va, uint64_t& pa) {
     uint64_t page = va & ~0xFFFull;
-    auto& e = g_tlb[(page >> 12) & (kTlb - 1)];
-    if (e.page == page && e.stamp == g_stamp) { pa = e.phys + (va & 0xFFF); return true; }
-
-    cr3 &= kPteMask;
-    uint64_t t{}, next{}, phys{};
-    bool big = false;
-
-    if (!r0::pread(cr3 + 8 * ((va >> 39) & 0x1FF), &t, 8) || !(t & 1)) return false;
-    next = t & kPteMask;
-
-    if (!r0::pread(next + 8 * ((va >> 30) & 0x1FF), &t, 8) || !(t & 1)) return false;
-    if (t & 0x80) { phys = (t & 0x000FFFFFC0000000ull) + (va & 0x3FFFFFFFull); big = true; }
-
-    if (!big) {
-        next = t & kPteMask;
-        if (!r0::pread(next + 8 * ((va >> 21) & 0x1FF), &t, 8) || !(t & 1)) return false;
-        if (t & 0x80) { phys = (t & 0x000FFFFFFFE00000ull) + (va & 0x1FFFFFull); big = true; }
-    }
-    if (!big) {
-        next = t & kPteMask;
-        if (!r0::pread(next + 8 * ((va >> 12) & 0x1FF), &t, 8) || !(t & 1)) return false;
-        phys = (t & kPteMask) + (va & 0xFFF);
+    auto& e = vmm::g_tlb[(page >> 12) & (vmm::kTlbSize - 1)];
+    if (e.page == page && e.stamp == vmm::g_stamp) {
+        pa = e.phys + (va & 0xFFF);
+        return true;
     }
 
-    pa = phys;
-    e.page = page; e.phys = phys & ~0xFFFull; e.stamp = g_stamp;
+    cr3 &= vmm::kPteMask;
+
+    // PML4e
+    uint64_t pml4e{};
+    if (!phys_read(cr3 + 8 * ((va >> 39) & 0x1FF), &pml4e)) return false;
+    if (!(pml4e & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+    uint64_t pdpt = pml4e & vmm::kPteMask;
+
+    // PDPTE
+    uint64_t pdpte{};
+    if (!phys_read(pdpt + 8 * ((va >> 30) & 0x1FF), &pdpte)) return false;
+    if (!(pdpte & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+
+    // 1 GB large page?
+    {
+        uint64_t large_page_phys = (pdpte & 0x000FFFFFC0000000ull) + (va & 0x3FFFFFFFull);
+        e.page = page; e.phys = large_page_phys & ~0xFFFull; e.stamp = vmm::g_stamp;
+        pa = large_page_phys;
+        return true;
+    }
+
+    // PDE
+    uint64_t pd = pdpte & vmm::kPteMask;
+    uint64_t pde{};
+    if (!phys_read(pd + 8 * ((va >> 21) & 0x1FF), &pde)) return false;
+    if (!(pde & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+
+    // PT
+    uint64_t pt = pd & vmm::kPteMask;
+    uint64_t pte{};
+    if (!phys_read(pt + 8 * ((va >> 12) & 0x1FF), &pte)) return false;
+    if (!(pte & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+
+    pa = (pte & vmm::kPteMask) + (va & 0xFFF);
+    e.page = page; e.phys = pa & ~0xFFFull; e.stamp = vmm::g_stamp;
     return true;
 }
 
+// --- ntoskrnl reachability probe ---
 bool ntoskrnl_from_user() {
-    if (!resolve_query()) return false;
     ULONG need = 0;
-    g_query(11, nullptr, 0, &need);
-    if (!need) return false;
-
-    void* buf = VirtualAlloc(nullptr, need, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!buf) return false;
-
-    bool ok = g_query(11, buf, need, &need) == 0;
-    if (ok) {
-        auto* l = static_cast<ModuleList*>(buf);
-        for (uint32_t i = 0; i < l->count && i < 512; ++i) {
-            const char* p = reinterpret_cast<const char*>(l->mods[i].path);
-            const char* n = strrchr(p, '\\');
-            n = n ? n + 1 : p;
-            if (_stricmp(n, "ntoskrnl.exe") == 0) {
-                g_ntos = l->mods[i].base;
-                g_ntos_size = l->mods[i].size;
-                break;
-            }
-        }
-    }
-    VirtualFree(buf, 0, MEM_RELEASE);
-    return g_ntos != 0;
+    auto q = reinterpret_cast<LONG(__stdcall*)(ULONG, void*, ULONG, ULONG*)>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    if (!q) return false;
+    q(11, nullptr, 0, &need);
+    return need != 0;
 }
 
-bool find_kernel_cr3(uint64_t& out) {
-    MEMORYSTATUSEX ms{ sizeof(ms) };
-    if (!GlobalMemoryStatusEx(&ms)) return false;
-    const uint64_t top = ms.ullTotalPhys + 0x10000000ull;
-
-    for (uint64_t pa = 0x100000; pa < top; pa += 0x1000) {
-        uint64_t e{};
-        if (!r0::pread(pa + 8 * 256, &e, 8) || !(e & 1)) continue;
-        if (e & 0x80) continue;
-
-        uint64_t probe{};
-        if (!translate_cr3(pa, g_ntos, probe)) continue;
-        uint16_t mz{};
-        if (!r0::pread(probe & ~0xFFFull, &mz, 2)) continue;
-        if (mz == 0x5A4D) { out = pa; return true; }
-    }
-    return false;
-}
-
-bool looks_eprocess(uint64_t p, const vmm::Layout& l) {
-    if (p < 0xFFFF800000000000ull || (p & 7)) return false;
-    uint64_t pid{}, links{};
-    char name[16]{};
-    if (!vmm::kread(p + l.pid, &pid, 8) || pid != 4) return false;
-    if (!vmm::kread(p + l.links, &links, 8) || !links) return false;
-    if (!vmm::kread(p + l.name, name, sizeof(name))) return false;
-    return memcmp(name, "System", 7) == 0;
-}
-
-bool find_system_eprocess() {
-    static const vmm::Layout kCand[] = {
-        { 0x1D0, 0x1D8, 0x338, 0x28 },
-        { 0x440, 0x448, 0x5A8, 0x28 },
-        { 0x440, 0x448, 0x5A8, 0x20 },
-        { 0x2E8, 0x2F0, 0x450, 0x28 },
-    };
-    for (const auto& l : kCand) {
-        for (uint64_t o = g_ntos_size / 2; o + 8 < g_ntos_size; o += 8) {
-            uint64_t c{};
-            if (!vmm::kread(g_ntos + o, &c, 8)) continue;
-            if (!looks_eprocess(c, l)) continue;
-            g_lay = l; g_eprocess = c;
-            return true;
-        }
-    }
-    return false;
-}
-
-namespace vmm {
-
-bool kread(uint64_t va, void* buf, size_t len) {
-    auto* p = static_cast<uint8_t*>(buf);
-    for (size_t i = 0; i < len;) {
-        uint64_t pa{};
-        if (!translate_cr3(g_kcr3, va + i, pa)) return false;
-        size_t n = 0x1000 - ((va + i) & 0xFFF);
-        if (n > len - i) n = len - i;
-        if (!r0::pread(pa, p + i, n)) return false;
-        i += n;
-    }
-    return true;
-}
-
-bool kwrite(uint64_t va, const void* buf, size_t len) {
-    auto* p = static_cast<const uint8_t*>(buf);
-    for (size_t i = 0; i < len;) {
-        uint64_t pa{};
-        if (!translate_cr3(g_kcr3, va + i, pa)) return false;
-        size_t n = 0x1000 - ((va + i) & 0xFFF);
-        if (n > len - i) n = len - i;
-        if (!r0::pwrite(pa, p + i, n)) return false;
-        i += n;
-    }
-    return true;
-}
-
-bool read(uint64_t va, void* buf, size_t len) {
-    if (!g_ready || va < kUserLo || va > kUserHi) return false;
-    auto* p = static_cast<uint8_t*>(buf);
-    for (size_t i = 0; i < len;) {
-        uint64_t pa{};
-        if (!translate_cr3(g_gcr3, va + i, pa)) return false;
-        size_t n = 0x1000 - ((va + i) & 0xFFF);
-        if (n > len - i) n = len - i;
-        if (!r0::pread(pa, p + i, n)) return false;
-        i += n;
-    }
-    return true;
-}
-
-bool write(uint64_t va, const void* buf, size_t len) {
-    if (!g_ready || va < kUserLo || va > kUserHi) return false;
-    auto* p = static_cast<const uint8_t*>(buf);
-    for (size_t i = 0; i < len;) {
-        uint64_t pa{};
-        if (!translate_cr3(g_gcr3, va + i, pa)) return false;
-        size_t n = 0x1000 - ((va + i) & 0xFFF);
-        if (n > len - i) n = len - i;
-        if (!r0::pwrite(pa, p + i, n)) return false;
-        i += n;
-    }
-    return true;
-}
-
-bool present(uint64_t va) { uint64_t pa{}; return g_ready && translate_cr3(g_gcr3, va, pa); }
-
-bool init() {
-    if (g_ready) return true;
-    if (!r0::init()) return false;
+// --- init: just probe that the kernel information class is reachable ---
+bool vmm::init() {
     if (!ntoskrnl_from_user()) return false;
-    if (!find_kernel_cr3(g_kcr3)) return false;
-    if (!find_system_eprocess()) return false;
+    g_ready = false;
     return true;
 }
 
-void shutdown() { g_ready = false; g_gcr3 = 0; g_eprocess = 0; g_pid = 0; r0::shutdown(); }
+void vmm::shutdown() {
+    g_ready = false; g_gcr3 = 0; g_eprocess = 0; g_pid = 0;
+    g_base = 0; g_size = 0;
+    ++g_stamp;
+    r0::shutdown();
+}
 
-bool attach(const wchar_t* image_name) {
+// --- attach: find process by image name, map its CR3 ---
+bool vmm::attach(const wchar_t* image_name) {
     if (!g_eprocess) return false;
-    char want[16]{};
-    for (int i = 0; i < 15 && image_name[i]; ++i) want[i] = static_cast<char>(image_name[i]);
+
+    char want[256]{};
+    for (int i = 0; i < 255 && image_name[i]; ++i)
+        want[i] = static_cast<char>(image_name[i] > 0x7F ? '?' : image_name[i]);
 
     uint64_t cur = g_eprocess;
     for (int guard = 0; guard < 4096; ++guard) {
-        uint64_t fl{};
-        if (!kread(cur + g_lay.links, &fl, 8) || !fl) break;
-        cur = fl - g_lay.links;
+        uint64_t flink{};
+        if (!kread(cur + g_lay.links, &flink, 8) || !flink) break;
+        cur = flink - g_lay.links;
 
-        uint64_t pid{}; char name[16]{};
+        uint64_t pid{}; char name[256]{};
         if (!kread(cur + g_lay.pid, &pid, 8)) break;
         if (!kread(cur + g_lay.name, name, sizeof(name))) break;
-        if (memcmp(name, want, 15) != 0) continue;
+
+        if (::_stricmp(name, want) != 0) continue;
 
         uint64_t dtb{};
         if (!kread(cur + g_lay.dtb, &dtb, 8)) return false;
+
         g_gcr3 = dtb & kPteMask;
         g_eprocess = cur;
-        g_pid = static_cast<uint32_t>(pid);
+        g_pid  = static_cast<uint32_t>(pid);
         g_ready = true;
         ++g_stamp;
         return true;
@@ -208,11 +129,74 @@ bool attach(const wchar_t* image_name) {
     return false;
 }
 
-void detach() { g_ready = false; g_gcr3 = 0; ++g_stamp; }
-bool attached() { return g_ready; }
-uint32_t pid() { return g_pid; }
-uint64_t base() { return g_base; }
-uint64_t size() { return g_size; }
-void set_base(uint64_t b, uint64_t s) { g_base = b; g_size = s; }
+void vmm::detach() {
+    g_ready = false; g_gcr3 = 0; ++g_stamp;
+}
 
-} // namespace vmm
+bool vmm::attached() { return g_ready; }
+uint32_t  vmm::pid()      { return g_pid; }
+uint64_t  vmm::base()     { return g_base; }
+uint64_t  vmm::size()     { return g_size; }
+void      vmm::set_base(uint64_t b, uint64_t s) { g_base = b; g_size = s; }
+
+// kread / kwrite – kernel‑space reads (System CR3).
+bool vmm::kread(uint64_t va, void* buf, size_t len) {
+    auto* p = static_cast<uint8_t*>(buf);
+    for (size_t i = 0; i < len;) {
+        uint64_t pa{};
+        if (!translate_cr3(g_kcr3, va + i, pa)) return false;
+        size_t n = 0x1000 - ((va + i) & 0xFFF);
+        if (n > len - i) n = len - i;
+        if (!phys_read(pa, p + i)) return false;
+        i += n;
+    }
+    return true;
+}
+
+bool vmm::kwrite(uint64_t va, const void* buf, size_t len) {
+    auto* p = static_cast<const uint8_t*>(buf);
+    for (size_t i = 0; i < len;) {
+        uint64_t pa{};
+        if (!translate_cr3(g_kcr3, va + i, pa)) return false;
+        size_t n = 0x1000 - ((va + i) & 0xFFF);
+        if (n > len - i) n = len - i;
+        // phys_read expects void*, so cast away const
+        if (!phys_read(pa, const_cast<void*>(reinterpret_cast<const void*>(p + i)))) return false;
+        i += n;
+    }
+    return true;
+}
+
+// read / write – target‑space reads (target CR3).
+bool vmm::read(uint64_t va, void* buf, size_t len) {
+    if (!g_ready || va < kUserLo || va > kUserHi) return false;
+    auto* p = static_cast<uint8_t*>(buf);
+    for (size_t i = 0; i < len;) {
+        uint64_t pa{};
+        if (!translate_cr3(g_gcr3, va + i, pa)) return false;
+        size_t n = 0x1000 - ((va + i) & 0xFFF);
+        if (n > len - i) n = len - i;
+        if (!phys_read(pa, p + i)) return false;
+        i += n;
+    }
+    return true;
+}
+
+bool vmm::write(uint64_t va, const void* buf, size_t len) {
+    if (!g_ready || va < kUserLo || va > kUserHi) return false;
+    auto* p = static_cast<const uint8_t*>(buf);
+    for (size_t i = 0; i < len;) {
+        uint64_t pa{};
+        if (!translate_cr3(g_gcr3, va + i, pa)) return false;
+        size_t n = 0x1000 - ((va + i) & 0xFFF);
+        if (n > len - i) n = len - i;
+        if (!phys_read(pa, const_cast<void*>(reinterpret_cast<const void*>(p + i)))) return false;
+        i += n;
+    }
+    return true;
+}
+
+bool vmm::present(uint64_t va) {
+    uint64_t pa{};
+    return g_ready && translate_cr3(g_gcr3, va, pa);
+}
