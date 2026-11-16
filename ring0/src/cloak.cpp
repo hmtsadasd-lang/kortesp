@@ -117,19 +117,19 @@ bool find_head(uint64_t& head) {
         if (valid_head(head)) return true;
     }
 
-    IMAGE_DOS_HEADER dos{};
-    if (!vmm::kread(vmm::g_ntos, &dos, sizeof(dos))) return false;
-    IMAGE_NT_HEADERS64 nt{};
-    if (!vmm::kread(vmm::g_ntos + dos.e_lfanew, &nt, sizeof(nt))) return false;
+    // Section table read properly - IMAGE_FIRST_SECTION(&nt) on a stack-local
+    // IMAGE_NT_HEADERS64 points past the struct, because the section table
+    // follows OptionalHeader in the image and is not part of it. That bug made
+    // this scan walk stack garbage as if it were section headers.
+    std::vector<vmm::Section> secs;
+    if (!vmm::sections(secs)) return false;
 
-    auto* sec = IMAGE_FIRST_SECTION(&nt);
-    for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++sec) {
-        const DWORD ch = sec->Characteristics;
-        if (!(ch & IMAGE_SCN_MEM_WRITE) || (ch & IMAGE_SCN_MEM_EXECUTE)) continue;
-        if (!sec->Misc.VirtualSize) continue;
+    for (const auto& s : secs) {
+        if (!(s.chars & IMAGE_SCN_MEM_WRITE) || (s.chars & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (!s.size) continue;
 
-        const uint64_t lo = vmm::g_ntos + sec->VirtualAddress;
-        const uint64_t hi = lo + sec->Misc.VirtualSize;
+        const uint64_t lo = vmm::g_ntos + s.va;
+        const uint64_t hi = lo + s.size;
 
         // Bulk read: one IOCTL per 4 KiB page instead of one per qword (the
         // old code did 8 bytes per IOCTL *plus* ~5 more in valid_head for

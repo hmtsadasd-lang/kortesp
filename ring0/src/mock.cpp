@@ -122,8 +122,13 @@ bool mock_vwrite(uint64_t va, const void* in, size_t len) {
     return mock_write(kKernPa + off, in, len);
 }
 
+bool mock_vread(uint64_t va, void* out, size_t len) {
+    if (va < kKvaBase) return false;
+    return mock_read(kKernPa + (va - kKvaBase), out, len);
+}
+
 const r0::Backend kMockBackend{L"mock", mock_open, mock_close,
-                               mock_read, mock_write, mock_vwrite};
+                               mock_read, mock_write, mock_vwrite, mock_vread};
 
 // ---- writers into the user data region -----------------------------------
 uint64_t uva(uint64_t off) { return kVaBase + off; }
@@ -324,6 +329,9 @@ void check(bool cond, const char* what) {
 } // namespace
 
 bool run() {
+    // The mock's physical addresses are synthetic; a real RAM map would reject
+    // every one of them. Permissive mode keeps phys_read() out of the way.
+    vmm::phys_map_reset();
     g_pages.clear();
     g_pass = g_fail = 0;
 

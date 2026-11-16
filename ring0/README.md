@@ -9,8 +9,8 @@ with a handle.
 | File | Purpose |
 |---|---|
 | `include/offsets.hpp` | Fortnite member offsets (VERIFIED / UNVERIFIED) |
-| `include/r0.hpp` / `src/r0.cpp` | DBUtil_2_3 backend: physical read/write + kernel-VA write |
-| `include/vmm.hpp` / `src/vmm.cpp` | ntoskrnl discovery, kernel CR3 scan, page walk, EPROCESS scan, attach |
+| `include/r0.hpp` / `src/r0.cpp` | DBUtil_2_3 backend: physical read/write + kernel-VA read/write |
+| `include/vmm.hpp` / `src/vmm.cpp` | ntoskrnl discovery, System EPROCESS, kernel CR3, page walk, attach |
 | `include/ov.hpp` / `src/ov.cpp` | Layered-window + D3D11 quad-batcher overlay |
 | `include/esp.hpp` / `src/esp.cpp` | ESP pipeline + `--probe` chain walker |
 | `include/cloak.hpp` / `src/cloak.cpp` | Unlinks the driver from `PsLoadedModuleList` |
@@ -26,6 +26,8 @@ with a handle.
 |---|---|
 | Build | ✅ compiles and links with w64devkit GCC |
 | IOCTL direction | ✅ disassembly + non-zero low-memory read probe in `r0::init()` |
+| Granular modes (`--raw`/`--ntos`/`--eproc`/`--cr3scan`) | ✅ implemented; each stops after its own stage |
+| Image gate | ✅ runner verifies the `.sys` SHA256 before it is mapped |
 | Page walk (PML4→PT, 2 MB + 1 GB pages) | ✅ verified by `--mock` (17 checks) |
 | PEB→LDR→module walk | ✅ verified by `--mock` |
 | Offset chain (GEngine→…→GameState→players) | ✅ verified by `--mock` (structure only) |
@@ -123,18 +125,51 @@ PASS/FAIL per check.
 
 ### Live
 
+The stack initialises in three stages — ntoskrnl, System EPROCESS, kernel
+CR3 — and each of the first stages has its own mode, so a failure (or a hang)
+can be attributed to a layer instead of the whole pipeline. Run them in this
+order; every one is read-only, and each stops after its own step:
+
 ```bat
-run_r0.bat --probe        :: resolve the chain, print each hop (read-only)
-run_r0.bat --kwtest       :: prove the kernel write path (writes back identical bytes)
-run_r0.bat --cloak        :: dry run: print the two unlink writes, write nothing
-run_r0.bat --cloak-commit :: actually unlink
-run_r0.bat --hide-symlink :: remove \??\DBUtil_2_3 (permanent until reboot)
-run_r0.bat                :: overlay + ESP
+run_r0.bat --ntos            :: SystemModuleInformation only - no IOCTL at all
+run_r0.bat --eproc           :: + PsInitialSystemProcess, validated EPROCESS
+run_r0.bat --cr3scan         :: + kernel CR3 (writes cr3.cache for this boot)
+run_r0.bat --probe           :: resolve the chain, print each hop
+run_r0.bat --kwtest          :: prove the kernel write path (writes back identical bytes)
+run_r0.bat --cloak           :: dry run: print the two unlink writes, write nothing
+run_r0.bat --cloak-commit    :: actually unlink
+run_r0.bat --hide-symlink    :: remove \??\DBUtil_2_3 (permanent until reboot)
+run_r0.bat                   :: overlay + ESP
 ```
+
+Smallest possible driver test, before any of the above:
+
+```bat
+run_r0.bat --raw 0x400       :: one physical read of 16 bytes, nothing else
+run_r0.bat --raw 0x1000 64   :: one physical read of 64 bytes
+```
+
+`--raw` bypasses the RAM map on purpose (a hole read is then still observable)
+and prints whether the address is inside the map. It touches no page table and
+needs no CR3: if the box fails here, the driver's `MmMapIoSpace` path is the
+problem and everything above it is irrelevant.
+
+`--cr3scan` is the only mode that runs the physical scan. `--probe` and every
+later mode take the CR3 from System's EPROCESS (`KPROCESS+0x28`) in one IOCTL,
+or from `cr3.cache` when a previous `--cr3scan` in the same boot wrote it. A
+failed fast path prints the instruction to run `--cr3scan`; it never falls back
+to the scan implicitly.
 
 `run_r0.bat` looks for `dbutil_2_3.sys` in `driver\`, next to the script, in
 `%SystemRoot%\System32\drivers\`, or at `%DBUTIL_SYS%`. It creates the service
 `DBUtil_2_3` once and leaves it running until reboot.
+
+Before the image is copied or mapped, the runner verifies its SHA256 against
+`0296E2CE999E67C76352613A718E11516FE1B0EFC3FFDB8918FC999DD76A73A5` and aborts
+on a mismatch. `DBUTIL_SHA256` overrides the expected value (re-signed copy);
+`FORTESP_SKIP_HASH=1` bypasses the check. The gate exists because the on-disk
+file is what gets loaded: a stale or corrupted copy in `driver\` is a silent
+wrong-driver, and this driver is the one component that runs in ring 0.
 
 State handling, in order:
 
@@ -178,8 +213,9 @@ sc delete DBUtil_2_3
 ## The driver
 
 `DBUtil_2_3.sys` is **not in this repository**. It is the Dell BIOS flash
-utility driver (CVE-2021-21551); it exposes `\\.\DBUtil_2_3` with two IOCTLs
-that read and write arbitrary physical memory.
+utility driver (CVE-2021-21551); it exposes `\\.\DBUtil_2_3` with IOCTLs that
+read and write arbitrary physical memory and can `memmove` to/from a kernel
+virtual address.
 
 Fetch it with:
 
@@ -228,11 +264,13 @@ Two separate gates:
    but the device object and `\??\DBUtil_2_3` symlink survive it, and the file
    name is checkable on disk.
 
-Test order: `--probe` (read-only), `--kwtest` (proves the write path), then
-`--cloak` dry run, `--cloak-commit`, `--hide-symlink`, then launch the game.
+Test order: `--raw` (one physical read), `--ntos`, `--eproc`, `--cr3scan`,
+`--probe` (read-only), `--kwtest` (proves the write path), then `--cloak` dry
+run, `--cloak-commit`, `--hide-symlink`, then launch the game.
 Rename the driver (`FORTESP_SVC` / `FORTESP_IMAGE`) **before** that last step,
 so one launch gives one answer instead of a bisect. `--hide-symlink` is last
-because it is permanent for the boot.
+because it is permanent for the boot, and `--probe`/`--kwtest` must precede a
+commit because an unlinked module can no longer be found by `our_base()`.
 
 ## Keys
 
@@ -256,6 +294,10 @@ window cannot composite over an exclusive swapchain.
 | Flag | Effect |
 |---|---|
 | `--mock` | driverless self-test; exits with the result |
+| `--raw <pa> [len]` | exactly one physical read (default 16 bytes, max 4096); no CR3, no page table |
+| `--ntos` | resolve ntoskrnl via `SystemModuleInformation` only; no IOCTL |
+| `--eproc` | + `PsInitialSystemProcess`, validate the EPROCESS layout; stop there |
+| `--cr3scan` | + the physical CR3 scan on purpose; writes `cr3.cache` for this boot |
 | `--probe` | resolve the chain and print each hop; no window needed |
 | `--kwtest` | read `PsInitialSystemProcess`, write the identical 8 bytes back, verify; exits with the result |
 | `--cloak` | **dry run** — resolve the module-list entry and print every address; writes nothing |
@@ -386,11 +428,43 @@ the user-mode `LDR_DATA_TABLE_ENTRY`, and writing to its slot would hit
 (kernel VA, 16-byte aligned); only those few candidates pay the ~5 dependent
 reads in `valid_head()`. The old loop did one IOCTL per qword.
 
-**The kernel CR3 is cached on disk.** `find_kernel_cr3` is ~8M IOCTLs, so a hit
-is written to `<exe dir>\cr3.cache` keyed on the ntoskrnl base *and* size, and
-re-validated on load by translating the base and checking for `MZ`. KASLR moves
-ntoskrnl every boot, so the cache is invalidated by construction; the `MZ` check
-catches a page directory that was freed and reused.
+**Initialisation is staged, and the scan is opt-in.** `vmm::init()` runs
+`init_ntos()` → `init_kcr3_cached()` → `init_system()` → `init_kcr3()`. The name
+of the game is `g_ntos`, every hop is a separate function so a hang can be
+bisected from the command line, and `init_kcr3()` never scans: the kernel CR3 is
+`System`'s `DirectoryTableBase` (`KPROCESS+0x28`, one IOCTL), validated by
+translating ntoskrnl's own base and requiring `MZ`. The physical scan lives
+behind `--cr3scan`, which is the heaviest and riskiest operation here, and a hit
+is written to `<exe dir>\cr3.cache` keyed on ntoskrnl base *and* size and
+re-validated on load by the same `MZ` translation. KASLR moves ntoskrnl every
+boot, so the cache is boot-scoped by construction.
+
+**Trusted-read direction is proven once.** The kernel-VA *read* half
+(`0x9B0C1EC4`) has never been exercised live — `--kwtest` only proves the write
+half — and a transposed pair would `memmove` zeroes over ntoskrnl's header.
+So the first `kread_trusted()` sends a zero-payload probe: read interprets it as
+a copy out, write has no bytes to write, and the result is checked against
+ntoskrnl's `MZ`. If it cannot be proven, the page walk is used when a CR3 is
+known, and the message points at `--cr3scan`. `kread_trusted` is only ever
+called with addresses derived from ntoskrnl's headers/exports or a validated
+EPROCESS; unvalidated candidates stay on `vmm::kread()` (missing page = `false`,
+not a `0x50`).
+
+**Physical bounds come from the loader's own range map.** `ullTotalPhys` is an
+amount, not a top, and the space below it has PCIe MMIO holes; `MmMapIoSpace`
+builds PTEs for a hole anyway and reading a powered-down BAR can lock the root
+complex. `vmm::phys_map_init()` parses
+`HKLM\HARDWARE\RESOURCEMAP\System Resources\Physical Memory\.Translated`
+(`CM_RESOURCE_LIST`), with the HAL's device-memory ranges subtracted in the
+fallback path. Every physical read is gated on that map. The driverless mock
+installs a permissive map (`phys_map_reset()`) because its addresses are
+synthetic.
+
+**`IMAGE_FIRST_SECTION(&nt)` on a stack struct is a bug.** The section table
+follows `OptionalHeader` in the image and is not part of `IMAGE_NT_HEADERS64`, so
+the macro points one-past-the-end of a stack-local copy and every field read is
+stack garbage. Both the writable-section scan and the cloak's list-head scan now
+go through `vmm::sections()`, which reads the table at the correct file offset.
 
 **The cloak is a dry run by default.** It is the only part of the tool that
 writes to the kernel, so `--cloak` resolves every address and prints the exact

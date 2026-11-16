@@ -141,7 +141,7 @@ if defined LOADED (
             echo       !BINPATH!
             echo     The cloak matches on "%IMAGE%" and would not find itself.
             echo     Do NOT stop it. Reboot, then re-run to recreate the service.
-            exit /b 1
+            goto :fail
         )
     )
 ) else (
@@ -150,7 +150,7 @@ if defined LOADED (
         rem Not RUNNING means no mapped image; deleting the service is safe.
         rem (Rule 2 only forbids deleting a *running* one.)
         call :delete_service
-        if errorlevel 1 exit /b 1
+        if errorlevel 1 goto :fail
         set "EXISTS="
     )
 
@@ -165,10 +165,26 @@ if defined LOADED (
         echo [x] driver image not found. Run:
         echo       powershell -ExecutionPolicy Bypass -File driver\fetch_driver.ps1
         echo     or set DBUTIL_SYS to a full path.
-        exit /b 1
+        goto :fail
     )
 
     echo [*] source image: !SYS!
+
+    rem ---- verify the image before it is ever mapped ----
+    rem The on-disk file is what gets loaded, so a stale or corrupted copy in
+    rem driver\ is a silent wrong-driver. Default hash is the published
+    rem dbutil_2_3.sys value; DBUTIL_SHA256 overrides it, and
+    rem FORTESP_SKIP_HASH=1 bypasses the check.
+    rem
+    rem These are `rem`, not `::`: inside a parenthesised block `::` is a label,
+    rem and cmd prints "Sistem belirtilen surucuyu bulamiyor." once per such
+    rem line on stderr. Cosmetic, but it hides real errors in run.log.
+    rem
+    rem The check itself lives in a subroutine because `exit /b N` inside a
+    rem doubly-nested block returns 0 on this cmd build (reproduced), which
+    rem would turn a rejected image into a successful-looking run.
+    call :verify_image "!SYS!"
+    if errorlevel 1 goto :fail
 
     rem Copy only if the target does not exist yet. Overwriting an image that
     rem a loaded instance is mapped from is exactly what we must not do.
@@ -176,7 +192,7 @@ if defined LOADED (
         copy /y "!SYS!" "%DST%" >nul
         if errorlevel 1 (
             echo [x] could not copy the image to %DST%
-            exit /b 1
+            goto :fail
         )
         echo [*] installed as %DST%
     ) else (
@@ -187,7 +203,7 @@ if defined LOADED (
         sc.exe create "%SVC%" type= kernel start= demand binPath= "%DST%" >nul
         if errorlevel 1 (
             echo [x] sc create failed for %SVC%
-            exit /b 1
+            goto :fail
         )
     )
     sc.exe start "%SVC%" >nul
@@ -202,7 +218,7 @@ if defined LOADED (
         echo     Likely: the vulnerable-driver blocklist enforces on this build
         echo     HVCI, or Secure Boot refuses the image. The tool will fail
         echo     its read probe; nothing was touched in kernel memory.
-        exit /b 1
+        goto :fail
     )
     echo [*] driver loaded and RUNNING. It stays loaded until reboot - do NOT stop it.
 
@@ -239,13 +255,51 @@ set /a WAIT=0
 sc.exe query "%SVC%" >nul 2>&1
 if not errorlevel 1 (
     set /a WAIT+=1
-    if !WAIT! GEQ 10 (
-        echo [x] service %SVC% is still registered after delete.
-        echo     Reboot and re-run; not starting a half-deleted service.
-        exit /b 1
-    )
+    if !WAIT! GEQ 10 goto :del_fail
     timeout /t 1 /nobreak >nul
     goto wait_delete
 )
 exit /b 0
+:del_fail
+echo [x] service %SVC% is still registered after delete.
+echo     Reboot and re-run; not starting a half-deleted service.
+exit /b 1
+
+rem ---------------------------------------------------------------------------
+:: Verify one driver image: :verify_image <full path>
+:: Returns 0 for ok/skipped, 1 for mismatch.
+:: Deliberately flat: no nested blocks, because `exit /b N` inside one returns
+:: 0 on this cmd build when it is nested two levels deep.
+:: ---------------------------------------------------------------------------
+:verify_image
+if "%FORTESP_SKIP_HASH%"=="1" (
+    echo [*] hash check skipped - FORTESP_SKIP_HASH=1
+    exit /b 0
+)
+set "WANT=%DBUTIL_SHA256%"
+if not defined WANT set "WANT=0296E2CE999E67C76352613A718E11516FE1B0EFC3FFDB8918FC999DD76A73A5"
+set "GOT="
+for /f "skip=1 tokens=* delims=" %%H in ('certutil -hashfile "%~1" SHA256 2^>nul') do (
+    if not defined GOT set "GOT=%%H"
+)
+if not defined GOT goto :vi_bad
+set "GOT=%GOT: =%"
+if /i "%GOT%"=="%WANT%" goto :vi_ok
+:vi_bad
+echo [x] image hash mismatch.
+echo       want: %WANT%
+echo       got : %GOT%
+echo     Set DBUTIL_SHA256 to the expected value, or FORTESP_SKIP_HASH=1.
+exit /b 1
+:vi_ok
+echo [*] image hash ok
+exit /b 0
+
+rem ---------------------------------------------------------------------------
+:: Single abort exit. Reached with `goto` from inside the load block, so the
+:: errorlevel is set at file scope and actually reaches the caller.
+:: ---------------------------------------------------------------------------
+:fail
+echo [x] refusing to continue - the driver was NOT started by this run.
+endlocal & exit /b 1
 

@@ -6,12 +6,19 @@
 #include "mock.hpp"
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include <shlwapi.h>
 
 namespace { constexpr wchar_t kImage[] = L"FortniteClient-Win64-Shipping.exe"; }
 namespace { constexpr DWORD kWindowWaitMs = 120000; }
+
+// Overlay present rate. The old loop was Sleep(1) with vsync off: ~1000
+// presents a second, one core pinned and the GPU woken continuously. On a box
+// that hard-locks under load, that is not free.
+namespace { constexpr double kTargetFps = 120.0; }
 
 // Forward declaration.
 bool key_pressed_once(int vk);
@@ -28,6 +35,14 @@ struct CmdFlags {
     bool cloak_restore{ false };// standalone: re-link from cloak.state, then exit
     bool hide_symlink{ false }; // remove \??\DBUtil_2_3, permanent until reboot
     bool mock{ false };
+    // Granular stages. Each one stops after its own step, so a hang can be
+    // attributed to a layer instead of to the whole pipeline.
+    bool raw{ false };          // one physical read, nothing else
+    bool only_ntos{ false };    // SystemModuleInformation only
+    bool only_cr3{ false };     // the heavy physical CR3 scan, on purpose
+    bool only_eproc{ false };   // PsInitialSystemProcess only
+    uint64_t raw_pa{ 0 };
+    size_t   raw_len{ 16 };
     std::wstring driver_name;   // --driver-name <name.sys>
 };
 
@@ -44,8 +59,21 @@ CmdFlags parse_cmd() {
             if (wcscmp(argv[i], L"--cloak-restore") == 0) f.cloak_restore = true;
             if (wcscmp(argv[i], L"--hide-symlink") == 0) f.hide_symlink = true;
             if (wcscmp(argv[i], L"--mock")  == 0) f.mock  = true;
+            if (wcscmp(argv[i], L"--ntos")  == 0) f.only_ntos = true;
+            if (wcscmp(argv[i], L"--cr3scan") == 0) f.only_cr3 = true;
+            if (wcscmp(argv[i], L"--eproc") == 0) f.only_eproc = true;
             if (wcscmp(argv[i], L"--driver-name") == 0 && i + 1 < argc)
                 f.driver_name = argv[++i];
+            if (wcscmp(argv[i], L"--raw") == 0) {
+                f.raw = true;
+                if (i + 1 < argc) {
+                    f.raw_pa = wcstoull(argv[++i], nullptr, 0);
+                    if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                        const unsigned long long l = wcstoull(argv[++i], nullptr, 0);
+                        if (l && l <= 0x1000) f.raw_len = static_cast<size_t>(l);
+                    }
+                }
+            }
         }
         LocalFree(argv);
     }
@@ -60,6 +88,46 @@ std::string narrow(const std::wstring& s) {
     WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, out.data(), n, nullptr, nullptr);
     out.resize(static_cast<size_t>(n - 1));
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// --raw <pa> [len]: exactly one physical read, nothing else.
+//
+// This is the smallest possible live test of the driver. It touches no page
+// table, needs no CR3, and cannot corrupt anything. If the box hangs on this,
+// the driver's MmMapIoSpace path is the problem and everything above it is
+// irrelevant.
+// ---------------------------------------------------------------------------
+bool raw_read(uint64_t pa, size_t len) {
+    if (!len) { printf("[!] zero length\n"); return false; }
+
+    printf("[*] physical read 0x%llx, %zu bytes\n",
+           (unsigned long long)pa, len);
+    printf("[*] in RAM map: %s\n", vmm::phys_is_ram(pa, len) ? "yes" : "NO");
+
+    std::vector<uint8_t> b(len, 0xCC);
+    if (!r0::pread(pa, b.data(), len)) {
+        printf("[!] IOCTL failed (GetLastError %lu)\n", GetLastError());
+        return false;
+    }
+
+    bool any = false;
+    for (uint8_t v : b) any |= (v != 0);
+
+    for (size_t i = 0; i < len; i += 16) {
+        printf("  %08llx  ", (unsigned long long)(pa + i));
+        for (size_t j = 0; j < 16 && i + j < len; ++j)
+            printf("%02x ", b[i + j]);
+        printf("\n");
+    }
+
+    if (!any) {
+        printf("[!] all zeros. Either the page really is zero, or the read IOCTL "
+               "is transposed into a write of zeroes.\n");
+        return false;
+    }
+    printf("[+] read returned data\n");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +244,27 @@ bool enable_debug_privilege() {
     return ok && err != ERROR_NOT_ALL_ASSIGNED;
 }
 
+// Frame limiter: Sleep() for the bulk of the budget, then a short spin. The
+// old loop simply Sleep(1)ed, i.e. presented as fast as the GPU allowed.
+void frame_wait(double fps, LARGE_INTEGER& freq, LARGE_INTEGER& last) {
+    if (fps <= 0.0) return;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double budget = static_cast<double>(freq.QuadPart) / fps;
+    const double spent = static_cast<double>(now.QuadPart - last.QuadPart);
+    if (spent < budget) {
+        const double ms = (budget - spent) * 1000.0 / static_cast<double>(freq.QuadPart);
+        if (ms > 1.2) Sleep(static_cast<DWORD>(ms - 0.8));
+    }
+    QueryPerformanceCounter(&last);
+}
+
 int wmain() {
+    // Redirected stdout is block-buffered: if the box hangs, the last progress
+    // line never reaches run.log. Unbuffered logging is the whole point of
+    // running these modes one at a time.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     CmdFlags flags = parse_cmd();
 
     // --mock: driverless self-test against a synthetic target.
@@ -214,11 +302,42 @@ int wmain() {
     }
     printf("[+] driver ok\n");
 
-    if (!vmm::init()) {
-        printf("[!] kernel discovery failed\n");
+    // --raw stops here: no ntoskrnl lookup, no CR3, no page table.
+    if (flags.raw) {
+        const bool ok = raw_read(flags.raw_pa, flags.raw_len);
+        r0::shutdown();
+        return ok ? 0 : 1;
+    }
+
+    if (!vmm::init_ntos()) { r0::shutdown(); return 1; }
+
+    if (flags.only_ntos) { r0::shutdown(); return 0; }
+
+    // --cr3scan is the only mode that runs the physical scan. It is separated
+    // on purpose: it is the heaviest and riskiest operation in the tool.
+    if (flags.only_cr3) {
+        const bool ok = vmm::scan_kernel_cr3();
+        r0::shutdown();
+        return ok ? 0 : 1;
+    }
+
+    // A cache written by a previous --cr3scan in this boot turns the page walk
+    // into the trusted read path without touching the kernel-VA IOCTL.
+    if (!vmm::init_kcr3_cached())
+        printf("[*] no usable cr3.cache - EPROCESS discovery will use the "
+               "kernel-VA read path\n");
+
+    if (!vmm::init_system()) {
+        printf("[!] System EPROCESS not found\n");
+        printf("    If the kernel-VA read path is unavailable, run --cr3scan "
+               "once and retry.\n");
+        r0::shutdown();
         return 1;
     }
-    printf("[+] ntoskrnl base 0x%llx\n", static_cast<unsigned long long>(vmm::g_ntos));
+
+    if (flags.only_eproc) { vmm::shutdown(); return 0; }
+
+    if (!vmm::init_kcr3()) { vmm::shutdown(); return 1; }
 
     // --cloak-restore is a standalone mode: it uses cloak.state written by the
     // commit, because a fresh process cannot rediscover an unlinked entry.
@@ -322,6 +441,10 @@ int wmain() {
         { VK_F8, &esp::cfg.bots }
     };
 
+    LARGE_INTEGER freq{}, last{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&last);
+
     for (;;) {
         if (!ov::pump()) break;
         if (key_pressed_once(VK_END)) break;
@@ -334,7 +457,7 @@ int wmain() {
         ov::begin();
         esp::draw();
         ov::end();
-        Sleep(1);
+        frame_wait(kTargetFps, freq, last);
     }
 
     // Driver stays loaded until reboot; the entry is left unlinked so module
