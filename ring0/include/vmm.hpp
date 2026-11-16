@@ -71,4 +71,13 @@ bool read (uint64_t va, void* buf, size_t len);
 bool write(uint64_t va, const void* buf, size_t len);
 bool present(uint64_t va);
 
+// Resolve a data export out of ntoskrnl's export directory. The export RVA
+// is the address of the variable itself. Used for PsInitialSystemProcess;
+// PsLoadedModuleList is NOT exported on 26200, so the cloak scans for it.
+bool export_rva(const char* name, uint64_t& rva);
+
+// Physical RAM size. Reads above this are refused - a garbage page-table
+// entry can otherwise turn into a kernel-mode fault.
+uint64_t phys_ram_end();
+
 } // namespace vmm

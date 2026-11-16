@@ -6,14 +6,19 @@
 #include <cwchar>
 #include <cmath>
 
-namespace { constexpr wchar_t kClass[] = L"fortesp_r0_overlay"; }
+// Neutral class name: a process enumerating top-level windows sees this
+// string, and "fortesp_r0_overlay" was a direct giveaway.
+namespace { constexpr wchar_t kClass[] = L"OverlayHostWnd"; }
 
-HWND g_wnd{}; HWND g_game{}; ID3D11Device* g_dev{}; ID3D11DeviceContext* g_ctx{}; IDXGISwapChain* g_sc{}; ID3D11RenderTargetView* g_rtv{}; ID3D11VertexShader* g_vs{}; ID3D11PixelShader* g_ps{}; ID3D11InputLayout* g_il{}; ID3D11Buffer* g_vb{}; ID3D11Buffer* g_cb{}; ID3D11BlendState* g_bl{}; ID3D11RasterizerState* g_rs{}; ID3D11DepthStencilState* g_ds{}; int g_w{}, g_h{}; struct Vert { float x, y, r, g, b, a; }; constexpr int kMax = 1 << 16; Vert g_stage[kMax]{}; int g_n{}; const char* kSrc =
+HWND g_wnd{}; HWND g_game{}; ID3D11Device* g_dev{}; ID3D11DeviceContext* g_ctx{}; IDXGISwapChain1* g_sc{}; ID3D11RenderTargetView* g_rtv{}; ID3D11VertexShader* g_vs{}; ID3D11PixelShader* g_ps{}; ID3D11InputLayout* g_il{}; ID3D11Buffer* g_vb{}; ID3D11Buffer* g_cb{}; ID3D11BlendState* g_bl{}; ID3D11RasterizerState* g_rs{}; ID3D11DepthStencilState* g_ds{}; int g_w{}, g_h{}; struct Vert { float x, y, r, g, b, a; }; constexpr int kMax = 1 << 16; Vert g_stage[kMax]{}; int g_n{}; const char* kSrc =
     "cbuffer C:register(b0){float2 sz;};"
     "struct I{float2 p:POS;float4 c:COL;};"
     "struct O{float4 p:SV_POSITION;float4 c:COL;};"
     "O vs(I i){O o;o.p=float4(i.p.x/sz.x*2-1,1-i.p.y/sz.y*2,0,1);o.c=i.c;return o;}"
-    "float4 ps(O i):SV_TARGET{return i.c;}";
+    // Premultiplied output. A WS_EX_LAYERED window with a swapchain
+    // composites per-pixel through DWM using the backbuffer's alpha, so the
+    // colour has to be premultiplied or the edges are too bright.
+    "float4 ps(O i):SV_TARGET{return float4(i.c.rgb*i.c.a,i.c.a);}";
 
 LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -57,7 +62,9 @@ bool build_pipeline() {
 
     D3D11_BLEND_DESC bl{};
     bl.RenderTarget[0].BlendEnable = TRUE;
-    bl.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    // Premultiplied: src factor is ONE, not SRC_ALPHA, because the shader
+    // already multiplied rgb by alpha.
+    bl.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
     bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
     bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
@@ -109,30 +116,59 @@ bool init(HWND game) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
-    g_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+    g_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+                           WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         kClass, L"", WS_POPUP, 0, 0, 8, 8,
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_wnd) return false;
 
-    SetLayeredWindowAttributes(g_wnd, 0, 255, LWA_ALPHA);
+    // NOTE: do NOT call SetLayeredWindowAttributes(..., LWA_ALPHA) here.
+    // On a WS_EX_LAYERED window that switches the window to a single constant
+    // alpha and discards the per-pixel alpha of the surface - the overlay
+    // becomes an opaque black rectangle over the game. The swapchain's alpha
+    // channel is what DWM composites with, and the shader premultiplies.
+
     ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
 
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2;
-    sd.BufferDesc.Width = 8;
-    sd.BufferDesc.Height = 8;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = g_wnd;
-    sd.SampleDesc.Count = 1;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    sd.Windowed = TRUE;
-
+    // A DXGI *flip-model* swapchain with AlphaMode=PREMULTIPLIED, presented
+    // into a WS_EX_LAYERED window, is composited per-pixel by DWM. The legacy
+    // DXGI_SWAP_EFFECT_DISCARD path ignores the alpha channel entirely,
+    // which is why the old code "solved" transparency with
+    // SetLayeredWindowAttributes(LWA_ALPHA) - a single constant alpha that
+    // also discarded the surface alpha, leaving an opaque black rectangle.
+    //
+    // So: device first, then a swapchain built from DXGI_SWAP_CHAIN_DESC1.
     const D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL got{};
-    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+    if (D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT, want, 1, D3D11_SDK_VERSION,
-        &sd, &g_sc, &g_dev, &got, &g_ctx) < 0) return false;
+        &g_dev, &got, &g_ctx) < 0) return false;
+
+    IDXGIDevice* dxdev{};
+    if (g_dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxdev)) < 0) return false;
+    IDXGIAdapter* adap{};
+    dxdev->GetAdapter(&adap);
+    dxdev->Release();
+    if (!adap) return false;
+
+    IDXGIFactory2* fact{};
+    if (adap->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&fact)) < 0) { adap->Release(); return false; }
+    adap->Release();
+
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = 8;
+    sd.Height = 8;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.Scaling = DXGI_SCALING_STRETCH;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+    const HRESULT hr = fact->CreateSwapChainForHwnd(g_dev, g_wnd, &sd, nullptr, nullptr, &g_sc);
+    fact->Release();
+    if (hr < 0) return false;
 
     if (!build_pipeline() || !make_rtv()) return false;
     tick();
@@ -149,9 +185,11 @@ void shutdown() {
     if (g_bl) g_bl->Release();
     if (g_rs) g_rs->Release();
     if (g_ds) g_ds->Release();
+    // Swapchain before device: a flip-model swapchain holds a device reference
+    // and ResizeBuffers/Present would touch a released device otherwise.
+    if (g_sc) g_sc->Release();
     if (g_ctx) g_ctx->Release();
     if (g_dev) g_dev->Release();
-    if (g_sc) g_sc->Release();
     if (g_wnd) DestroyWindow(g_wnd);
     g_rtv = nullptr; g_vb = nullptr; g_cb = nullptr; g_il = nullptr;
     g_vs = nullptr; g_ps = nullptr; g_bl = nullptr; g_rs = nullptr; g_ds = nullptr;

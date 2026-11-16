@@ -2,7 +2,7 @@
 :: ring0 runner - starts the DBUtil_2_3 driver and launches fortesp_r0.exe
 ::
 :: SAFETY RULES (learned the hard way - DBUtil_2_3 bugchecks this box):
-;;
+::
 ::  1. NEVER `sc stop` this driver. It is NOT_STOPPABLE / IGNORES_SHUTDOWN.
 ::     Stopping it fails, leaves the service half-deleted, and the driver
 ::     stays loaded with no owner. That is a BSOD waiting to happen.
@@ -13,8 +13,10 @@
 ::     fails on the second one and the driver half-initialises.
 ::
 :: So: load it once, leave it running, and let a reboot unload it. If it is
-:: already loaded this script does nothing to the driver at all - it just
-:: runs the tool.
+:: ALREADY RUNNING this script does nothing to the driver at all - it just
+:: runs the tool. A service that exists but is STOPPED never had a live
+:: instance, so retrying `sc start` is safe; the old version treated mere
+:: existence as "loaded" and then silently did nothing.
 ::
 :: The driver image goes in ring0\driver\dbutil_2_3.sys
 :: (driver\fetch_driver.ps1 downloads and hash-verifies it).
@@ -31,17 +33,39 @@ if errorlevel 1 (
     exit /b 0
 )
 
-:: ---- is the driver already loaded? ----
-:: Look for our service name in the kernel-driver list.
+:: ---- HVCI / blocklist preflight ----
+:: With Memory Integrity on, the Microsoft vulnerable-driver blocklist is
+:: enforced by CI and this image will not load at all. Check, don't guess.
+reg query "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled >nul 2>&1
+if not errorlevel 1 (
+    for /f "tokens=3" %%V in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled 2^>nul ^| findstr /i /c:"Enabled"') do (
+        if /i "%%V"=="0x1" (
+            echo [!] HVCI (Memory Integrity) is ON.
+            echo     The Microsoft vulnerable-driver blocklist is enforced and
+            echo     dbutil_2_3.sys will be rejected at load. Turn Memory
+            echo     Integrity off and reboot, or use a different backend.
+        )
+    )
+)
+
+:: ---- is the driver already RUNNING? ----
+:: State, not existence: query the service state and only treat RUNNING as
+:: "loaded". STOPPED means no live instance, so a start is safe.
 set "SVC=DBUtil_2_3"
+set "EXISTS="
 set "LOADED="
-for /f "tokens=2 delims=:" %%S in ('sc.exe query type= driver state= all ^| findstr /i /c:"SERVICE_NAME: %SVC%"') do (
-    set "LOADED=%%S"
+for /f "tokens=2 delims=:" %%S in ('sc.exe query "%SVC%" 2^>nul ^| findstr /i /c:"SERVICE_NAME"') do set "EXISTS=%%S"
+if defined EXISTS (
+    set "STATE="
+    for /f "tokens=2 delims=:" %%S in ('sc.exe query "%SVC%" 2^>nul ^| findstr /i /c:"STATE"') do set "STATE=%%S"
+    echo !STATE! | findstr /i /c:"RUNNING" /c:"START_PENDING" >nul && set "LOADED=1"
 )
 
 if defined LOADED (
-    echo [*] driver already loaded as "%LOADED%" - leaving it alone.
+    echo [*] driver is RUNNING - leaving it alone.
 ) else (
+    if defined EXISTS echo [*] service exists but is not running (state !STATE!) - starting it.
+
     :: ---- locate the driver image ----
     set "SYS="
     if defined DBUTIL_SYS ( if exist "!DBUTIL_SYS!" set "SYS=!DBUTIL_SYS!" )
@@ -66,15 +90,28 @@ if defined LOADED (
         echo [*] driver image already present - not overwriting it
     )
 
-    sc.exe create "%SVC%" type= kernel start= demand binPath= "%SystemRoot%\System32\drivers\DBUtil_2_3.sys" >nul
-    sc.exe start "%SVC%" >nul
-    if errorlevel 1 (
-        echo [!] the service failed to start.
-        echo     Likely: the vulnerable-driver blocklist now enforces on this build,
-        echo     or Secure Boot refuses the image.
-    ) else (
-        echo [*] driver loaded. It will stay loaded until reboot - do NOT stop it.
+    if not defined EXISTS (
+        sc.exe create "%SVC%" type= kernel start= demand binPath= "%SystemRoot%\System32\drivers\DBUtil_2_3.sys" >nul
     )
+    sc.exe start "%SVC%" >nul
+
+    :: Confirm it actually reached RUNNING before launching the tool.
+    set "STATE="
+    for /f "tokens=2 delims=:" %%S in ('sc.exe query "%SVC%" 2^>nul ^| findstr /i /c:"STATE"') do set "STATE=%%S"
+    echo !STATE! | findstr /i /c:"RUNNING" /c:"START_PENDING" >nul
+    if errorlevel 1 (
+        echo [!] the service did not reach RUNNING (state !STATE!).
+        echo     Likely: the vulnerable-driver blocklist enforces on this build
+        echo     (HVCI), or Secure Boot refuses the image. The tool will fail
+        echo     its read probe; nothing was touched in kernel memory.
+        exit /b 1
+    )
+    echo [*] driver loaded and RUNNING. It stays loaded until reboot - do NOT stop it.
+
+    :: The device is exclusive (one open at a time). If this fails while the
+    :: service is RUNNING, something else already holds it.
+    powershell -NoProfile -Command "try { $f=[IO.File]::Open('\\.\DBUtil_2_3','Open','ReadWrite','ReadWrite'); $f.Close(); exit 0 } catch { exit 1 }" >nul 2>&1
+    if errorlevel 1 echo [!] \\.\DBUtil_2_3 could not be opened - another process may hold it.
 )
 
 :: ---- run ----

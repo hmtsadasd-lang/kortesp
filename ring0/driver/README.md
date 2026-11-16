@@ -18,8 +18,11 @@ malware.
 
 ## ⚠ Safety — read this before running anything
 
-This driver **bugchecked this machine four times**. It is old and it does not
-handle being stopped or loaded twice.
+This driver **bugchecked this machine four times**. Two of those were our own
+fault: the IOCTL table was swapped, so every "physical read" was a physical
+*write* of a zero-filled buffer, and the CR3 scan stamped zeros over the start
+of eight million pages. That is fixed and now self-verified at startup. The
+driver is also old and does not handle being stopped or loaded twice.
 
 **Never do these:**
 
@@ -72,30 +75,75 @@ used to read the IOCTL codes and request layouts out of the shipped image.
 
 ## IOCTL interface
 
-Read out of the driver's IRP dispatch, not guessed:
+Read out of the driver's IRP dispatch, not guessed. Four primitives, and the
+two pairs are **not** interchangeable:
 
 | IOCTL | Meaning | Request layout | Length |
 |---|---|---|---|
-| `0x9B0C1F44` | read physical memory | `{ u64 header; u64 physaddr; u8 payload[]; }` | `0x10 + n` |
-| `0x9B0C1EC8` | write physical memory | `{ u64 header; u64 base; u32 offset; u32 pad; u8 payload[]; }` | `0x18 + n` |
+| `0x9B0C1F40` | **physical read** | `{ u64 header; u64 physaddr; u8 payload[]; }` | `0x10 + n` |
+| `0x9B0C1F44` | **physical write** | `{ u64 header; u64 physaddr; u8 payload[]; }` | `0x10 + n` |
+| `0x9B0C1EC4` | **kernel-VA read** | `{ u64 header; u64 va; u64 offset; u8 payload[]; }` | `0x18 + n` |
+| `0x9B0C1EC8` | **kernel-VA write** | `{ u64 header; u64 va; u64 offset; u8 payload[]; }` | `0x18 + n` |
 
-The write target is `base + offset` (offset is 32-bit). The rest of the
-driver's IOCTLs are port I/O and query handlers.
+The physical pair maps the range with `MmMapIoSpace(..., MmNonCached)` and
+copies in/out. The kernel-VA pair `memmove`s in the caller's thread context,
+i.e. through the normal cached mapping.
+
+**The distinction is a safety property, not a detail.** Writing kernel
+structures through the non-cached physical mapping leaves stale lines in cores
+that are reading the same structure; and using the physical *write* handler for
+a read stamps the zero-filled request buffer into physical memory.
+
+An earlier revision of this file had the two columns swapped (`0x9B0C1F44`
+listed as read). That is what zeroed the first 8 bytes of every 4 KiB page
+during the CR3 scan and produced the 0x50/0xEF bugchecks. `r0::init()` now
+proves the direction before anything else runs: it reads a handful of low
+physical addresses that carry non-zero firmware data and rejects an all-zero
+result. Deliberately **no write probe** — guessing which handler is the write
+is how you get a bugcheck, and the only writes the tool makes are the cloak's,
+which are dry-run by default.
+
+The kernel-VA write target is `va + offset` (offset is read as 32-bit; the code
+passes 0). The rest of the driver's IOCTLs are port I/O and query handlers.
+
+The request's first 8 bytes must be zero, or match the cached value from the
+previous call. Leave the header zeroed.
 
 ---
 
 ## Blocklist
 
-This box has Microsoft vulnerable-driver blocklist enforcement **off**:
+Two independent things can stop this driver, and they fail differently.
+
+**1. Windows / HVCI blocklist — a load failure.** This box has Microsoft
+vulnerable-driver blocklist enforcement off:
 
 ```
 HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy
     VerifiedAndReputablePolicyState = 0x0
 ```
 
-so `dbutil_2_3.sys` loads. If a Windows update enables enforcement the
-service fails to start — a **load failure, not a detection**. The driver
-simply never appears.
+so `dbutil_2_3.sys` loads. If a Windows update or Memory Integrity turns
+enforcement on, `sc start` fails. That is a **load failure, not a detection**:
+the driver simply never appears, and `run_r0.bat` reports it.
+
+**2. Easy Anti-Cheat — a *client* refusal.** Since mid-2026 EAC recognises this
+binary and Fortnite will not launch while it is loaded, regardless of what the
+kernel blocklist says. This is not a load failure; it is EAC naming the
+driver. The only counter in this tree is the module-list cloak
+(`cloak::apply(true)`), and that is necessary but probably not sufficient —
+`\Device\DBUtil_2_3` and `\??\DBUtil_2_3` survive it.
+
+Sequence that actually tells you something:
+
+1. `--probe` with a working read path (driver only, no game).
+2. `--cloak` dry run, review the two writes.
+3. `--cloak-commit`, then launch Fortnite.
+4. If EAC still names `DBUtil_2_3`, the module list was not the tell. Next
+   cheapest move is running the driver under a random service name and random
+   image name (defeats name matching, not hashing); after that the driver has
+   to be replaced. `r0::Backend` is the seam — nothing above it knows which
+   driver is in use.
 
 ---
 

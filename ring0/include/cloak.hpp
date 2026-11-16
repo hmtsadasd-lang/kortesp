@@ -23,8 +23,6 @@ struct Plan {
     uint64_t entry{};       // our KLDR_DATA_TABLE_ENTRY
     uint64_t load_prev{};   // InLoadOrderLinks.Blink
     uint64_t load_next{};   // InLoadOrderLinks.Flink
-    uint64_t mem_prev{};    // InMemoryOrderLinks.Blink
-    uint64_t mem_next{};    // InMemoryOrderLinks.Flink
     uint64_t dll_base{};    // DllBase of the matched entry
     bool     found{};
 };

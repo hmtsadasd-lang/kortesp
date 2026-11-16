@@ -22,16 +22,17 @@ bool      vmm::g_ready = false;
 bool      vmm::g_attached = false;
 
 // EPROCESS layout candidates, most likely first.
-// { pid, links, name, dtb, peb }
-vmm::Layout   vmm::g_lay{ 0x1D0, 0x98, 0x338, 0x28, 0x38 };
+// { pid, links, name, dtb, peb } - Win11 24H2/25H2.
+vmm::Layout   vmm::g_lay{ 0x1D0, 0x1D8, 0x338, 0x28, 0x2E0 };
 
 // --- Helper: physical read via r0 backend (length-aware) ---
 //
-// Every physical read goes through the driver's MmMapIoSpace path. Reading a
-// physical address that is not backed by RAM (a reserved hole, or anything
-// above installed RAM) faults in kernel mode and bugchecks the machine, so
-// every read is bounds-checked against the physical RAM size first.
-uint64_t phys_ram_end() {
+// Every physical read goes through the driver's MmMapIoSpace path. A garbage
+// page-table entry can name a physical address that is not RAM; the driver
+// maps it anyway and the copy returns garbage, so the read cannot fault on
+// its own - but the *contents* of a page table we are about to trust would be
+// garbage. Refusing anything above installed RAM keeps the page walk honest.
+uint64_t vmm::phys_ram_end() {
     static uint64_t end = 0;
     if (!end) {
         MEMORYSTATUSEX ms{ sizeof(ms) };
@@ -41,9 +42,9 @@ uint64_t phys_ram_end() {
     return end;
 }
 
-bool phys_read(uint64_t pa, void* buf, size_t len) {
+static bool phys_read(uint64_t pa, void* buf, size_t len) {
     if (!len) return false;
-    if (pa + len > phys_ram_end()) return false;
+    if (pa + len > vmm::phys_ram_end()) return false;
     if (pa + len < pa) return false;          // overflow
     return r0::pread(pa, buf, len);
 }
@@ -183,11 +184,21 @@ bool find_ntoskrnl(uint64_t& base, uint64_t& size) {
 // Kernel CR3: scan physical memory for a CR3 whose kernel half maps ntoskrnl.
 // ---------------------------------------------------------------------------
 bool find_kernel_cr3(uint64_t& out) {
+    // One scan per process is enough; remember the hit so a later call (or a
+    // re-init after a detach) does not pay for 8M round-trips again.
+    if (vmm::g_kcr3) { out = vmm::g_kcr3; return true; }
+
     // The CR3 and all of its page tables live in installed RAM. Do not scan
     // past it - above RAM is the PCI hole and mapping it would fault.
-    const uint64_t top = phys_ram_end();
+    const uint64_t top = vmm::phys_ram_end();
 
+    uint64_t visited = 0;
     for (uint64_t pa = 0x1000; pa < top; pa += 0x1000) {
+        if (!(++visited & 0xFFFFF)) {
+            // Every ~4 GB. Without this the scan just looks hung.
+            printf("[*] CR3 scan: 0x%llx / 0x%llx\n",
+                   (unsigned long long)pa, (unsigned long long)top);
+        }
         uint64_t e{};
         if (!phys_read(pa, &e, 8)) continue;
         if (!(e & static_cast<uint64_t>(vmm::PteFlags::Present))) continue;
@@ -201,7 +212,7 @@ bool find_kernel_cr3(uint64_t& out) {
 
         uint16_t mz{};
         if (!phys_read(probe & ~0xFFFull, &mz, 2)) continue;
-        if (mz == 0x5A4D) { out = pa; return true; }
+        if (mz == 0x5A4D) { vmm::g_kcr3 = pa; out = pa; return true; }
     }
     return false;
 }
@@ -217,15 +228,103 @@ bool looks_eprocess(uint64_t p, const vmm::Layout& l) {
     if (!vmm::kread(p + l.pid, &pid, 8)) return false;
     if (pid != 4) return false;
     if (!vmm::kread(p + l.name, name, sizeof(name))) return false;
-    return memcmp(name, "System", 7) == 0;
+    if (memcmp(name, "System", 7) != 0) return false;
+
+    // Validate the LIST_ENTRY offset for real: both neighbours must be
+    // kernel addresses, and the forward neighbour's Blink must point back at
+    // this node. A wrong `links` offset (the old table had 0x98) reads two
+    // arbitrary EPROCESS fields and fails here instead of at attach().
+    uint64_t flink{}, blink{};
+    if (!vmm::kread(p + l.links, &flink, 8)) return false;
+    if (!vmm::kread(p + l.links + 8, &blink, 8)) return false;
+    if (flink < 0xFFFF800000000000ull || blink < 0xFFFF800000000000ull) return false;
+    uint64_t back{};
+    if (!vmm::kread(flink + 8, &back, 8)) return false;
+    if (back != p + l.links) return false;
+
+    return true;
 }
 
+// ---------------------------------------------------------------------------
+// ntoskrnl export lookup.
+//
+// Resolves a *data* export (a variable, not a function): the export RVA is
+// the address of the variable itself. PsInitialSystemProcess is one; the
+// PsLoadedModuleList head is not - that one is not exported on 26200, so the
+// cloak has to find it by scanning instead.
+// ---------------------------------------------------------------------------
+bool vmm::export_rva(const char* want, uint64_t& rva) {
+    IMAGE_DOS_HEADER dos{};
+    if (!vmm::kread(vmm::g_ntos, &dos, sizeof(dos)) || dos.e_magic != 0x5A4D) return false;
+
+    IMAGE_NT_HEADERS64 nt{};
+    if (!vmm::kread(vmm::g_ntos + dos.e_lfanew, &nt, sizeof(nt))) return false;
+    if (nt.Signature != 0x4550) return false;
+
+    const auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return false;
+
+    IMAGE_EXPORT_DIRECTORY ed{};
+    if (!vmm::kread(vmm::g_ntos + dir.VirtualAddress, &ed, sizeof(ed))) return false;
+
+    for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
+        uint32_t name_rva{};
+        if (!vmm::kread(vmm::g_ntos + ed.AddressOfNames + 4ull * i, &name_rva, 4)) return false;
+        char name[64]{};
+        if (!vmm::kread(vmm::g_ntos + name_rva, name, sizeof(name) - 1)) continue;
+        if (strcmp(name, want) != 0) continue;
+
+        uint16_t ord{};
+        if (!vmm::kread(vmm::g_ntos + ed.AddressOfNameOrdinals + 2ull * i, &ord, 2)) return false;
+        uint32_t fn{};
+        if (!vmm::kread(vmm::g_ntos + ed.AddressOfFunctions + 4ull * ord, &fn, 4)) return false;
+        rva = fn;
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// System EPROCESS.
+//
+// PsInitialSystemProcess is exported by ntoskrnl on every modern Windows -
+// it is a pointer to the System process EPROCESS. One read, no scan.
+// ---------------------------------------------------------------------------
 bool find_system_eprocess() {
+    uint64_t rva{};
+    if (vmm::export_rva("PsInitialSystemProcess", rva)) {
+        uint64_t ep{};
+        if (vmm::kread(vmm::g_ntos + rva, &ep, sizeof(ep)) && ep &&
+            ep >= 0xFFFF800000000000ull && !(ep & 7)) {
+            // Confirm it really is the System process (pid 4, name "System").
+            // Offsets from Vergilius (_EPROCESS):
+            //   24H2/25H2 (26100/26200): pid 0x1D0, links 0x1D8, name 0x338,
+            //                            Peb 0x2E0
+            //   23H2 / Win10 22H2:      pid 0x440, links 0x448, name 0x5A8,
+            //                            Peb 0x550
+            // DirectoryTableBase is KPROCESS+0x28 on every x64 build.
+            //
+            // The previous table had links 0x98 and Peb 0x38, which are not
+            // fields in either structure; validation (pid/name) still passed,
+            // so attach() would have failed at the first list walk.
+            static const vmm::Layout kCand[] = {
+                { 0x1D0, 0x1D8, 0x338, 0x28, 0x2E0 },
+                { 0x440, 0x448, 0x5A8, 0x28, 0x550 },
+            };
+            for (const auto& l : kCand) {
+                if (!looks_eprocess(ep, l)) continue;
+                vmm::g_lay = l;
+                vmm::g_eprocess = ep;
+                return true;
+            }
+        }
+    }
+
+    // Fallback: scan ntoskrnl's writable sections for a pointer that
+    // validates as the System process (pid 4, name "System").
     static const vmm::Layout kCand[] = {
-        { 0x1D0, 0x98, 0x338, 0x28, 0x38 },   // Win11 24H2 / 25H2 (build 26200)
-        { 0x440, 0x98, 0x5A8, 0x28, 0x38 },   // Win10 22H2 / 11 23H2
-        { 0x440, 0x98, 0x5A8, 0x20, 0x38 },
-        { 0x2E8, 0x98, 0x450, 0x28, 0x38 },   // Win10 1903 - 21H2
+        { 0x1D0, 0x1D8, 0x338, 0x28, 0x2E0 },   // Win11 24H2 / 25H2 (26200)
+        { 0x440, 0x448, 0x5A8, 0x28, 0x550 },   // Win11 23H2 / Win10 22H2
     };
 
     // Read the PE headers so we only scan writable data sections.
@@ -292,6 +391,59 @@ void vmm::shutdown() {
     r0::shutdown();
 }
 
+// Read through an arbitrary CR3 - used before we have attached to anything.
+static bool read_cr3(uint64_t cr3, uint64_t va, void* buf, size_t len) {
+    auto* p = static_cast<uint8_t*>(buf);
+    for (size_t i = 0; i < len;) {
+        uint64_t pa{};
+        if (!translate_cr3(cr3, va + i, pa)) return false;
+        size_t n = 0x1000 - ((va + i) & 0xFFF);
+        if (n > len - i) n = len - i;
+        if (!phys_read(pa, p + i, n)) return false;
+        i += n;
+    }
+    return true;
+}
+
+// Confirm the candidate process really has the wanted module in its own PEB.
+//
+// EPROCESS.ImageFileName is only char[15], so the game truncates to
+// "FortniteClient-". "FortniteClient-Win64-Shipping.exe" and
+// "FortniteClient-Win64-Shipping_BE.exe" truncate identically, so the
+// truncated name alone is ambiguous - the module list settles it.
+//
+// x64 PEB:  Ldr at +0x18.  PEB_LDR_DATA: InLoadOrderModuleList at +0x10.
+// LDR_DATA_TABLE_ENTRY: BaseDllName (UNICODE_STRING) length +0x58, buffer +0x60.
+static bool peb_has_module(uint64_t eprocess, uint64_t cr3, const char* want) {
+    uint64_t peb{}, ldr{}, head{}, cur{};
+    if (!read_cr3(cr3, eprocess + vmm::g_lay.peb, &peb, 8)) return false;
+    if (peb < vmm::kUserLo || peb > vmm::kUserHi) return false;
+    if (!read_cr3(cr3, peb + 0x18, &ldr, 8)) return false;      // PEB->Ldr
+    if (ldr < vmm::kUserLo || ldr > vmm::kUserHi) return false;
+    if (!read_cr3(cr3, ldr + 0x10, &head, 8)) return false;     // InLoadOrderModuleList
+    if (head < vmm::kUserLo || head > vmm::kUserHi) return false;
+    if (!read_cr3(cr3, head, &cur, 8)) return false;
+
+    for (int g = 0; g < 512 && cur && cur != head; ++g) {
+        uint64_t nbuf{};
+        uint16_t nlen{};
+        if (!read_cr3(cr3, cur + 0x58, &nlen, 2)) return false;
+        if (!read_cr3(cr3, cur + 0x60, &nbuf, 8)) return false;
+        if (nlen > 3 && nlen < 512) {
+            wchar_t w[264]{};
+            const int c = nlen / 2;
+            if (c < 263 && read_cr3(cr3, nbuf, w, nlen)) {
+                char a[64]{};
+                for (int i = 0; i < c && i < 63; ++i)
+                    a[i] = w[i] < 128 ? static_cast<char>(w[i]) : '?';
+                if (_stricmp(a, want) == 0) return true;
+            }
+        }
+        if (!read_cr3(cr3, cur, &cur, 8)) return false;
+    }
+    return false;
+}
+
 // attach: find the process by image name and map its CR3
 bool vmm::attach(const wchar_t* image_name) {
     if (!g_eprocess) return false;
@@ -310,12 +462,24 @@ bool vmm::attach(const wchar_t* image_name) {
         if (!kread(cur + g_lay.pid, &pid, 8)) break;
         if (!kread(cur + g_lay.name, name, sizeof(name))) break;
 
-        if (::_stricmp(name, want) != 0) continue;
+        // ImageFileName is char[15] - the field truncates. Compare only as
+        // many characters as the field can hold.
+        constexpr size_t kEprocNameMax = 15;
+        size_t wl = strlen(want);
+        if (wl > kEprocNameMax) wl = kEprocNameMax;
+        if (_strnicmp(name, want, wl) != 0) continue;
+        if (pid == 0 || pid == 4) continue;
 
         uint64_t dtb{};
-        if (!kread(cur + g_lay.dtb, &dtb, 8)) return false;
+        if (!kread(cur + g_lay.dtb, &dtb, 8)) continue;
+        dtb &= kPteMask;
+        if (!dtb || dtb >= vmm::phys_ram_end()) continue;
 
-        g_gcr3 = dtb & kPteMask;
+        // The truncated name is ambiguous - confirm against the target's own
+        // module list before committing to this process.
+        if (!peb_has_module(cur, dtb, want)) continue;
+
+        g_gcr3 = dtb;
         g_eprocess = cur;
         g_pid  = static_cast<uint32_t>(pid);
         g_ready = true;
@@ -353,10 +517,16 @@ bool vmm::kwrite(uint64_t va, const void* buf, size_t len) {
     auto* p = static_cast<const uint8_t*>(buf);
     for (size_t i = 0; i < len;) {
         uint64_t pa{};
+        // Walk first: it validates that every page is present, so the
+        // memmove cannot fault halfway through.
         if (!translate_cr3(g_kcr3, va + i, pa)) return false;
         size_t n = 0x1000 - ((va + i) & 0xFFF);
         if (n > len - i) n = len - i;
-        if (!r0::pwrite(pa, p + i, n)) return false;
+        // The driver's KERNEL-VIRTUAL path, not the physical one: it memmoves
+        // on the normal cached mapping, so other cores see the change. The
+        // physical path uses MmMapIoSpace(MmNonCached) and would leave stale
+        // lines in any core reading the same structure.
+        if (!r0::vwrite(va + i, p + i, n)) return false;
         i += n;
     }
     return true;

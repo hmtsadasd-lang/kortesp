@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -12,15 +13,23 @@ constexpr uint64_t kLde_BaseName = 0x58;
 
 uint64_t g_head{};
 uint64_t g_entry{};
-uint64_t g_p1{}, g_n1{};   // InLoadOrderLinks  .Blink / .Flink
-uint64_t g_p2{}, g_n2{};   // InMemoryOrderLinks.Blink / .Flink
+uint64_t g_prev{};
+uint64_t g_next{};
 uint64_t g_our_base{};
 bool     g_on{};
 
+// The image the driver was loaded under. Defaults to the stock name; the
+// runner overrides it when it installs the driver under a random name.
+const char* driver_image() {
+    const char* e = getenv("FORTESP_DRIVER_IMAGE");
+    if (e && *e) return e;
+    return "dbutil_2_3.sys";
+}
+
 // ---- the module's own base, straight from the kernel module list ----------
-// Name-suffix match, so a renamed image still resolves. Returns 0 if the
-// driver is not loaded, which is the only case where cloak can legitimately
-// do nothing.
+// Name-suffix match, so a renamed image still resolves as long as the caller
+// tells us what it was renamed to. Returns 0 if the driver is not loaded,
+// which is the only case where cloak can legitimately do nothing.
 uint64_t our_base() {
     HMODULE n = GetModuleHandleW(L"ntdll.dll");
     if (!n) return 0;
@@ -45,18 +54,20 @@ uint64_t our_base() {
         };
         struct L { uint32_t count; uint32_t pad; E e[1]; };
 
+        const char* want = driver_image();
+        const size_t wl = strlen(want);
+
         auto* l = static_cast<L*>(buf);
         for (uint32_t i = 0; i < l->count && i < 512; ++i) {
             const char* p = reinterpret_cast<const char*>(l->e[i].path);
             const size_t len = strlen(p);
-            const char* want = "dbutil_2_3.sys";
-            const size_t wl = strlen(want);
             if (len < wl) continue;
 
             bool same = true;
             for (size_t k = 0; k < wl; ++k) {
                 char a = p[len - wl + k], b = want[k];
                 if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + 32);
+                if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + 32);
                 if (a != b) { same = false; break; }
             }
             if (same) { base = l->e[i].image_base; break; }
@@ -70,37 +81,6 @@ uint64_t our_base() {
 // It is not exported on 26200 any more, so the export is only a fast path.
 // The fallback scans ntoskrnl's writable, non-executable sections for a
 // LIST_ENTRY whose first entry validates as a real module.
-bool export_rva(const char* want, uint64_t& rva) {
-    IMAGE_DOS_HEADER dos{};
-    if (!vmm::kread(vmm::g_ntos, &dos, sizeof(dos)) || dos.e_magic != 0x5A4D) return false;
-
-    IMAGE_NT_HEADERS64 nt{};
-    if (!vmm::kread(vmm::g_ntos + dos.e_lfanew, &nt, sizeof(nt))) return false;
-    if (nt.Signature != 0x4550) return false;
-
-    const auto& dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress || !dir.Size) return false;
-
-    IMAGE_EXPORT_DIRECTORY ed{};
-    if (!vmm::kread(vmm::g_ntos + dir.VirtualAddress, &ed, sizeof(ed))) return false;
-
-    for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
-        uint32_t name_rva{};
-        if (!vmm::kread(vmm::g_ntos + ed.AddressOfNames + 4ull * i, &name_rva, 4)) return false;
-        char name[64]{};
-        if (!vmm::kread(vmm::g_ntos + name_rva, name, sizeof(name) - 1)) continue;
-        if (strcmp(name, want) != 0) continue;
-
-        uint16_t ord{};
-        if (!vmm::kread(vmm::g_ntos + ed.AddressOfNameOrdinals + 2ull * i, &ord, 2)) return false;
-        uint32_t fn{};
-        if (!vmm::kread(vmm::g_ntos + ed.AddressOfFunctions + 4ull * ord, &fn, 4)) return false;
-        rva = fn;
-        return true;
-    }
-    return false;
-}
-
 bool valid_head(uint64_t h) {
     uint64_t f{};
     if (!vmm::kread(h, &f, 8)) return false;
@@ -124,7 +104,7 @@ bool valid_head(uint64_t h) {
 
 bool find_head(uint64_t& head) {
     uint64_t rva{};
-    if (export_rva("PsLoadedModuleList", rva)) {
+    if (vmm::export_rva("PsLoadedModuleList", rva)) {
         head = vmm::g_ntos + rva;
         if (valid_head(head)) return true;
     }
@@ -166,7 +146,11 @@ bool apply(bool commit) {
     g_plan = Plan{};
 
     g_our_base = our_base();
-    if (!g_our_base) return false;
+    if (!g_our_base) {
+        printf("[cloak] driver module \"%s\" not found in the kernel module list\n",
+               driver_image());
+        return false;
+    }
 
     if (!find_head(g_head)) return false;
 
@@ -178,27 +162,28 @@ bool apply(bool commit) {
 
         uint64_t base{};
         if (vmm::kread(entry + kLde_DllBase, &base, 8) && base == g_our_base) {
-            uint64_t ln{}, lp{}, mn{}, mp{};
-            if (!vmm::kread(entry + 0x00, &ln, 8)) return false;   // load .Flink
-            if (!vmm::kread(entry + 0x08, &lp, 8)) return false;   // load .Blink
-            if (!vmm::kread(entry + 0x10, &mn, 8)) return false;   // mem  .Flink
-            if (!vmm::kread(entry + 0x18, &mp, 8)) return false;   // mem  .Blink
+            // KLDR_DATA_TABLE_ENTRY has exactly ONE list: InLoadOrderLinks at
+            // +0x00. There is no InMemoryOrderLinks - that belongs to the
+            // USER-MODE LDR_DATA_TABLE_ENTRY. Unlinking a "memory order"
+            // link here would write into ExceptionTable/ExceptionTableSize
+            // (+0x10/+0x18) and bugcheck the machine.
+            uint64_t next{}, prev{};
+            if (!vmm::kread(entry + 0x00, &next, 8)) return false;
+            if (!vmm::kread(entry + 0x08, &prev, 8)) return false;
 
-            // Sanity: the neighbours must be kernel addresses. A wrong list
-            // head would otherwise have us write the entry pointer into an
+            // The neighbours must be kernel addresses. A wrong list head
+            // would otherwise have us write the entry pointer into an
             // arbitrary kernel address.
-            if (lp < kKvaLo || ln < kKvaLo || mp < kKvaLo || mn < kKvaLo) return false;
+            if (prev < kKvaLo || next < kKvaLo) return false;
 
             g_entry = entry;
-            g_p1 = lp; g_n1 = ln;
-            g_p2 = mp; g_n2 = mn;
+            g_prev = prev;
+            g_next = next;
 
             g_plan.head      = g_head;
             g_plan.entry     = entry;
-            g_plan.load_prev = lp;
-            g_plan.load_next = ln;
-            g_plan.mem_prev  = mp;
-            g_plan.mem_next  = mn;
+            g_plan.load_prev = prev;
+            g_plan.load_next = next;
             g_plan.dll_base  = base;
             g_plan.found     = true;
 
@@ -207,30 +192,22 @@ bool apply(bool commit) {
                 printf("[cloak]   PsLoadedModuleList head : 0x%llx\n", (unsigned long long)g_head);
                 printf("[cloak]   our KLDR entry          : 0x%llx\n", (unsigned long long)entry);
                 printf("[cloak]   DllBase                 : 0x%llx\n", (unsigned long long)base);
-                printf("[cloak]   InLoadOrder  prev/next  : 0x%llx / 0x%llx\n",
-                       (unsigned long long)lp, (unsigned long long)ln);
-                printf("[cloak]   InMemoryOrder prev/next  : 0x%llx / 0x%llx\n",
-                       (unsigned long long)mp, (unsigned long long)mn);
-                printf("[cloak]   write 0x%llx <- 0x%llx   (load prev.Flink)\n",
-                       (unsigned long long)lp, (unsigned long long)ln);
-                printf("[cloak]   write 0x%llx <- 0x%llx   (load next.Blink)\n",
-                       (unsigned long long)ln + 8, (unsigned long long)lp);
-                printf("[cloak]   write 0x%llx <- 0x%llx   (mem prev.Flink)\n",
-                       (unsigned long long)mp, (unsigned long long)mn);
-                printf("[cloak]   write 0x%llx <- 0x%llx   (mem next.Blink)\n",
-                       (unsigned long long)mn + 8, (unsigned long long)mp);
+                printf("[cloak]   prev / next             : 0x%llx / 0x%llx\n",
+                       (unsigned long long)prev, (unsigned long long)next);
+                printf("[cloak]   would write 0x%llx <- 0x%llx   (prev.Flink = next)\n",
+                       (unsigned long long)prev, (unsigned long long)next);
+                printf("[cloak]   would write 0x%llx <- 0x%llx   (next.Blink = prev)\n",
+                       (unsigned long long)next + 8, (unsigned long long)prev);
                 printf("[cloak] re-run with --cloak-commit to actually unlink.\n");
                 return true;
             }
 
             // ---- the only kernel writes in the whole tool ----
-            // Unlink from BOTH lists: SystemModuleInformation walks
-            // InLoadOrderLinks, but an anti-cheat that walks
-            // InMemoryOrderLinks would otherwise still see the driver.
-            if (!vmm::kwrite(lp,     &ln, 8)) return false;   // load prev.Flink = next
-            if (!vmm::kwrite(ln + 8, &lp, 8)) return false;   // load next.Blink = prev
-            if (!vmm::kwrite(mp,     &mn, 8)) return false;   // mem  prev.Flink = next
-            if (!vmm::kwrite(mn + 8, &mp, 8)) return false;   // mem  next.Blink = prev
+            // Two writes. The kernel-VA path (memmove on the cached mapping),
+            // not the physical one - MmMapIoSpace(MmNonCached) would leave
+            // stale lines in the cores that are reading this list.
+            if (!vmm::kwrite(prev, &next, 8)) return false;   // prev.Flink = next
+            if (!vmm::kwrite(next + 8, &prev, 8)) return false; // next.Blink = prev
 
             g_on = true;
             return true;
@@ -243,10 +220,8 @@ bool apply(bool commit) {
 
 void restore() {
     if (!g_on) return;
-    vmm::kwrite(g_p1, &g_entry, 8);      // load prev.Flink = entry
-    vmm::kwrite(g_n1 + 8, &g_entry, 8);   // load next.Blink = entry
-    vmm::kwrite(g_p2, &g_entry, 8);       // mem  prev.Flink = entry
-    vmm::kwrite(g_n2 + 8, &g_entry, 8);   // mem  next.Blink = entry
+    vmm::kwrite(g_prev, &g_entry, 8);       // prev.Flink = entry
+    vmm::kwrite(g_next + 8, &g_entry, 8);   // next.Blink = entry
     g_on = false;
 }
 

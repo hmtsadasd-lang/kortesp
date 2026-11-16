@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,9 +22,9 @@ namespace {
 //   kernel VA  0xFFFF800000000000  -> 2 MB pages
 //
 // A 2 MB large page resolves to  PA = (pde & 0x000FFFFFFFE00000) + (va & 0x1FFFFF).
-// The PDE address field therefore only carries bits 21+, so consecutive 2 MB
-// chunks advance the physical base by 2 MB but the VA must sit in the *same*
-// 1 GB region - hence the PD slot for chunk j is (pd0 + j) & 0x1FF.
+// The PDE address field only carries bits 21+, so consecutive 2 MB chunks
+// advance the physical base by 2 MB but the VA must sit in the *same* 1 GB
+// region - hence the PD slot for chunk j is (pd0 + j) & 0x1FF.
 //
 // The physical side is sparse (page-granular map), so a 512 MB user VA range
 // costs only the pages actually touched.
@@ -114,7 +115,15 @@ bool mock_write(uint64_t pa, const void* in, size_t len) {
     return true;
 }
 
-const r0::Backend kMockBackend{L"mock", mock_open, mock_close, mock_read, mock_write};
+// The mock's "kernel VA" space is the kernel data region.
+bool mock_vwrite(uint64_t va, const void* in, size_t len) {
+    const uint64_t off = va - kKvaBase;
+    if (va < kKvaBase) return false;
+    return mock_write(kKernPa + off, in, len);
+}
+
+const r0::Backend kMockBackend{L"mock", mock_open, mock_close,
+                               mock_read, mock_write, mock_vwrite};
 
 // ---- writers into the user data region -----------------------------------
 uint64_t uva(uint64_t off) { return kVaBase + off; }
@@ -127,6 +136,7 @@ void w16(uint64_t off, uint16_t v)  { uint8_t* p = page_for_write(upa(off)); mem
 void w32(uint64_t off, uint32_t v)  { uint8_t* p = page_for_write(upa(off)); memcpy(p + off % kPageSz, &v, 4); }
 void w64(uint64_t off, uint64_t v)  { uint8_t* p = page_for_write(upa(off)); memcpy(p + off % kPageSz, &v, 8); }
 void wf32(uint64_t off, float v)    { uint8_t* p = page_for_write(upa(off)); memcpy(p + off % kPageSz, &v, 4); }
+void wf64(uint64_t off, double v)   { uint8_t* p = page_for_write(upa(off)); memcpy(p + off % kPageSz, &v, 8); }
 void wbytes(uint64_t off, const void* src, size_t n) {
     uint8_t* p = page_for_write(upa(off));
     memcpy(p + off % kPageSz, src, n);
@@ -151,7 +161,7 @@ void build_page_tables() {
 
     {
         uint8_t* p = page_for_write(kPml4Pa);
-        const uint64_t v = kPdptPa | 0x03ull;          // Present|Write
+        const uint64_t v = kPdptPa | 0x03ull;
         memcpy(p + (u_pml4 * 8) % kPageSz, &v, 8);
     }
     {
@@ -159,8 +169,6 @@ void build_page_tables() {
         const uint64_t v = kPdPa | 0x03ull;
         memcpy(p + (u_pdpt * 8) % kPageSz, &v, 8);
     }
-    // Chunk j of the region lives at PD slot (u_pd0 + j) & 0x1FF and maps to
-    // physical kDataPa + j * 2MB.
     for (uint64_t j = 0; j < 512; ++j)
         put_pde(kPdPa, (u_pd0 + j) & 0x1FF, kDataPa + j * 0x200000ull);
 
@@ -183,7 +191,6 @@ void build_page_tables() {
 }
 
 // ---- FString encoding (inverse of esp::decode_fstring) -------------------
-// Produces the obfuscated buffer UE would store.
 int encode_fstring(const wchar_t* plain, wchar_t* out, int cap) {
     const int n = static_cast<int>(wcslen(plain));
     int key = ((n + 1) - 1) & 3;                 // same seed the decoder uses
@@ -228,15 +235,15 @@ void build_graph() {
 
     w64(O_CAMERAMGR + off::Camera_CameraCachePrivate, uva(O_CAMERACACHE));
 
-    // POV lives at cam + CameraCachePrivate + CacheEntry_POV.
+    // POV: { FVector3d Location; FRotator3d Rotation; double FOV }
     const uint64_t po = O_CAMERAMGR + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
-    wf32(po + off::POV_Location + 0, 1000.0f);
-    wf32(po + off::POV_Location + 4, 2000.0f);
-    wf32(po + off::POV_Location + 8,  100.0f);
-    wf32(po + off::POV_Rotation + 0,   0.0f);   // pitch
-    wf32(po + off::POV_Rotation + 4,  90.0f);   // yaw -> facing +Y
-    wf32(po + off::POV_Rotation + 8,   0.0f);   // roll
-    wf32(po + off::POV_FOV, 90.0f);
+    wf64(po + off::POV_Location + 0,  1000.0);
+    wf64(po + off::POV_Location + 8,  2000.0);
+    wf64(po + off::POV_Location + 16,  100.0);
+    wf64(po + off::POV_Rotation + 0,     0.0);   // pitch
+    wf64(po + off::POV_Rotation + 8,    90.0);   // yaw -> facing +Y
+    wf64(po + off::POV_Rotation + 16,    0.0);   // roll
+    wf64(po + off::POV_FOV,             90.0);
 
     w64(O_GAMESTATE + off::GameState_PlayerArray, uva(O_PLAYERARRAY));
     w32(O_GAMESTATE + off::GameState_PlayerArray + 8, 2);
@@ -246,13 +253,13 @@ void build_graph() {
 
     // local player
     w64(O_STATE0 + off::State_Pawn, uva(O_PAWN0));
-    w32(O_STATE0 + off::State_Team, 3);
+    w8 (O_STATE0 + off::State_Team, 3);            // byte, not int32
     w8 (O_STATE0 + off::State_Flags, 0x00);
     write_name(O_STATE0, L"LocalPlayer", O_NAMEBUF0);
 
     // enemy
     w64(O_STATE1 + off::State_Pawn, uva(O_PAWN1));
-    w32(O_STATE1 + off::State_Team, 7);
+    w8 (O_STATE1 + off::State_Team, 7);
     w8 (O_STATE1 + off::State_Flags, 0x00);
     write_name(O_STATE1, L"TestEnemy123", O_NAMEBUF1);
 
@@ -267,22 +274,26 @@ void build_graph() {
     wf32(O_PAWN1 + off::Pawn_CapsuleHalf, 88.0f);
     w8 (O_PAWN1 + off::Pawn_Dying, 0x00);
 
-    wf32(O_MESH0 + off::Comp_C2W + off::Xform_Translation + 0, 1000.0f);
-    wf32(O_MESH0 + off::Comp_C2W + off::Xform_Translation + 4, 2000.0f);
-    wf32(O_MESH0 + off::Comp_C2W + off::Xform_Translation + 8,  100.0f);
+    // ComponentToWorld translation: FTransform { FQuat4d; FVector3d; FVector3d }
+    // FQuat4d is 32 bytes, so Translation is at +0x20 and is 3x double.
+    wf64(O_MESH0 + off::Comp_C2W + off::Xform_Translation + 0,  1000.0);
+    wf64(O_MESH0 + off::Comp_C2W + off::Xform_Translation + 8,  2000.0);
+    wf64(O_MESH0 + off::Comp_C2W + off::Xform_Translation + 16,  100.0);
 
-    wf32(O_MESH1 + off::Comp_C2W + off::Xform_Translation + 0, 1000.0f);
-    wf32(O_MESH1 + off::Comp_C2W + off::Xform_Translation + 4, 5000.0f);
-    wf32(O_MESH1 + off::Comp_C2W + off::Xform_Translation + 8,  100.0f);
+    wf64(O_MESH1 + off::Comp_C2W + off::Xform_Translation + 0,  1000.0);
+    wf64(O_MESH1 + off::Comp_C2W + off::Xform_Translation + 8,  5000.0);
+    wf64(O_MESH1 + off::Comp_C2W + off::Xform_Translation + 16,  100.0);
 
     wf32(O_HEALTH0 + off::Health_Current, 100.0f);
     wf32(O_HEALTH0 + off::Health_Max,     100.0f);
     wf32(O_HEALTH1 + off::Health_Current,  40.0f);
     wf32(O_HEALTH1 + off::Health_Max,     100.0f);
 
-    // PEB / LDR / module list
-    w64(O_PEB + 0x30, uva(O_LDR));
-    w64(O_LDR + 0x20, uva(O_MODLIST));
+    // PEB / LDR / module list.
+    //   x64 PEB:  Ldr at +0x18
+    //   PEB_LDR_DATA: InLoadOrderModuleList at +0x10
+    w64(O_PEB + 0x18, uva(O_LDR));
+    w64(O_LDR + 0x10, uva(O_MODLIST));
 
     w64(O_MODLIST + 0x00, uva(O_MODENTRY));
     w64(O_MODLIST + 0x08, uva(O_MODENTRY));
@@ -335,7 +346,7 @@ bool run() {
     {
         uint64_t probe = 0x0123456789ABCDEFull;
         const uint64_t va = uva(0x0010A500);
-        w64(0x0010A500, probe);          // must land at the offset, not page start
+        w64(0x0010A500, probe);
 
         uint64_t got = 0;
         check(vmm::read(va, &got, sizeof(got)) && got == probe,
@@ -345,7 +356,6 @@ bool run() {
         check(vmm::read(va, &one, 1) && one == static_cast<uint8_t>(probe),
               "1-byte read does not overflow the destination");
 
-        // A VA in a different 2MB chunk must land on a different physical page.
         const uint64_t va2 = uva(0x0030A500);
         uint64_t probe2 = 0x00FFEEDDCCBBAA00ull;
         w64(0x0030A500, probe2);
@@ -353,9 +363,6 @@ bool run() {
         check(vmm::read(va2, &got2, sizeof(got2)) && got2 == probe2,
               "read from a second 2MB chunk lands on the right physical page");
 
-        // A VA 480 MB past the base must still resolve. Use a scratch offset
-        // that is not part of the object graph - the GEngine slot at
-        // base+0x1C9DC1D8 is real data and must not be clobbered.
         constexpr uint64_t kScratch = 0x1F000000;
         const uint64_t va3 = uva(kScratch);
         uint64_t probe3 = 0x0BADF00DDEADBEEFull;
@@ -388,7 +395,6 @@ bool run() {
 
     printf("\n5. FString decode\n");
     {
-        // Round-trip: obfuscate, then decode.
         wchar_t cipher[64]{};
         const int n = encode_fstring(L"TestEnemy123", cipher, 64);
         wchar_t out[64]{};
@@ -407,9 +413,27 @@ bool run() {
               "the name read out of the FString decodes correctly");
     }
 
-    printf("\n6. projection and drawing\n");
+    printf("\n6. LWC doubles\n");
     {
-        // Deterministic geometry: box + health bar only.
+        // The POV Location is 3x double at +0x00. Read it back and check the
+        // value is a real coordinate, not the low mantissa half of one.
+        double loc[3]{};
+        const uint64_t po = uva(O_CAMERAMGR + off::Camera_CameraCachePrivate + off::CacheEntry_POV);
+        vmm::read(po + off::POV_Location, loc, sizeof(loc));
+        check(loc[0] == 1000.0 && loc[1] == 2000.0 && loc[2] == 100.0,
+              "POV.Location reads back as 3x double");
+
+        double feet[3]{};
+        vmm::read(uva(O_MESH1 + off::Comp_C2W + off::Xform_Translation), feet, sizeof(feet));
+        check(feet[1] == 5000.0, "FTransform.Translation reads back as 3x double");
+
+        uint8_t team = 0;
+        vmm::read(uva(O_STATE1 + off::State_Team), &team, sizeof(team));
+        check(team == 7, "State_Team reads back as a byte");
+    }
+
+    printf("\n7. projection and drawing\n");
+    {
         const esp::Config saved = esp::cfg;
         esp::cfg.boxes = true;
         esp::cfg.health = true;
@@ -429,7 +453,7 @@ bool run() {
         esp::cfg = saved;
     }
 
-    printf("\n7. cleanup\n");
+    printf("\n8. cleanup\n");
     {
         esp::shutdown();
         r0::set_backend(nullptr);
