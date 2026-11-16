@@ -50,7 +50,17 @@ rem elevated token. Do NOT use `net session` here - it goes through the SMB
 rem stack, and this box runs a WinDivert-based network filter and has a
 rem history of hangs right after SMB/SCM commands. `fltmc` is equally off
 rem limits: it loads the filter-manager stack.
-whoami /groups 2>nul | findstr /c:"S-1-16-12288" >nul
+rem ---- elevation check: must be run from an elevated shell ---::
+:: `whoami /groups` contains S-1-16-12288 only when the process is
+:: running with SeDebugPrivilege (i.e. true admin/elevated token).
+:: `ver` alone is NOT a valid test (always returns 0/errorlevel 0).
+whoami /groups > "%TEMP%\_fg_groups.tmp" 2>nul
+findstr /c:"S-1-16-12288" "%TEMP%\_fg_groups.tmp" >nul
+if errorlevel 1 (
+    echo [x] this runner must be started in an elevated (admin) session.
+    echo     right-click the bat and choose "Run as administrator".
+    goto :fail
+)
 if errorlevel 1 (
     echo [*] requesting elevation...
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^

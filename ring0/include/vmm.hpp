@@ -78,6 +78,7 @@ struct Section {
 // Only init_ntos() is a prerequisite for the others. The scan is never called
 // implicitly: it is the heaviest and riskiest operation in the tool, so it
 // lives behind its own --cr3scan mode.
+
 // ---------------------------------------------------------------------------
 bool init();                  // every stage
 bool init_ntos();
@@ -107,6 +108,9 @@ bool kread_trusted(uint64_t va, void* buf, size_t len);
 
 bool kwrite(uint64_t va, const void* buf, size_t len);
 bool read (uint64_t va, void* buf, size_t len);
+
+// MZ check that survives a transposed kernel-VA pair (which zeroes the header).
+
 bool write(uint64_t va, const void* buf, size_t len);
 bool present(uint64_t va);
 
@@ -137,3 +141,6 @@ bool      phys_is_ram(uint64_t pa, size_t len);
 uint64_t  phys_ram_end();
 
 } // namespace vmm
+
+// MZ check that survives a transposed kernel-VA pair (which zeroes the header).
+

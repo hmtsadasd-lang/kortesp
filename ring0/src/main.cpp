@@ -71,6 +71,7 @@ CmdFlags parse_cmd() {
                     if (i + 1 < argc && argv[i + 1][0] != L'-') {
                         const unsigned long long l = wcstoull(argv[++i], nullptr, 0);
                         if (l && l <= 0x1000) f.raw_len = static_cast<size_t>(l);
+                        else if (l) printf("[!] len %llu capped to 4096\n", l);
                     }
                 }
             }
@@ -101,9 +102,11 @@ std::string narrow(const std::wstring& s) {
 bool raw_read(uint64_t pa, size_t len) {
     if (!len) { printf("[!] zero length\n"); return false; }
 
+    const bool in_ram = vmm::phys_is_ram(pa, len);
     printf("[*] physical read 0x%llx, %zu bytes\n",
            (unsigned long long)pa, len);
-    printf("[*] in RAM map: %s\n", vmm::phys_is_ram(pa, len) ? "yes" : "NO");
+    printf("[*] in RAM map: %s%s\n", in_ram ? "yes" : "NO",
+           in_ram ? "" : " - reading anyway, that is what --raw is for");
 
     std::vector<uint8_t> b(len, 0xCC);
     if (!r0::pread(pa, b.data(), len)) {

