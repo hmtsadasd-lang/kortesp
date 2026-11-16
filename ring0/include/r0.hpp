@@ -63,10 +63,6 @@ bool vread(uint64_t va, void* buf, size_t len);
 // false return means vread() must not be used.
 bool vread_probe(uint64_t va, size_t len);
 bool vread_ready();
-// Returns true once the kernel-VA IOCTL pair direction has been proven.
-// ntos_mz_broken() is true when the probe found the pair is transposed
-// (0x9B0C1EC4 is the write handler, MZ gets zeroed, header paths use 0x0000).
-bool ntos_mz_broken();
 
 // Remove the driver's symbolic link (e.g. L"\\DosDevices\\DBUtil_2_3") from
 // the object directory, so CreateFile(L"\\\\.\\DBUtil_2_3") afterwards returns

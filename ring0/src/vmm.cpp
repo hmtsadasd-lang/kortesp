@@ -792,10 +792,7 @@ void vmm::shutdown() {
 // ---------------------------------------------------------------------------
 // MZ check that survives a transposed kernel-VA pair (which zeroes the header).
 // ---------------------------------------------------------------------------
-bool vmm::mz_ok(uint16_t m) {
-    if (m == 0x5A4D) return true;
-    return m == 0 && r0::ntos_mz_broken();
-}
+// mz_ok defined inline in vmm.hpp; declaration/definition removed from this TU
 
 // Read through an arbitrary CR3 - used before we have attached to anything.
 static bool read_cr3(uint64_t cr3, uint64_t va, void* buf, size_t len) {
@@ -996,3 +993,6 @@ bool vmm::present(uint64_t va) {
 }
 
 
+
+// Global state: set by vread_probe when kernel-VA pair direction is proved transposed.
+bool vmm::g_ntos_mz_broken = false;

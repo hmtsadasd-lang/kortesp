@@ -144,7 +144,14 @@ uint64_t  phys_ram_end();
 // Used by vmm::sections(), export_rva(), init_kcr3(), cache_valid(), and
 // scan_kernel_cr3() to accept both 0x5A4D and 0x0000 when the kernel-VA
 // pair is transposed.
-bool mz_ok(uint16_t magic);
+// State is defined in vmm.cpp as `bool vmm::g_ntos_mz_broken = false;`
+extern bool g_ntos_mz_broken;
+
+// Inline MZ check that survives a transposed kernel-VA pair.
+// Definition in header → every TU gets its own copy, no linker involvement.
+inline bool mz_ok(uint16_t m) {
+    return m == 0x5A4D || (m == 0 && g_ntos_mz_broken);
+}
 
 } // namespace vmm
 
