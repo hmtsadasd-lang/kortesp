@@ -120,6 +120,10 @@ bool present(uint64_t va);
 // PsLoadedModuleList is NOT exported on 26200, so the cloak scans for it.
 bool export_rva(const char* name, uint64_t& rva);
 
+// Find a kernel module by name via SystemModuleInformation. Used by cloak.cpp
+// to avoid pool-scanning ntoskrnl for its own base.
+bool module_base(const char* name, uint64_t& base, uint64_t& size);
+
 // ntoskrnl's section table, read properly. IMAGE_FIRST_SECTION(&nt) on a
 // stack-local IMAGE_NT_HEADERS64 points one-past-the-end of that struct,
 // because the section table follows OptionalHeader in the file and is not

@@ -304,6 +304,7 @@ static bool find_ntoskrnl(uint64_t& base, uint64_t& size) {
     if (!q) return false;
 
     std::vector<uint8_t> buf;
+    ULONG got = 0;
     bool got_list = false;
     for (int attempt = 0; attempt < 3; ++attempt) {
         ULONG need = 0;
@@ -312,7 +313,7 @@ static bool find_ntoskrnl(uint64_t& base, uint64_t& size) {
 
         need += 0x1000 * static_cast<ULONG>(attempt + 1);   // slack for a concurrent load
         buf.assign(need, 0);
-        ULONG got = need;
+        got = need;
         const LONG st = q(11, buf.data(), need, &got);
         if (st == 0) { got_list = true; break; }
         if (static_cast<ULONG>(st) != 0xC0000004ul || attempt == 2) return false;
@@ -325,7 +326,9 @@ static bool find_ntoskrnl(uint64_t& base, uint64_t& size) {
     const size_t header = 8;
     if (buf.size() <= header) return false;
 
-    size_t stride = (buf.size() - header) / count;
+    // Use got (actual bytes returned) not buf.size() (allocation size),
+    // otherwise stride is inflated by the 0x1000 slack padding.
+    size_t stride = (got - header) / count;
     if (!stride || stride < 0x28) { stride = 296; }
 
     for (uint32_t i = 0; i < count; ++i) {
@@ -349,6 +352,67 @@ static bool find_ntoskrnl(uint64_t& base, uint64_t& size) {
 
         base = ib;
         size = isz;
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// module_base() - locate any kernel module by name from SystemModuleInformation.
+// This avoids the CR3-dependent page walk for cloak::apply().
+// ---------------------------------------------------------------------------
+bool vmm::module_base(const char* image_name, uint64_t& base, uint64_t& size) {
+    auto q = reinterpret_cast<LONG(__stdcall*)(ULONG, void*, ULONG, ULONG*)>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    if (!q) return false;
+
+    std::vector<uint8_t> buf;
+    ULONG got = 0;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ULONG need = 0;
+        q(11, nullptr, 0, &need);
+        if (!need) return false;
+        need += 0x1000 * static_cast<ULONG>(attempt + 1);
+        buf.assign(need, 0);
+        const LONG st = q(11, buf.data(), need, &got);
+        if (st == 0) break;
+        if (static_cast<ULONG>(st) != 0xC0000004ul || attempt == 2) return false;
+    }
+    if (buf.empty()) return false;
+
+    const uint32_t count = *reinterpret_cast<uint32_t*>(buf.data());
+    if (!count || count > 4096) return false;
+    const size_t header = 8;
+    if (buf.size() <= header) return false;
+
+    size_t stride = (got - header) / count;
+    if (!stride || stride < 0x28) stride = 296;
+
+    const size_t wl = strlen(image_name);
+    if (!wl || wl >= 0x100) return false;
+
+    printf("[DEBUG] module_base: looking for '%s'\n", image_name);
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t off = header + static_cast<size_t>(i) * stride;
+        if (off + 0x30 > buf.size()) break;
+        const char* name = reinterpret_cast<const char*>(&buf[off + 0x28]);
+        size_t nl = 0;
+        while (nl < 256 && name[nl]) ++nl;
+        if (nl == 0) continue;
+        printf("[DEBUG]   module %d: '%s'\n", i, name);
+        printf("[DEBUG]   module %d: '%s'\n", (int)i, name);
+        if (nl < wl) continue;
+        const char* tail = name + nl - wl;
+        if (tail > name && tail[-1] != '\\' && tail[-1] != '/') continue;
+        if (_strnicmp(tail, image_name, wl) != 0) continue;
+
+        uint64_t ib{}, isz{};
+        memcpy(&ib,  &buf[off + 0x10], 8);
+        memcpy(&isz, &buf[off + 0x18], 4);
+        if (ib < 0xFFFF000000000000ull) continue;
+        if (isz == 0 || isz > 0x10000000ull) continue;
+
+        base = ib; size = isz;
         return true;
     }
     return false;
@@ -558,12 +622,11 @@ bool vmm::scan_kernel_cr3() {
 
             uint16_t mz{};
             if (!phys_read(probe & ~0xFFFull, &mz, 2)) continue;
-            if (!vmm::mz_ok(mz)) {
-                g_kcr3 = pa;
-                save_cr3_cache(pa);
-                printf("[+] kernel CR3 0x%llx (scan)\n", (unsigned long long)pa);
-                return true;
-            }
+            if (!vmm::mz_ok(mz)) continue;
+            g_kcr3 = pa;
+            save_cr3_cache(pa);
+            printf("[+] kernel CR3 0x%llx (scan)\n", (unsigned long long)pa);
+            return true;
         }
     }
     printf("[!] CR3 scan exhausted 0x%llx without a hit\n",
