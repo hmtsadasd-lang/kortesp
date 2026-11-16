@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <io.h>
 #include <string>
 #include <vector>
 #include <shlwapi.h>
@@ -53,7 +54,7 @@ struct CmdFlags {
 static void boot_output() {
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         _wfreopen(L"CONOUT$", L"w", stdout);
-        _wfreopen(L"CONOUT$", L"w", stderr);
+        _dup2(_fileno(stdout), _fileno(stderr));
         return;
     }
     wchar_t path[MAX_PATH]{};
@@ -63,7 +64,7 @@ static void boot_output() {
     *(s + 1) = 0;
     if (wcslen(path) + 12 < MAX_PATH) wcscat(path, L"fortesp.log");
     _wfreopen(path, L"w", stdout);
-    _wfreopen(path, L"w", stderr);
+    _dup2(_fileno(stdout), _fileno(stderr));
 }
 
 bool raw_read(uint64_t pa, size_t len);
@@ -77,7 +78,8 @@ bool run_preflight() {
     if (!vmm::init_kcr3())     printf("[*] no CR3 - kernel-VA path only\n");
     if (!vmm::attach(kImage))  { printf("[!] step 5/5 client not found\n"); return false; }
     if (!esp::init())          { printf("[!] client base unresolved\n"); return false; }
-    return esp::probe();
+    printf("[+] esp init ok\n");
+    return true;
 }
 
 CmdFlags parse_cmd() {
@@ -272,12 +274,20 @@ int wmain() {
         return ok ? 0 : 1;
     }
 
+    if (flags.actors) esp::use_actors = true;
+
     if (flags.preflight || flags.esp_mode) {
         if (!run_preflight()) { vmm::shutdown(); return 1; }
-        if (flags.preflight && !flags.esp_mode) { vmm::shutdown(); return 0; }
+        if (flags.preflight && !flags.esp_mode) {
+            const bool ok = esp::probe();
+            vmm::shutdown();
+            return ok ? 0 : 1;
+        }
+        // --esp: probe is advisory output, not a gate. esp::init() succeeded,
+        // which is sufficient to launch the overlay.
+        printf("[*] running probe (advisory):\n");
+        esp::probe();
     }
-
-    if (flags.actors) esp::use_actors = true;
 
     if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
     if (flags.only_ntos) { vmm::shutdown(); return 0; }

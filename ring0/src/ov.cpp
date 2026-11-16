@@ -1,5 +1,5 @@
 #include "ov.hpp"
-#include "../../payload/include/font.hpp"
+#include "font.hpp"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -15,7 +15,7 @@ ID3D11PixelShader* g_ps{}; ID3D11InputLayout* g_il{}; ID3D11Buffer* g_vb{};
 ID3D11Buffer* g_cb{}; ID3D11BlendState* g_bl{}; ID3D11RasterizerState* g_rs{};
 ID3D11DepthStencilState* g_ds{}; int g_w{}, g_h{};
 struct Vert { float x, y, r, g, b, a; };
-constexpr int kMax = 1 << 16;
+constexpr int kMax = 1 << 19;
 Vert g_stage[kMax]{}; int g_n{};
 
 const char* kSrc =
@@ -149,12 +149,17 @@ bool init(HWND game) {
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 2;
     sd.Scaling = DXGI_SCALING_STRETCH;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
     const HRESULT hr = fact->CreateSwapChainForHwnd(g_dev, g_wnd, &sd, nullptr, nullptr, &g_sc);
     fact->Release();
-    if (hr < 0) return false;
+    if (hr < 0) {
+        // Clean up on failure: unregister class and destroy window.
+        UnregisterClassW(kClass, wc.hInstance);
+        if (g_wnd) { DestroyWindow(g_wnd); g_wnd = nullptr; }
+        return false;
+    }
 
     if (!build_pipeline() || !make_rtv()) return false;
     tick();
@@ -218,17 +223,20 @@ bool pump() {
 void begin() { g_n = 0; }
 
 void end() {
-    if (!g_ctx || !g_rtv || g_w < 1 || g_h < 1) return;
+    if (!g_ctx || g_w < 1 || g_h < 1) {
+        if (g_sc) g_sc->Present(0, 0);
+        return;
+    }
     const float clear[4]{ 0.f, 0.f, 0.f, 0.f };
     g_ctx->ClearRenderTargetView(g_rtv, clear);
 
-    if (g_n) {
+    if (g_n && g_rtv) {
         D3D11_MAPPED_SUBRESOURCE m{};
         if (g_ctx->Map(g_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m) >= 0) {
             memcpy(m.pData, g_stage, sizeof(Vert) * g_n);
             g_ctx->Unmap(g_vb, 0);
 
-            float sz[2]{ static_cast<float>(g_w), static_cast<float>(g_h) };
+            float sz[4]{ static_cast<float>(g_w), static_cast<float>(g_h), 0.f, 0.f };
             g_ctx->UpdateSubresource(g_cb, 0, nullptr, sz, 0, 0);
 
             UINT stride = sizeof(Vert), offset = 0;
@@ -287,6 +295,5 @@ float textw(const wchar_t* s, float sc) { return static_cast<float>(wcslen(s)) *
 int width() { return g_w; }
 int height() { return g_h; }
 int pending() { return g_n; }
-void set_surface(int w, int h) { g_w = w; g_h = h; }
 
 } // namespace ov

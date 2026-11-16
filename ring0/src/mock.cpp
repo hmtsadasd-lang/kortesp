@@ -449,7 +449,6 @@ bool run() {
         esp::cfg.dist = false;
         esp::cfg.lines = false;
 
-        ov::set_surface(1920, 1080);
         ov::begin();
         esp::draw();
         const int verts = ov::pending();

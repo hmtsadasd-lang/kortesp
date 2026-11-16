@@ -71,7 +71,7 @@ constexpr uintptr_t Health_Max     = 0x70 + 0x4;   // VERIFIED float
 
 // ---- UObject ------------------------------------------------------------
 constexpr uintptr_t Obj_Class = 0x10;   // UNVERIFIED - UClass*
-constexpr uintptr_t Class_Name = 0x10;  // UNVERIFIED - FName (IsA fallback)
+constexpr uintptr_t Class_Name = 0x18;  // UNVERIFIED - FName (NamePrivate, not ClassPrivate at 0x10)
 
 // ---- bones (SK_Male / SK_Female) ---------------------------------------
 // Per-skeleton; verify each before trusting the skeleton overlay.

@@ -28,6 +28,4 @@ int  width();
 int  height();
 int  pending();          // pending vertex count (for debugging)
 
-void set_surface(int w, int h);
-
 } // namespace ov
