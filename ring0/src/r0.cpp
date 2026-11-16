@@ -1,5 +1,6 @@
 #include "r0.hpp"
 #include <windows.h>
+#include <winternl.h>
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -197,6 +198,84 @@ bool pwrite(uint64_t pa, const void* buf, size_t len) {
 bool vwrite(uint64_t va, const void* buf, size_t len) {
     if (!g_be) return false;
     return g_be->vwrite(va, buf, len);
+}
+
+// ---------------------------------------------------------------------------
+// \??\DBUtil_2_3 removal.
+//
+// DriverEntry creates \Device\DBUtil_2_3 and the symbolic link \??\DBUtil_2_3
+// (shown as \DosDevices\DBUtil_2_3). The link is what makes
+// CreateFile("\\.\DBUtil_2_3") work, and it is also a name an anti-cheat can
+// enumerate. IoCreateSymbolicLink creates the link as a permanent object, so
+// the way to remove the name is:
+//
+//   1. open the link with DELETE access,
+//   2. NtMakeTemporaryObject clears OBJ_PERMANENT,
+//   3. close the handle - the object directory entry goes away.
+//
+// The device object is not touched. Our already-open handle refers to it
+// directly, so I/O through it keeps working; a later process opening by path
+// gets OBJECT_NAME_NOT_FOUND. \Driver\DBUtil_2_3 and the service registry key
+// survive this - they need object-directory surgery, not a link removal.
+// ---------------------------------------------------------------------------
+using NtOpenSymbolicLinkObjectFn =
+    NTSTATUS (NTAPI*)(HANDLE*, ACCESS_MASK, PUNICODE_STRING);
+using NtMakeTemporaryObjectFn = NTSTATUS (NTAPI*)(HANDLE);
+
+bool hide_symlink(const wchar_t* link) {
+    if (!link || !*link) return false;
+
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (!nt) return false;
+    const auto nt_open = reinterpret_cast<NtOpenSymbolicLinkObjectFn>(
+        reinterpret_cast<void*>(GetProcAddress(nt, "NtOpenSymbolicLinkObject")));
+    const auto nt_temp = reinterpret_cast<NtMakeTemporaryObjectFn>(
+        reinterpret_cast<void*>(GetProcAddress(nt, "NtMakeTemporaryObject")));
+    if (!nt_open || !nt_temp) {
+        printf("[!] ntdll is missing NtOpenSymbolicLinkObject / "
+               "NtMakeTemporaryObject\n");
+        return false;
+    }
+
+    UNICODE_STRING name{};
+    name.Buffer = const_cast<PWSTR>(link);
+    name.Length = static_cast<USHORT>(wcslen(link) * sizeof(wchar_t));
+    name.MaximumLength = name.Length;
+
+    HANDLE h = nullptr;
+    NTSTATUS st = nt_open(&h, DELETE, &name);
+    if (st < 0) {
+        printf("[!] open %ls failed: 0x%08lX - DELETE access refused?\n",
+               link, static_cast<unsigned long>(st));
+        return false;
+    }
+
+    st = nt_temp(h);
+    CloseHandle(h);                 // deletion happens when the last handle closes
+    if (st < 0) {
+        printf("[!] NtMakeTemporaryObject failed: 0x%08lX\n",
+               static_cast<unsigned long>(st));
+        return false;
+    }
+
+    // Prove the name is gone. The device is exclusive and already open by us,
+    // so "still there" would surface as a sharing/access error, not a success;
+    // only not-found means the link was actually removed.
+    HANDLE probe = CreateFileW(L"\\\\.\\DBUtil_2_3", GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+    if (probe != INVALID_HANDLE_VALUE) {
+        CloseHandle(probe);
+        printf("[!] \\\\.\\DBUtil_2_3 still opens - the link was not removed\n");
+        return false;
+    }
+    const DWORD err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+        printf("[!] \\\\.\\DBUtil_2_3 still resolves (error %lu) - "
+               "the link was not removed\n", err);
+        return false;
+    }
+    return true;
 }
 
 } // namespace r0

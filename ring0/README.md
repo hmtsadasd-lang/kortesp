@@ -128,6 +128,7 @@ run_r0.bat --probe        :: resolve the chain, print each hop (read-only)
 run_r0.bat --kwtest       :: prove the kernel write path (writes back identical bytes)
 run_r0.bat --cloak        :: dry run: print the two unlink writes, write nothing
 run_r0.bat --cloak-commit :: actually unlink
+run_r0.bat --hide-symlink :: remove \??\DBUtil_2_3 (permanent until reboot)
 run_r0.bat                :: overlay + ESP
 ```
 
@@ -228,9 +229,10 @@ Two separate gates:
    name is checkable on disk.
 
 Test order: `--probe` (read-only), `--kwtest` (proves the write path), then
-`--cloak` dry run, `--cloak-commit`, then launch the game. Rename the driver
-(`FORTESP_SVC` / `FORTESP_IMAGE`) **before** that last step, so one launch gives
-one answer instead of a bisect.
+`--cloak` dry run, `--cloak-commit`, `--hide-symlink`, then launch the game.
+Rename the driver (`FORTESP_SVC` / `FORTESP_IMAGE`) **before** that last step,
+so one launch gives one answer instead of a bisect. `--hide-symlink` is last
+because it is permanent for the boot.
 
 ## Keys
 
@@ -259,6 +261,7 @@ window cannot composite over an exclusive swapchain.
 | `--cloak` | **dry run** — resolve the module-list entry and print every address; writes nothing |
 | `--cloak-commit` | actually unlink the driver from `PsLoadedModuleList`; writes `cloak.state`; **stays** unlinked after exit |
 | `--cloak-restore` | standalone: re-link from `cloak.state`, then exit |
+| `--hide-symlink` | remove `\??\DBUtil_2_3` (`NtMakeTemporaryObject`); permanent until reboot, run last |
 | `--driver-name <n>` | image name to match in the module list (default `dbutil_2_3.sys`, or `FORTESP_DRIVER_IMAGE`) |
 
 `--kwtest` is the only thing that proves the kernel **write** path before the
@@ -399,7 +402,22 @@ VA range before any write.
 loaded until reboot, so its entry stays valid and re-linking would only put the
 known module name back in front of the anti-cheat. `--cloak-restore` is a
 standalone mode: it re-links from `cloak.state` and exits, and refuses stale
-state (wrong boot, or a list that is not actually unlinked).
+state (wrong boot, or neighbours that match neither endpoint).
+
+Restore handles the crash-between-writes case explicitly. `prev.Flink == next`
+and `next.Blink == prev` mean fully unlinked; both pointing at the entry means
+nothing was written (clear the state file); exactly one means half-unlinked, and
+that half is completed first (idempotent) before re-linking. Re-linking from the
+half state would leave one neighbour pointing at the entry and the other not.
+
+**`--hide-symlink` removes the name, not the device.** `IoCreateSymbolicLink`
+creates `\??\DBUtil_2_3` as a permanent object; opening it with `DELETE` and
+calling `NtMakeTemporaryObject` clears that flag so the directory entry goes
+away when the handle closes. The already-open device handle keeps working — it
+refers to the device object — but any later `CreateFile("\\.\DBUtil_2_3")`
+returns `OBJECT_NAME_NOT_FOUND`, and that includes a later run of this tool.
+Reboot is the only way back. `\Driver\DBUtil_2_3` and the service registry key
+survive; those need object-directory surgery this tool does not do.
 
 **Physical vs kernel writes.** Target user memory is read through the page
 walk + physical path (read-only). Kernel structures are written through the

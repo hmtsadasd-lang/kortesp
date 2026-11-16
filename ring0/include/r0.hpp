@@ -47,4 +47,12 @@ bool pwrite(uint64_t pa, const void* buf, size_t len);
 // Kernel-virtual write (used by the cloak).
 bool vwrite(uint64_t va, const void* buf, size_t len);
 
+// Remove the driver's symbolic link (e.g. L"\\DosDevices\\DBUtil_2_3") from
+// the object directory, so CreateFile(L"\\\\.\\DBUtil_2_3") afterwards returns
+// OBJECT_NAME_NOT_FOUND. The device object itself is unaffected: call this
+// while the device handle is open, and I/O keeps working on that handle.
+// Permanent until the driver is reloaded (i.e. reboot). Requires DELETE access
+// on the link, so the caller must be elevated.
+bool hide_symlink(const wchar_t* link);
+
 } // namespace r0

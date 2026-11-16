@@ -4,7 +4,6 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -363,11 +362,12 @@ bool apply(bool commit) {
 // and in a fresh process (state file), because after the unlink the entry is
 // unreachable from PsLoadedModuleList and cannot be rediscovered by walking.
 //
-// Before writing, verify the list is actually in the "unlinked" state:
-// prev.Flink must be next and next.Blink must be prev. If either points at the
-// entry already, it was never unlinked (or was re-linked) and writing would
-// corrupt the list, so refuse. If they point anywhere else, the state file is
-// stale or the kernel moved things - also refuse.
+// Before writing, classify the list from its two links. Fully unlinked and
+// "nothing was written" are both safe endpoints (the latter just needs the
+// stale state file cleared). The half-unlinked state - a crash between the two
+// commit writes - is completed first, because re-linking from it would leave
+// one neighbour pointing at the entry and the other not. Anything else means
+// the state file is stale or the kernel moved things, and is refused.
 // ---------------------------------------------------------------------------
 bool restore() {
     uint64_t entry{}, prev{}, next{};
@@ -398,22 +398,71 @@ bool restore() {
         printf("[cloak] state rejected: cannot read the neighbours\n");
         return false;
     }
-    if (pf != next || nb != prev) {
-        printf("[cloak] state rejected: list is not in the unlinked state\n");
-        printf("[cloak]   prev.Flink = 0x%llx (expected 0x%llx)\n",
-               (unsigned long long)pf, (unsigned long long)next);
-        printf("[cloak]   next.Blink = 0x%llx (expected 0x%llx)\n",
-               (unsigned long long)nb, (unsigned long long)prev);
+
+    // Three states are possible, because the commit is two writes and a
+    // process can die between them:
+    //
+    //   a && b      fully unlinked      (both neighbours skip the entry)
+    //   !a && !b    nothing was written (both still point at the entry)
+    //   a != b      half-unlinked       (exactly one write landed)
+    //
+    // Re-linking from the half state would leave one neighbour pointing at the
+    // entry and the other not, i.e. a broken list. Finish the unlink first
+    // (idempotent from either half), then re-link from a coherent state.
+    const bool a = (pf == next);
+    const bool b = (nb == prev);
+
+    if (!a && !b) {
+        if (pf != entry || nb != entry) {
+            printf("[cloak] state rejected: neighbours point at neither the entry "
+                   "nor each other - cloak.state is stale\n");
+            printf("[cloak]   prev.Flink = 0x%llx (expected 0x%llx)\n",
+                   (unsigned long long)pf, (unsigned long long)entry);
+            printf("[cloak]   next.Blink = 0x%llx (expected 0x%llx)\n",
+                   (unsigned long long)nb, (unsigned long long)entry);
+            return false;
+        }
+        printf("[cloak] list is already linked - clearing the stale state file\n");
+        g_on = false;
+        delete_state();
+        return true;
+    }
+
+    if (a != b) {
+        printf("[cloak] half-unlinked list (prev.Flink %s entry, next.Blink %s entry)\n",
+               a ? "skips" : "points at", b ? "skips" : "points at");
+        printf("[cloak] completing the unlink before re-linking\n");
+        if (!a && !vmm::kwrite(prev, &next, 8)) {        // prev.Flink = next
+            printf("[cloak] could not finish the unlink at prev.Flink. REBOOT NOW.\n");
+            return false;
+        }
+        if (!b && !vmm::kwrite(next + 8, &prev, 8)) {    // next.Blink = prev
+            printf("[cloak] could not finish the unlink at next.Blink. REBOOT NOW.\n");
+            return false;
+        }
+        if (!vmm::kread(prev, &pf, 8) || !vmm::kread(next + 8, &nb, 8) ||
+            pf != next || nb != prev) {
+            printf("[cloak] FATAL: list is still half-unlinked after the completion "
+                   "writes. REBOOT NOW.\n");
+            return false;
+        }
+    }
+
+    // Fully unlinked: re-link with the same kernel-VA write path the unlink used.
+    if (!vmm::kwrite(prev, &entry, 8)) {                    // prev.Flink = entry
+        printf("[cloak] re-link write failed at prev.Flink. REBOOT NOW.\n");
+        return false;
+    }
+    if (!vmm::kwrite(next + 8, &entry, 8)) {                // next.Blink = entry
+        printf("[cloak] re-link write failed at next.Blink. REBOOT NOW.\n");
         return false;
     }
 
-    // Re-link with the same kernel-VA write path the unlink used.
-    if (!vmm::kwrite(prev, &entry, 8)) return false;       // prev.Flink = entry
-    if (!vmm::kwrite(next + 8, &entry, 8)) return false;   // next.Blink = entry
-
-    // Confirm it took, rather than assuming.
-    if (!vmm::kread(prev, &pf, 8) || pf != entry) {
-        printf("[cloak] re-link read-back mismatch at prev.Flink\n");
+    // Confirm both sides took, rather than assuming.
+    if (!vmm::kread(prev, &pf, 8) || pf != entry ||
+        !vmm::kread(next + 8, &nb, 8) || nb != entry) {
+        printf("[cloak] re-link read-back mismatch (prev=0x%llx next=0x%llx). REBOOT NOW.\n",
+               (unsigned long long)pf, (unsigned long long)nb);
         return false;
     }
 

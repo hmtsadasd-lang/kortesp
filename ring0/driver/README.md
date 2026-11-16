@@ -138,17 +138,20 @@ driver. The only counter in this tree is the module-list cloak
 
 Sequence that actually tells you something:
 
-1. `--probe` with a working read path (driver only, no game).
+1. `--probe` with a working read path. `vmm::init()` (ntoskrnl, CR3 scan,
+   System EPROCESS) needs no game; the chain walk itself needs Fortnite running
+   and borderless.
 2. `--kwtest` — proves the kernel **write** path (writes identical bytes back
    over `PsInitialSystemProcess`), before the cloak depends on it.
 3. `--cloak` dry run, review the two writes.
-4. `--cloak-commit`, then launch Fortnite. Rename the service/image
-   (`FORTESP_SVC` / `FORTESP_IMAGE`) **before** this step, not after.
-5. If EAC still names `DBUtil_2_3`, the module list was not the tell. Next
-   cheapest move is running the driver under a random service name and random
-   image name (defeats name matching, not hashing); after that the driver has
-   to be replaced. `r0::Backend` is the seam — nothing above it knows which
-   driver is in use.
+4. `--cloak-commit`, then `--hide-symlink`, then launch Fortnite. Rename the
+   service/image (`FORTESP_SVC` / `FORTESP_IMAGE`) **before** this step, not
+   after; `--hide-symlink` is reversible only by reboot.
+5. If EAC still names `DBUtil_2_3`, the module list and device name were not
+   the only tell. Next cheapest move is running the driver under a random
+   service name and random image name (defeats name matching, not hashing);
+   after that the driver has to be replaced. `r0::Backend` is the seam —
+   nothing above it knows which driver is in use.
 
 ---
 

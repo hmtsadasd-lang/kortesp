@@ -26,6 +26,7 @@ struct CmdFlags {
     bool cloak{ false };        // dry run - compute and report, write nothing
     bool cloak_commit{ false }; // actually unlink from PsLoadedModuleList
     bool cloak_restore{ false };// standalone: re-link from cloak.state, then exit
+    bool hide_symlink{ false }; // remove \??\DBUtil_2_3, permanent until reboot
     bool mock{ false };
     std::wstring driver_name;   // --driver-name <name.sys>
 };
@@ -41,6 +42,7 @@ CmdFlags parse_cmd() {
             if (wcscmp(argv[i], L"--cloak") == 0) f.cloak = true;
             if (wcscmp(argv[i], L"--cloak-commit") == 0) { f.cloak = true; f.cloak_commit = true; }
             if (wcscmp(argv[i], L"--cloak-restore") == 0) f.cloak_restore = true;
+            if (wcscmp(argv[i], L"--hide-symlink") == 0) f.hide_symlink = true;
             if (wcscmp(argv[i], L"--mock")  == 0) f.mock  = true;
             if (wcscmp(argv[i], L"--driver-name") == 0 && i + 1 < argc)
                 f.driver_name = argv[++i];
@@ -79,6 +81,16 @@ bool kwtest() {
         printf("[!] PsInitialSystemProcess not found in ntoskrnl's exports\n");
         return false;
     }
+    // Bound the address against the image before writing anything. export_rva
+    // returning garbage would otherwise put ntos+rva in an arbitrary kernel
+    // page, and the memmove would fault (0x50/0xEF) before any value check
+    // could help.
+    if (!vmm::g_ntos || vmm::g_ntos_size < 8 || rva > vmm::g_ntos_size - 8) {
+        printf("[!] RVA 0x%llx is outside the image (size 0x%llx) - refusing to write\n",
+               static_cast<unsigned long long>(rva),
+               static_cast<unsigned long long>(vmm::g_ntos_size));
+        return false;
+    }
     const uint64_t va = vmm::g_ntos + rva;
     printf("[*] PsInitialSystemProcess at 0x%llx (ntos+0x%llx)\n",
            static_cast<unsigned long long>(va), static_cast<unsigned long long>(rva));
@@ -107,8 +119,13 @@ bool kwtest() {
         return false;
     }
     if (back != v) {
-        printf("[!] write-back mismatch: wrote 0x%llx, read 0x%llx\n",
-               static_cast<unsigned long long>(v), static_cast<unsigned long long>(back));
+        // The write returned success, so it landed SOMEWHERE - just not where
+        // we expected to read it back from (or the read path is wrong). Either
+        // way the kernel now holds 8 bytes we did not intend to place. Do not
+        // retry: reboot and start from a known state.
+        printf("[!] write reported success but read-back returned 0x%llx (wrote 0x%llx)\n",
+               static_cast<unsigned long long>(back), static_cast<unsigned long long>(v));
+        printf("[!] the write landed somewhere unknown. REBOOT before doing anything else.\n");
         return false;
     }
     printf("[+] write-back read-back matches - kernel write path works\n");
@@ -168,9 +185,8 @@ int wmain() {
         return ok ? 0 : 1;
     }
 
-    // Must be set before the service is created, which is why run_r0.bat picks
-    // the name first and exports it both to the loader and to this tool.
-    // Normalise: accept "name" or "name.sys".
+    // Chosen before the service is created and passed down as --driver-name;
+    // the runner never exports a second copy. Accept "name" or "name.sys".
     if (!flags.driver_name.empty()) {
         std::wstring n = flags.driver_name;
         if (n.size() < 4 || _wcsicmp(n.c_str() + n.size() - 4, L".sys") != 0) n += L".sys";
@@ -232,6 +248,25 @@ int wmain() {
             printf("[!] cloak failed - module stays visible (not fatal)\n");
     }
     // -----------------------------------------------------------------------
+
+    // --- Remove the \??\DBUtil_2_3 symlink ---
+    // This is the name EAC is expected to name, and the only part of the
+    // surface removable without touching the driver. It is permanent for the
+    // boot, so it runs last: a later process cannot open the device by path
+    // (this one still can - its handle refers to the device object itself).
+    if (flags.hide_symlink) {
+        const bool ok = r0::hide_symlink(L"\\DosDevices\\DBUtil_2_3");
+        if (ok)
+            printf("[+] \\??\\DBUtil_2_3 removed - opens by path fail until reboot\n");
+        else
+            printf("[!] symlink still present - device name stays visible\n");
+
+        // Standalone unless --probe asked for the read check as well.
+        if (!flags.probe) {
+            vmm::shutdown();
+            return ok ? 0 : 1;
+        }
+    }
 
     // The window is only needed for the overlay. --probe needs no window,
     // so it attaches straight away instead of burning the whole wait.

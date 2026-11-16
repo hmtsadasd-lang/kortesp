@@ -64,9 +64,10 @@ if not defined IMAGE set "IMAGE=DBUtil_2_3.sys"
 :: part of the echoed line, so an end-of-line match never matches.)
 if /i not "%IMAGE:~-4%"==".sys" set "IMAGE=%IMAGE%.sys"
 set "DST=%SystemRoot%\System32\drivers\%IMAGE%"
-:: The tool reads this if --driver-name is ever dropped; the explicit flag
-:: below takes precedence.
-set "FORTESP_DRIVER_IMAGE=%IMAGE%"
+rem No second source of truth: --driver-name (built from %IMAGE% at the bottom)
+rem is the only way the tool learns the image name. Exporting
+rem FORTESP_DRIVER_IMAGE here as well would let the two drift apart, and a
+rem mismatch makes our_base() silently match nothing in the cloak.
 
 echo [*] service: %SVC%
 echo [*] image  : %IMAGE%
