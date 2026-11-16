@@ -45,7 +45,12 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 rem ---- self-elevate (loading a kernel driver needs admin) ----
-net session >nul 2>&1
+rem Pure token query: the High Mandatory Level SID is present only in an
+rem elevated token. Do NOT use `net session` here - it goes through the SMB
+rem stack, and this box runs a WinDivert-based network filter and has a
+rem history of hangs right after SMB/SCM commands. `fltmc` is equally off
+rem limits: it loads the filter-manager stack.
+whoami /groups 2>nul | findstr /c:"S-1-16-12288" >nul
 if errorlevel 1 (
     echo [*] requesting elevation...
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
