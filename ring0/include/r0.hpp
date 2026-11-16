@@ -10,7 +10,7 @@ namespace r0 {
 // pairs. Everything above this layer (page-table walking, EPROCESS discovery)
 // is backend-agnostic, so swapping the driver is a change to this file only.
 //
-// The three primitives are deliberately different things:
+// The four primitives are deliberately different things:
 //
 //   read/write  - PHYSICAL addresses. The driver maps the range with
 //                 MmMapIoSpace (uncached) and copies in or out.
@@ -18,12 +18,11 @@ namespace r0 {
 //                 caller's context, so the copy goes through the normal
 //                 cached mapping and stays coherent with other cores.
 //
+// Do not use the physical path for kernel addresses: the cached/uncached
+// mismatch leaves stale lines in cores that are reading the same structure.
 // Do not use vread for an address you have not derived from a trusted source:
 // a non-present kernel VA faults inside the driver's memmove and bugchecks
 // (0x50). Use the page walk (vmm::kread) for unvalidated candidates.
-//
-// Do not use the physical path for kernel addresses: the cached/uncached
-// mismatch leaves stale lines in cores that are reading the same structure.
 struct Backend {
     const wchar_t* device;      // L"\\\\.\\DBUtil_2_3"
     bool (*open)();
@@ -53,16 +52,11 @@ bool pwrite(uint64_t pa, const void* buf, size_t len);
 bool vwrite(uint64_t va, const void* buf, size_t len);
 bool vread(uint64_t va, void* buf, size_t len);
 
-// Prove which half of the kernel-VA IOCTL pair is the read, before vread() is
-// used on anything that matters.
-//
-// The probe sends a request whose payload length is zero: if the code is the
-// write handler it has no bytes to write, so the call is a no-op. If it is the
-// read handler it fills the output buffer from `va`, and the caller checks that
-// against a known-good value (ntoskrnl's "MZ"). Returns true once proven; a
-// false return means vread() must not be used.
+// Prove which half of the kernel-VA pair 0x9B0C1EC4 really is. Sets
+// vmm::g_ntos_mz_broken when it proves the pair is transposed. Until this
+// returns true, vmm::kread_trusted refuses to use the handler.
 bool vread_probe(uint64_t va, size_t len);
-bool vread_ready(); // ntos_mz_broken removed - state in vmm::g_ntos_mz_broken
+bool vread_ready();
 
 // Remove the driver's symbolic link (e.g. L"\\DosDevices\\DBUtil_2_3") from
 // the object directory, so CreateFile(L"\\\\.\\DBUtil_2_3") afterwards returns

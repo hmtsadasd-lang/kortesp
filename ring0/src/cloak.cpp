@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+namespace cloak {
+
 namespace {
 
 uint64_t g_head{};
@@ -14,8 +16,6 @@ uint64_t g_prev{};
 uint64_t g_next{};
 uint64_t g_our_base{};
 bool     g_on{};
-
-} // namespace
 
 // Set by --driver-name. Overrides FORTESP_DRIVER_IMAGE / the stock name, so a
 // renamed .sys still resolves. Must be decided before the service is created;
@@ -105,21 +105,11 @@ bool find_head(uint64_t& head) {
     return false;
 }
 
+} // anonymous namespace
+
 // ---- our own driver's KLDR data table entry ----
 
-bool cloak_init(uint64_t our_base) {
-    g_our_base = our_base;
-    g_on = true;
-    return true;
-}
-
-void cloak_cleanup() {
-    g_on = false;
-}
-
-// ---- the two writes that unlink the driver from PsLoadedModuleList ----
-
-bool cloak_apply(bool commit) {
+bool apply(bool commit) {
     // If the driver is already unlinked, just re-link and return.
     if (!g_on) return false;
 
@@ -163,6 +153,19 @@ bool cloak_apply(bool commit) {
     return true;
 }
 
+bool restore() {
+    g_on = false;
+    return true;
+}
+
+bool active() {
+    return g_on;
+}
+
+void set_driver_image(const char* name) {
+    if (name && *name) g_driver_name = name;
+}
+
 // ---- remove the \??\DBUtil_2_3 symlink ----
 
 // This is the name EAC is expected to name, and the only part of the
@@ -174,3 +177,5 @@ bool hide_symlink(const wchar_t* link) {
     // For now, placeholder.
     return false;
 }
+
+} // namespace cloak

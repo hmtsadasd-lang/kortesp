@@ -57,7 +57,7 @@ rem ---- elevation check: must be run from an elevated shell ---::
 whoami /groups > "%TEMP%\_fg_groups.tmp" 2>nul
 findstr /c:"S-1-16-12288" "%TEMP%\_fg_groups.tmp" >nul
 if errorlevel 1 (
-    echo [x] this runner must be started in an elevated (admin) session.
+    echo [x] this runner must be started in an elevated admin session.
     echo     right-click the bat and choose "Run as administrator".
     goto :fail
 )
