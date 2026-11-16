@@ -183,10 +183,85 @@ bool find_ntoskrnl(uint64_t& base, uint64_t& size) {
 // ---------------------------------------------------------------------------
 // Kernel CR3: scan physical memory for a CR3 whose kernel half maps ntoskrnl.
 // ---------------------------------------------------------------------------
+namespace {
+
+// The scan is ~8M IOCTLs, so cache the hit on disk. KASLR moves ntoskrnl on
+// every boot, so the cache is keyed on its base and size and re-validated by
+// translating that base and checking for MZ before it is trusted. A Windows
+// update that moves ntoskrnl invalidates it by construction.
+constexpr uint32_t kCr3Magic = 0x33435246;   // 'FRC3'
+constexpr uint32_t kCr3Ver   = 1;
+struct Cr3Cache {
+    uint32_t magic;
+    uint32_t ver;
+    uint64_t ntos;
+    uint64_t ntos_size;
+    uint64_t cr3;
+};
+
+bool cr3_cache_path(wchar_t* out, size_t cch) {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return false;
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return false;
+    *(slash + 1) = 0;
+    return swprintf(out, cch, L"%scr3.cache", exe) > 0;
+}
+
+bool load_cr3_cache(uint64_t& cr3) {
+    wchar_t path[MAX_PATH]{};
+    if (!cr3_cache_path(path, MAX_PATH)) return false;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    Cr3Cache c{};
+    DWORD r = 0;
+    const bool ok = ReadFile(h, &c, sizeof(c), &r, nullptr) && r == sizeof(c);
+    CloseHandle(h);
+    if (!ok || c.magic != kCr3Magic || c.ver != kCr3Ver) return false;
+    if (c.ntos != vmm::g_ntos || c.ntos_size != vmm::g_ntos_size) return false;
+    if (c.cr3 < 0x1000 || (c.cr3 & 0xFFF)) return false;
+
+    // Re-validate: the entry must still translate ntoskrnl's base to a page
+    // that starts with "MZ". This rejects a stale cr3 whose page tables were
+    // freed and reused, which is the failure mode a boot id would miss.
+    uint64_t probe{};
+    if (!translate_cr3(c.cr3, vmm::g_ntos, probe)) return false;
+    if (probe >= vmm::phys_ram_end()) return false;
+    uint16_t mz{};
+    if (!phys_read(probe & ~0xFFFull, &mz, 2) || mz != 0x5A4D) return false;
+
+    cr3 = c.cr3;
+    return true;
+}
+
+void save_cr3_cache(uint64_t cr3) {
+    wchar_t path[MAX_PATH]{};
+    if (!cr3_cache_path(path, MAX_PATH)) return;
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    const Cr3Cache c{ kCr3Magic, kCr3Ver, vmm::g_ntos, vmm::g_ntos_size, cr3 };
+    DWORD w = 0;
+    WriteFile(h, &c, sizeof(c), &w, nullptr);
+    CloseHandle(h);
+}
+
+} // namespace
+
 bool find_kernel_cr3(uint64_t& out) {
     // One scan per process is enough; remember the hit so a later call (or a
     // re-init after a detach) does not pay for 8M round-trips again.
     if (vmm::g_kcr3) { out = vmm::g_kcr3; return true; }
+
+    uint64_t cached{};
+    if (load_cr3_cache(cached)) {
+        printf("[+] kernel CR3 0x%llx (from cr3.cache)\n", (unsigned long long)cached);
+        vmm::g_kcr3 = cached;
+        out = cached;
+        return true;
+    }
 
     // The CR3 and all of its page tables live in installed RAM. Do not scan
     // past it - above RAM is the PCI hole and mapping it would fault.
@@ -212,7 +287,12 @@ bool find_kernel_cr3(uint64_t& out) {
 
         uint16_t mz{};
         if (!phys_read(probe & ~0xFFFull, &mz, 2)) continue;
-        if (mz == 0x5A4D) { vmm::g_kcr3 = pa; out = pa; return true; }
+        if (mz == 0x5A4D) {
+            vmm::g_kcr3 = pa;
+            save_cr3_cache(pa);
+            out = pa;
+            return true;
+        }
     }
     return false;
 }

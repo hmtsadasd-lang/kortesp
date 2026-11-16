@@ -32,6 +32,7 @@ with a handle.
 | FString decode | ✅ verified by `--mock` |
 | Projection / overlay geometry | ✅ verified by `--mock` |
 | `--cloak` (module unlink) | ⚠️ implemented, not yet run against a live driver |
+| `--kwtest` (kernel write proof) | ✅ implemented; needs the driver to run |
 | **Offsets against a real client** | ❌ **unmeasured** — no driver present on this box |
 
 `--mock` proves the *code*. It builds the synthetic target from the same
@@ -123,16 +124,55 @@ PASS/FAIL per check.
 ### Live
 
 ```bat
-run_r0.bat --probe        :: resolve the chain, print each hop
+run_r0.bat --probe        :: resolve the chain, print each hop (read-only)
+run_r0.bat --kwtest       :: prove the kernel write path (writes back identical bytes)
+run_r0.bat --cloak        :: dry run: print the two unlink writes, write nothing
+run_r0.bat --cloak-commit :: actually unlink
 run_r0.bat                :: overlay + ESP
-run_r0.bat --cloak        :: unlink the driver from the module list first
 ```
 
 `run_r0.bat` looks for `dbutil_2_3.sys` in `driver\`, next to the script, in
 `%SystemRoot%\System32\drivers\`, or at `%DBUTIL_SYS%`. It creates the service
-`DBUtil_2_3` once, leaves it running until reboot, and never stops or deletes
-it. If the service exists but is stopped it retries the start; if it is already
-RUNNING it does not touch the driver at all.
+`DBUtil_2_3` once and leaves it running until reboot.
+
+State handling, in order:
+
+| Service state | What the runner does |
+|---|---|
+| RUNNING / START_PENDING | touches nothing, just runs the tool |
+| STOP_PENDING | **aborts** — do not delete a service mid-transition |
+| STOPPED | deletes and recreates it (no live image, so nothing is mapped) |
+| absent | copies the image and creates it |
+| any state after `sc start` but not RUNNING | **aborts** (blocklist / Secure Boot) |
+
+It **aborts** if HVCI (Memory Integrity) is on, because the vulnerable-driver
+blocklist is enforced then and the image cannot load. `DBUTIL_FORCE=1` tries
+anyway. `FORTESP_NOLOAD=1` skips all driver handling (for when the driver is
+already loaded, or when testing the script itself).
+
+**Renaming the driver** (decide before the first load):
+
+```bat
+set FORTESP_SVC=SomeSvcName
+set FORTESP_IMAGE=SomeName.sys
+run_r0.bat --probe
+```
+
+The runner copies the image to `drivers\%FORTESP_IMAGE%` (`.sys` is appended if
+missing), creates the service from that path, and passes `--driver-name` after
+`%*` so its answer always wins. The driver's hardcoded `\Device\DBUtil_2_3` and
+`\??\DBUtil_2_3` survive the rename — only the file/service names change. If
+the service is already running under a different image the runner refuses to
+touch it: reboot first.
+
+Renaming leaves any previous registration behind. Check it is not running, then
+remove it (the runner never touches a service other than `%FORTESP_SVC%`):
+
+```bat
+sc query DBUtil_2_3
+:: only if STATE says STOPPED:
+sc delete DBUtil_2_3
+```
 
 ## The driver
 
@@ -176,19 +216,21 @@ transposed; `r0::init()` now proves the direction at startup.
 
 Two separate gates:
 
-1. **Windows HVCI blocklist** — a load failure. Enforcement is currently off on
-   this box (`VerifiedAndReputablePolicyState = 0x0`), so the driver loads. If
-   it is turned on, `sc start` fails and nothing appears in the kernel.
+1. **Windows HVCI blocklist** — a load failure. `run_r0.bat` reads the
+   `HypervisorEnforcedCodeIntegrity` key and **aborts** when it is on, because
+   the blocklist is enforced then and `sc start` fails with nothing in the
+   kernel. `DBUTIL_FORCE=1` overrides. Enforcement was off on this box
+   (`VerifiedAndReputablePolicyState = 0x0`).
 2. **Easy Anti-Cheat** — a client refusal. Since mid-2026 EAC recognises
    `dbutil_2_3.sys` and Fortnite will not start while it is loaded. This is not
-   a load failure: the driver is named. The cloak is the only counter here, and
-   it may not be sufficient because the device object and `\??\DBUtil_2_3`
-   symlink survive it.
+   a load failure: the driver is named. The cloak removes the module-list entry
+   but the device object and `\??\DBUtil_2_3` symlink survive it, and the file
+   name is checkable on disk.
 
-That changes the test order: `--probe`, then `--cloak` dry run, then
-`--cloak-commit`, then launch the game. If EAC still complains, running the
-driver under a random service and image name is the next cheapest step (defeats
-name matching, not hashing).
+Test order: `--probe` (read-only), `--kwtest` (proves the write path), then
+`--cloak` dry run, `--cloak-commit`, then launch the game. Rename the driver
+(`FORTESP_SVC` / `FORTESP_IMAGE`) **before** that last step, so one launch gives
+one answer instead of a bisect.
 
 ## Keys
 
@@ -213,9 +255,23 @@ window cannot composite over an exclusive swapchain.
 |---|---|
 | `--mock` | driverless self-test; exits with the result |
 | `--probe` | resolve the chain and print each hop; no window needed |
+| `--kwtest` | read `PsInitialSystemProcess`, write the identical 8 bytes back, verify; exits with the result |
 | `--cloak` | **dry run** — resolve the module-list entry and print every address; writes nothing |
-| `--cloak-commit` | actually unlink the driver from `PsLoadedModuleList`; **stays** unlinked after exit |
-| `--cloak-restore` | re-link on exit (debugging only) |
+| `--cloak-commit` | actually unlink the driver from `PsLoadedModuleList`; writes `cloak.state`; **stays** unlinked after exit |
+| `--cloak-restore` | standalone: re-link from `cloak.state`, then exit |
+| `--driver-name <n>` | image name to match in the module list (default `dbutil_2_3.sys`, or `FORTESP_DRIVER_IMAGE`) |
+
+`--kwtest` is the only thing that proves the kernel **write** path before the
+cloak's two unlink writes — `--probe` is read-only and `--cloak` is a dry run.
+Writing the same bytes back over the same address is a no-op to the kernel; a
+wrong address is an 8-byte local write, not a sweep.
+
+`--cloak-restore` cannot rediscover the entry (it is no longer in
+`PsLoadedModuleList`), so the commit persists `{entry, prev, next, ntoskrnl
+base, System EPROCESS}` to `<exe dir>\cloak.state`. Restore refuses a file whose
+ntoskrnl base/System EPROCESS does not match the current boot, and refuses to
+write unless the list is actually in the unlinked state (`prev.Flink == next`
+and `next.Blink == prev`). It deletes the file on success.
 
 `--probe` prints each hop and marks the first failure `<- rejected`:
 
@@ -319,7 +375,19 @@ real module. The driver is matched by `DllBase`, so a renamed `.sys` still
 resolves. **Two** writes: `prev.Flink = next`, `next.Blink = prev`. The kernel
 `KLDR_DATA_TABLE_ENTRY` has no `InMemoryOrderLinks` — that field exists only in
 the user-mode `LDR_DATA_TABLE_ENTRY`, and writing to its slot would hit
-`ExceptionTableSize`. `restore()` reverses the two writes.
+`ExceptionTableSize`. `restore()` reverses the two writes from the persisted
+`cloak.state`.
+
+**The `.data` fallback is bulk-read.** Scanning for `PsLoadedModuleList` reads
+4 KiB at a time and filters locally for qwords that could be the head's Flink
+(kernel VA, 16-byte aligned); only those few candidates pay the ~5 dependent
+reads in `valid_head()`. The old loop did one IOCTL per qword.
+
+**The kernel CR3 is cached on disk.** `find_kernel_cr3` is ~8M IOCTLs, so a hit
+is written to `<exe dir>\cr3.cache` keyed on the ntoskrnl base *and* size, and
+re-validated on load by translating the base and checking for `MZ`. KASLR moves
+ntoskrnl every boot, so the cache is invalidated by construction; the `MZ` check
+catches a page directory that was freed and reused.
 
 **The cloak is a dry run by default.** It is the only part of the tool that
 writes to the kernel, so `--cloak` resolves every address and prints the exact
@@ -329,14 +397,21 @@ VA range before any write.
 
 **The unlink is not undone on exit.** The driver cannot be stopped and stays
 loaded until reboot, so its entry stays valid and re-linking would only put the
-known module name back in front of the anti-cheat. `--cloak-restore` exists for
-debugging.
+known module name back in front of the anti-cheat. `--cloak-restore` is a
+standalone mode: it re-links from `cloak.state` and exits, and refuses stale
+state (wrong boot, or a list that is not actually unlinked).
 
 **Physical vs kernel writes.** Target user memory is read through the page
 walk + physical path (read-only). Kernel structures are written through the
 driver's kernel-VA handler. The physical handler maps non-cached, and a
 non-cached write does not invalidate other cores' cache lines — the kernel
 reads `PsLoadedModuleList` constantly, so that would be incoherent.
+
+**`sc stop` after a commit.** `NtUnloadDriver` resolves the image through
+`PsLoadedModuleList` via the driver object's section pointer. With the entry
+unlinked there is nothing to find, so the call fails or leaves a half state.
+The driver is `NOT_STOPPABLE` anyway; the runner never stops it and the only
+documented unload path is a reboot.
 
 ## Offsets quick-reference
 
@@ -386,9 +461,14 @@ Health_Max                       0x70+0x4    VERIFIED
 - `Xform_Translation 0x20` follows from `FQuat4d` being 32 bytes. If a real
   target reads implausible coordinates, read both `0x10` and `0x20` once and
   keep whichever triple lands near the local pawn.
-- `find_kernel_cr3()` probes physical pages one `DeviceIoControl` at a time.
-  It is cached after the first success, but the first run on a large-RAM box is
-  slow.
+- `find_kernel_cr3()` probes physical pages one `DeviceIoControl` at a time. It
+  is cached in memory and on disk (`cr3.cache`), so the ~8M-IOCTL scan is a
+  one-time cost per boot. It is **not** parallelised: the driver is opened
+  exclusively and its dispatch caches request state in the device extension, so
+  concurrent IOCTLs on one handle are unverified — and the last thing this box
+  needs is another unverified concurrency assumption. If the first scan after a
+  reboot turns out to be painful, the safe shape is one worker per *disjoint
+  physical range* behind a probe that has already been validated live.
 - `IoCreateDevice(..., Exclusive = 1)`: a leftover handle from an earlier
   incarnation blocks the next open.
 - The EPROCESS layout table is per-build. If `find_system_eprocess()` fails on

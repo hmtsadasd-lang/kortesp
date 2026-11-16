@@ -4,6 +4,9 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -18,9 +21,15 @@ uint64_t g_next{};
 uint64_t g_our_base{};
 bool     g_on{};
 
+// Set by --driver-name. Overrides FORTESP_DRIVER_IMAGE / the stock name, so a
+// renamed .sys still resolves. Must be decided before the service is created;
+// see run_r0.bat. Held by value: the caller's string is often a temporary.
+std::string g_driver_name;
+
 // The image the driver was loaded under. Defaults to the stock name; the
-// runner overrides it when it installs the driver under a random name.
+// runner overrides it when it installs the driver under a different name.
 const char* driver_image() {
+    if (!g_driver_name.empty()) return g_driver_name.c_str();
     const char* e = getenv("FORTESP_DRIVER_IMAGE");
     if (e && *e) return e;
     return "dbutil_2_3.sys";
@@ -122,10 +131,32 @@ bool find_head(uint64_t& head) {
 
         const uint64_t lo = vmm::g_ntos + sec->VirtualAddress;
         const uint64_t hi = lo + sec->Misc.VirtualSize;
-        for (uint64_t a = (lo + 7) & ~7ull; a + 8 < hi; a += 8) {
-            if (!valid_head(a)) continue;
-            head = a;
-            return true;
+
+        // Bulk read: one IOCTL per 4 KiB page instead of one per qword (the
+        // old code did 8 bytes per IOCTL *plus* ~5 more in valid_head for
+        // every slot in .data - tens of thousands of round trips).
+        //
+        // Only qwords that could possibly be the list head's Flink are worth
+        // validating: a kernel VA, 16-byte aligned (valid_head requires
+        // f & 0xF == 0). That filter runs on the local buffer, so the ~5
+        // dependent reads in valid_head happen for a handful of candidates.
+        constexpr size_t kChunk = 0x1000;
+        std::vector<uint8_t> buf(kChunk);
+        for (uint64_t page = lo & ~0xFFFull; page < hi; page += kChunk) {
+            size_t n = kChunk;
+            if (page + n > hi) n = static_cast<size_t>(hi - page);
+            if (!vmm::kread(page, buf.data(), n)) continue;   // hole - skip
+
+            for (size_t off = 0; off + 8 <= n; off += 8) {
+                const uint64_t cand = page + off;
+                if (cand < lo || cand + 8 > hi) continue;
+                uint64_t v{};
+                memcpy(&v, buf.data() + off, 8);
+                if (v < kKvaLo || (v & 0xF)) continue;
+                if (!valid_head(cand)) continue;
+                head = cand;
+                return true;
+            }
         }
     }
     return false;
@@ -139,6 +170,81 @@ Plan g_plan{};
 
 const Plan& plan() { return g_plan; }
 bool active() { return g_on; }
+
+void set_driver_image(const char* name) {
+    if (name && *name) g_driver_name = name;
+    else g_driver_name.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Persisted unlink state.
+//
+// After the commit, the entry is no longer reachable from PsLoadedModuleList,
+// so a *separate* process cannot find it again by walking the list. Without a
+// record, --cloak-restore would resolve nothing and silently do nothing.
+// Write the five addresses the unlink touched, plus the ntoskrnl base so a
+// stale file from before a Windows update is rejected.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t kStateMagic = 0x434B4C52;   // 'RLCK'
+constexpr uint32_t kStateVer   = 1;
+
+struct State {
+    uint32_t magic;
+    uint32_t ver;
+    uint64_t entry;
+    uint64_t prev;
+    uint64_t next;
+    uint64_t ntos;
+    uint64_t system_eprocess;   // changes every boot; rejects a stale file
+};
+
+// <exe dir>\cloak.state - next to the binary, not in the cwd, so the runner
+// and a manual invocation see the same file.
+bool state_path(wchar_t* out, size_t cch) {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return false;
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return false;
+    *(slash + 1) = 0;
+    return swprintf(out, cch, L"%scloak.state", exe) > 0;
+}
+
+bool save_state() {
+    wchar_t path[MAX_PATH]{};
+    if (!state_path(path, MAX_PATH)) return false;
+    const State s{ kStateMagic, kStateVer, g_entry, g_prev, g_next,
+                   vmm::g_ntos, vmm::g_eprocess };
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD w = 0;
+    const bool ok = WriteFile(h, &s, sizeof(s), &w, nullptr) && w == sizeof(s);
+    CloseHandle(h);
+    return ok;
+}
+
+bool load_state(State& s) {
+    wchar_t path[MAX_PATH]{};
+    if (!state_path(path, MAX_PATH)) return false;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD r = 0;
+    const bool ok = ReadFile(h, &s, sizeof(s), &r, nullptr) && r == sizeof(s);
+    CloseHandle(h);
+    return ok && s.magic == kStateMagic && s.ver == kStateVer &&
+           s.ntos == vmm::g_ntos && s.system_eprocess == vmm::g_eprocess;
+}
+
+void delete_state() {
+    wchar_t path[MAX_PATH]{};
+    if (state_path(path, MAX_PATH)) DeleteFileW(path);
+}
+
+} // namespace
 
 bool apply(bool commit) {
     if (g_on) return true;
@@ -206,8 +312,42 @@ bool apply(bool commit) {
             // Two writes. The kernel-VA path (memmove on the cached mapping),
             // not the physical one - MmMapIoSpace(MmNonCached) would leave
             // stale lines in the cores that are reading this list.
-            if (!vmm::kwrite(prev, &next, 8)) return false;   // prev.Flink = next
-            if (!vmm::kwrite(next + 8, &prev, 8)) return false; // next.Blink = prev
+            if (!vmm::kwrite(prev, &next, 8)) {              // prev.Flink = next
+                printf("[cloak] FATAL: first unlink write failed - nothing changed. Reboot.\n");
+                return false;
+            }
+            if (!vmm::kwrite(next + 8, &prev, 8)) {          // next.Blink = prev
+                // The list is now half-unlinked: prev skips us, we still point
+                // at next, and next still points back at us. Put prev back so
+                // a walk from the head does not dead-end.
+                printf("[cloak] FATAL: second unlink write failed - list is half-unlinked.\n");
+                if (vmm::kwrite(prev, &entry, 8))
+                    printf("[cloak] rolled prev.Flink back to the entry; reboot before retrying.\n");
+                else
+                    printf("[cloak] rollback failed too. REBOOT NOW.\n");
+                return false;
+            }
+
+            // Read it back rather than trusting the write. Both writes are 8
+            // bytes into pool that is mapped and readable by construction, so
+            // a mismatch here means the kernel-VA path is wrong.
+            uint64_t pf{}, nb{};
+            if (!vmm::kread(prev, &pf, 8) || pf != next ||
+                !vmm::kread(next + 8, &nb, 8) || nb != prev) {
+                printf("[cloak] FATAL: unlink read-back mismatch (prev=0x%llx next=0x%llx)\n",
+                       (unsigned long long)pf, (unsigned long long)nb);
+                if (vmm::kwrite(prev, &entry, 8) && vmm::kwrite(next + 8, &entry, 8))
+                    printf("[cloak] re-linked both sides; treat the write path as broken.\n");
+                else
+                    printf("[cloak] could not re-link. REBOOT NOW.\n");
+                return false;
+            }
+
+            // Record what was unlinked. A later process cannot rediscover the
+            // entry, so without this file --cloak-restore has nothing to use.
+            // Failure to write it is not fatal to the unlink itself.
+            if (!save_state())
+                printf("[cloak] warning: could not write cloak.state - restore will not be possible\n");
 
             g_on = true;
             return true;
@@ -218,11 +358,71 @@ bool apply(bool commit) {
     return false;
 }
 
-void restore() {
-    if (!g_on) return;
-    vmm::kwrite(g_prev, &g_entry, 8);       // prev.Flink = entry
-    vmm::kwrite(g_next + 8, &g_entry, 8);   // next.Blink = entry
+// ---------------------------------------------------------------------------
+// Re-link the entry. Works both in the process that unlinked it (globals set)
+// and in a fresh process (state file), because after the unlink the entry is
+// unreachable from PsLoadedModuleList and cannot be rediscovered by walking.
+//
+// Before writing, verify the list is actually in the "unlinked" state:
+// prev.Flink must be next and next.Blink must be prev. If either points at the
+// entry already, it was never unlinked (or was re-linked) and writing would
+// corrupt the list, so refuse. If they point anywhere else, the state file is
+// stale or the kernel moved things - also refuse.
+// ---------------------------------------------------------------------------
+bool restore() {
+    uint64_t entry{}, prev{}, next{};
+
+    if (g_on && g_entry && g_prev && g_next) {
+        entry = g_entry;
+        prev  = g_prev;
+        next  = g_next;
+    } else {
+        State s{};
+        if (!load_state(s)) {
+            printf("[cloak] no usable cloak.state - nothing to restore "
+                   "(wrong session, or the image was never cloaked here)\n");
+            return false;
+        }
+        entry = s.entry;
+        prev  = s.prev;
+        next  = s.next;
+    }
+
+    if (entry < kKvaLo || prev < kKvaLo || next < kKvaLo) {
+        printf("[cloak] state rejected: addresses are not kernel VAs\n");
+        return false;
+    }
+
+    uint64_t pf{}, nb{};
+    if (!vmm::kread(prev, &pf, 8) || !vmm::kread(next + 8, &nb, 8)) {
+        printf("[cloak] state rejected: cannot read the neighbours\n");
+        return false;
+    }
+    if (pf != next || nb != prev) {
+        printf("[cloak] state rejected: list is not in the unlinked state\n");
+        printf("[cloak]   prev.Flink = 0x%llx (expected 0x%llx)\n",
+               (unsigned long long)pf, (unsigned long long)next);
+        printf("[cloak]   next.Blink = 0x%llx (expected 0x%llx)\n",
+               (unsigned long long)nb, (unsigned long long)prev);
+        return false;
+    }
+
+    // Re-link with the same kernel-VA write path the unlink used.
+    if (!vmm::kwrite(prev, &entry, 8)) return false;       // prev.Flink = entry
+    if (!vmm::kwrite(next + 8, &entry, 8)) return false;   // next.Blink = entry
+
+    // Confirm it took, rather than assuming.
+    if (!vmm::kread(prev, &pf, 8) || pf != entry) {
+        printf("[cloak] re-link read-back mismatch at prev.Flink\n");
+        return false;
+    }
+
     g_on = false;
+    delete_state();
+    printf("[cloak] re-linked entry 0x%llx between 0x%llx and 0x%llx\n",
+           (unsigned long long)entry, (unsigned long long)prev,
+           (unsigned long long)next);
+    return true;
 }
 
 } // namespace cloak

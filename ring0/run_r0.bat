@@ -6,9 +6,11 @@
 ::  1. NEVER `sc stop` this driver. It is NOT_STOPPABLE / IGNORES_SHUTDOWN.
 ::     Stopping it fails, leaves the service half-deleted, and the driver
 ::     stays loaded with no owner. That is a BSOD waiting to happen.
-::  2. NEVER `sc delete` it while it is running.
+::  2. NEVER `sc delete` it while it is running. This script only deletes a
+::     service that is not RUNNING (no live instance, so nothing is mapped).
 ::  3. NEVER overwrite the .sys image while an instance is loaded - the
-::     on-disk image and the mapped image diverge.
+::     on-disk image and the mapped image diverge. The copy below is skipped
+::     if the target already exists.
 ::  4. NEVER start a second instance. IoCreateDevice(\Device\DBUtil_2_3)
 ::     fails on the second one and the driver half-initialises.
 ::
@@ -18,13 +20,31 @@
 :: instance, so retrying `sc start` is safe; the old version treated mere
 :: existence as "loaded" and then silently did nothing.
 ::
+:: RENAMING (the cheapest thing that defeats a name check):
+::   set FORTESP_SVC=SomeSvcName
+::   set FORTESP_IMAGE=SomeName.sys
+:: before running. The loader copies the image to
+:: %SystemRoot%\System32\drivers\%FORTESP_IMAGE% and creates the service from
+:: it, then passes --driver-name so the cloak's KLDR matcher looks for the
+:: right suffix. The DRIVER'S OWN DEVICE NAME stays \Device\DBUtil_2_3 (it is
+:: hardcoded in the image) and so does the \??\DBUtil_2_3 symlink - renaming
+:: the file does not hide those.
+::
+:: Decide the name BEFORE the first load. Changing it later means recreating
+:: the service, which this script only does while it is not running, i.e.
+:: after a reboot.
+::
+:: HVCI: with Memory Integrity on, the Microsoft vulnerable-driver blocklist
+:: is enforced and this image will not load. This is a hard abort unless
+:: DBUTIL_FORCE=1 is set.
+::
 :: The driver image goes in ring0\driver\dbutil_2_3.sys
 :: (driver\fetch_driver.ps1 downloads and hash-verifies it).
 
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-:: ---- self-elevate (loading a kernel driver needs admin) ----
+rem ---- self-elevate (loading a kernel driver needs admin) ----
 net session >nul 2>&1
 if errorlevel 1 (
     echo [*] requesting elevation...
@@ -33,40 +53,102 @@ if errorlevel 1 (
     exit /b 0
 )
 
-:: ---- HVCI / blocklist preflight ----
+rem ---- identity: service name and image name ----
+set "SVC=%FORTESP_SVC%"
+if not defined SVC set "SVC=DBUtil_2_3"
+set "IMAGE=%FORTESP_IMAGE%"
+if not defined IMAGE set "IMAGE=DBUtil_2_3.sys"
+:: Accept "name" or "name.sys"; the loader and the cloak must agree, and the
+:: file needs an extension Windows will load a driver from.
+:: (Substring compare, not `echo|findstr /e`: the space before the pipe becomes
+:: part of the echoed line, so an end-of-line match never matches.)
+if /i not "%IMAGE:~-4%"==".sys" set "IMAGE=%IMAGE%.sys"
+set "DST=%SystemRoot%\System32\drivers\%IMAGE%"
+:: The tool reads this if --driver-name is ever dropped; the explicit flag
+:: below takes precedence.
+set "FORTESP_DRIVER_IMAGE=%IMAGE%"
+
+echo [*] service: %SVC%
+echo [*] image  : %IMAGE%
+
+rem ---- HVCI / blocklist preflight ----
 :: With Memory Integrity on, the Microsoft vulnerable-driver blocklist is
 :: enforced by CI and this image will not load at all. Check, don't guess.
-reg query "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled >nul 2>&1
-if not errorlevel 1 (
-    for /f "tokens=3" %%V in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled 2^>nul ^| findstr /i /c:"Enabled"') do (
-        if /i "%%V"=="0x1" (
-            echo [!] HVCI (Memory Integrity) is ON.
-            echo     The Microsoft vulnerable-driver blocklist is enforced and
-            echo     dbutil_2_3.sys will be rejected at load. Turn Memory
-            echo     Integrity off and reboot, or use a different backend.
-        )
+set "HVCI="
+for /f "tokens=3" %%V in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled 2^>nul ^| findstr /i /c:"Enabled"') do set "HVCI=%%V"
+if /i "!HVCI!"=="0x1" (
+    echo [x] HVCI - Memory Integrity - is ON.
+    echo     The vulnerable-driver blocklist is enforced and %IMAGE% will be
+    echo     rejected at load. Turn Memory Integrity off and reboot, or use a
+    echo     different backend.
+    if /i not "%DBUTIL_FORCE%"=="1" (
+        echo [x] aborting. Set DBUTIL_FORCE=1 to try anyway.
+        exit /b 1
     )
+    echo [x] DBUTIL_FORCE=1 - continuing despite HVCI.
 )
 
-:: ---- is the driver already RUNNING? ----
+rem FORTESP_NOLOAD=1: driver is already loaded (or you are testing the script
+:: itself) - do not touch the service at all, just run the tool.
+if "%FORTESP_NOLOAD%"=="1" (
+    echo [*] FORTESP_NOLOAD=1 - not touching the driver.
+    goto run_tool
+)
+
+rem ---- is the driver already RUNNING? ----
 :: State, not existence: query the service state and only treat RUNNING as
 :: "loaded". STOPPED means no live instance, so a start is safe.
-set "SVC=DBUtil_2_3"
 set "EXISTS="
 set "LOADED="
+set "BUSY="
 for /f "tokens=2 delims=:" %%S in ('sc.exe query "%SVC%" 2^>nul ^| findstr /i /c:"SERVICE_NAME"') do set "EXISTS=%%S"
 if defined EXISTS (
     set "STATE="
     for /f "tokens=2 delims=:" %%S in ('sc.exe query "%SVC%" 2^>nul ^| findstr /i /c:"STATE"') do set "STATE=%%S"
     echo !STATE! | findstr /i /c:"RUNNING" /c:"START_PENDING" >nul && set "LOADED=1"
+    echo !STATE! | findstr /i /c:"STOP_PENDING" >nul && set "BUSY=1"
 )
+
+if defined BUSY (
+    echo [x] service %SVC% is STOP_PENDING - not touching it. Wait and re-run.
+    exit /b 1
+)
+
+rem The service's configured image. If it does not match what we are about to
+:: run, a running instance has the wrong name for the cloak matcher and a
+:: stopped one has to be recreated.
+set "BINPATH="
+set "BINNAME="
+if defined EXISTS (
+    for /f "tokens=2,*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Services\%SVC%" /v ImagePath 2^>nul ^| findstr /i /c:"ImagePath"') do set "BINPATH=%%B"
+)
+:: Extract just the file name, then compare. `echo path | findstr /e` does not
+:: work: the space before the pipe becomes part of the echoed line, so an
+:: end-of-line match never matches (fails closed - but wrongly).
+if defined BINPATH for %%I in ("!BINPATH!") do set "BINNAME=%%~nxI"
 
 if defined LOADED (
     echo [*] driver is RUNNING - leaving it alone.
+    if defined BINNAME (
+        if /i not "!BINNAME!"=="%IMAGE%" (
+            echo [x] the running service is configured for a different image:
+            echo       !BINPATH!
+            echo     The cloak matches on "%IMAGE%" and would not find itself.
+            echo     Do NOT stop it. Reboot, then re-run to recreate the service.
+            exit /b 1
+        )
+    )
 ) else (
-    if defined EXISTS echo [*] service exists but is not running (state !STATE!) - starting it.
+    if defined EXISTS (
+        echo [*] service exists but is not running - it will be recreated.
+        rem Not RUNNING means no mapped image; deleting the service is safe.
+        rem (Rule 2 only forbids deleting a *running* one.)
+        call :delete_service
+        if errorlevel 1 exit /b 1
+        set "EXISTS="
+    )
 
-    :: ---- locate the driver image ----
+    rem ---- locate the driver image ----
     set "SYS="
     if defined DBUTIL_SYS ( if exist "!DBUTIL_SYS!" set "SYS=!DBUTIL_SYS!" )
     if not defined SYS if exist "%~dp0driver\dbutil_2_3.sys" set "SYS=%~dp0driver\dbutil_2_3.sys"
@@ -74,52 +156,90 @@ if defined LOADED (
     if not defined SYS if exist "%SystemRoot%\System32\drivers\DBUtil_2_3.sys" set "SYS=%SystemRoot%\System32\drivers\DBUtil_2_3.sys"
 
     if not defined SYS (
-        echo [!] driver image not found. Run:
+        echo [x] driver image not found. Run:
         echo       powershell -ExecutionPolicy Bypass -File driver\fetch_driver.ps1
         echo     or set DBUTIL_SYS to a full path.
         exit /b 1
     )
 
-    echo [*] driver image: %SYS%
+    echo [*] source image: !SYS!
 
-    :: Copy only if the target does not exist yet. Overwriting an image that
-    :: a loaded instance is mapped from is exactly what we must not do.
-    if not exist "%SystemRoot%\System32\drivers\DBUtil_2_3.sys" (
-        copy /y "%SYS%" "%SystemRoot%\System32\drivers\DBUtil_2_3.sys" >nul
+    rem Copy only if the target does not exist yet. Overwriting an image that
+    rem a loaded instance is mapped from is exactly what we must not do.
+    if not exist "%DST%" (
+        copy /y "!SYS!" "%DST%" >nul
+        if errorlevel 1 (
+            echo [x] could not copy the image to %DST%
+            exit /b 1
+        )
+        echo [*] installed as %DST%
     ) else (
-        echo [*] driver image already present - not overwriting it
+        echo [*] target image already present - not overwriting it
     )
 
     if not defined EXISTS (
-        sc.exe create "%SVC%" type= kernel start= demand binPath= "%SystemRoot%\System32\drivers\DBUtil_2_3.sys" >nul
+        sc.exe create "%SVC%" type= kernel start= demand binPath= "%DST%" >nul
+        if errorlevel 1 (
+            echo [x] sc create failed for %SVC%
+            exit /b 1
+        )
     )
     sc.exe start "%SVC%" >nul
 
-    :: Confirm it actually reached RUNNING before launching the tool.
-    set "STATE="
+    rem Confirm it actually reached RUNNING before launching the tool.
+    set "STATE=unreported"
     for /f "tokens=2 delims=:" %%S in ('sc.exe query "%SVC%" 2^>nul ^| findstr /i /c:"STATE"') do set "STATE=%%S"
+    echo [*] service state: !STATE!
     echo !STATE! | findstr /i /c:"RUNNING" /c:"START_PENDING" >nul
     if errorlevel 1 (
-        echo [!] the service did not reach RUNNING (state !STATE!).
+        echo [x] the service did not reach RUNNING.
         echo     Likely: the vulnerable-driver blocklist enforces on this build
-        echo     (HVCI), or Secure Boot refuses the image. The tool will fail
+        echo     HVCI, or Secure Boot refuses the image. The tool will fail
         echo     its read probe; nothing was touched in kernel memory.
         exit /b 1
     )
     echo [*] driver loaded and RUNNING. It stays loaded until reboot - do NOT stop it.
 
-    :: The device is exclusive (one open at a time). If this fails while the
-    :: service is RUNNING, something else already holds it.
+    rem The device is exclusive (one open at a time). If this fails while the
+    rem service is RUNNING, something else already holds it.
     powershell -NoProfile -Command "try { $f=[IO.File]::Open('\\.\DBUtil_2_3','Open','ReadWrite','ReadWrite'); $f.Close(); exit 0 } catch { exit 1 }" >nul 2>&1
-    if errorlevel 1 echo [!] \\.\DBUtil_2_3 could not be opened - another process may hold it.
+    if errorlevel 1 echo [x] \\.\DBUtil_2_3 could not be opened - another process may hold it.
 )
 
+:run_tool
 :: ---- run ----
 :: Log to a file so the output survives the elevated console closing.
+:: --driver-name comes after %* so the runner's answer always wins: it knows
+:: the name the service was actually created with.
 if not exist out mkdir out
-out\fortesp_r0.exe %* > out\run.log 2>&1
+out\fortesp_r0.exe %* --driver-name "%IMAGE%" > out\run.log 2>&1
+set "RC=%ERRORLEVEL%"
 type out\run.log
 
-:: NOTE: deliberately no `sc stop` and no `sc delete` here. See the rules at
-:: the top of this file.
-endlocal
+rem NOTE: deliberately no `sc stop` and no `sc delete` here. See the rules at
+rem the top of this file.
+rem Propagate the tool's exit code (0 pass / 1 fail) to the caller.
+endlocal & exit /b %RC%
+
+rem ---------------------------------------------------------------------------
+:: Delete a service that is NOT running, and wait for it to disappear.
+:: Returns 1 if it is still registered after ~10s (caller aborts rather than
+:: starting a half-deleted service).
+:: ---------------------------------------------------------------------------
+:delete_service
+sc.exe delete "%SVC%" >nul 2>&1
+set /a WAIT=0
+:wait_delete
+sc.exe query "%SVC%" >nul 2>&1
+if not errorlevel 1 (
+    set /a WAIT+=1
+    if !WAIT! GEQ 10 (
+        echo [x] service %SVC% is still registered after delete.
+        echo     Reboot and re-run; not starting a half-deleted service.
+        exit /b 1
+    )
+    timeout /t 1 /nobreak >nul
+    goto wait_delete
+)
+exit /b 0
+

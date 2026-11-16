@@ -125,7 +125,9 @@ HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy
 
 so `dbutil_2_3.sys` loads. If a Windows update or Memory Integrity turns
 enforcement on, `sc start` fails. That is a **load failure, not a detection**:
-the driver simply never appears, and `run_r0.bat` reports it.
+the driver simply never appears. `run_r0.bat` reads the HVCI key first and
+aborts unless `DBUTIL_FORCE=1`, and aborts again if the service does not reach
+RUNNING after `sc start`.
 
 **2. Easy Anti-Cheat — a *client* refusal.** Since mid-2026 EAC recognises this
 binary and Fortnite will not launch while it is loaded, regardless of what the
@@ -137,9 +139,12 @@ driver. The only counter in this tree is the module-list cloak
 Sequence that actually tells you something:
 
 1. `--probe` with a working read path (driver only, no game).
-2. `--cloak` dry run, review the two writes.
-3. `--cloak-commit`, then launch Fortnite.
-4. If EAC still names `DBUtil_2_3`, the module list was not the tell. Next
+2. `--kwtest` — proves the kernel **write** path (writes identical bytes back
+   over `PsInitialSystemProcess`), before the cloak depends on it.
+3. `--cloak` dry run, review the two writes.
+4. `--cloak-commit`, then launch Fortnite. Rename the service/image
+   (`FORTESP_SVC` / `FORTESP_IMAGE`) **before** this step, not after.
+5. If EAC still names `DBUtil_2_3`, the module list was not the tell. Next
    cheapest move is running the driver under a random service name and random
    image name (defeats name matching, not hashing); after that the driver has
    to be replaced. `r0::Backend` is the seam — nothing above it knows which
