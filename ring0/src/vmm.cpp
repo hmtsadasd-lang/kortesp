@@ -22,9 +22,6 @@ uint32_t  vmm::g_pid = 0;
 bool      vmm::g_ready = false;
 bool      vmm::g_attached = false;
 
-// MZ check that survives a transposed kernel-VA pair (which zeroes the header).
-bool mz_ok(uint16_t m);
-
 // EPROCESS layout candidates, most likely first.
 // { pid, links, name, dtb, peb } - Win11 24H2/25H2.
 vmm::Layout   vmm::g_lay{ 0x1D0, 0x1D8, 0x338, 0x28, 0x2E0 };
@@ -394,7 +391,7 @@ bool cache_valid(const Cr3Cache& c) {
     uint64_t probe{};
     if (!translate_cr3(c.cr3, vmm::g_ntos, probe)) return false;
     uint16_t mz{};
-    if (!phys_read(probe & ~0xFFFull, &mz, 2) || m != 0x5A4D && (m == 0 || !r0::ntos_mz_broken())) return false;
+    if (!phys_read(probe & ~0xFFFull, &mz, 2) || !vmm::mz_ok(mz)) return false;
     return true;
 }
 
@@ -461,7 +458,7 @@ bool vmm::init_kcr3() {
         if (dtb && (dtb & 0xFFF) == 0) {
             uint64_t pa{};
             uint16_t mz{};
-            if (translate_cr3(dtb, g_ntos, pa) && phys_read(pa, &mz, 2) && m != 0x5A4D && (m == 0 || !r0::ntos_mz_broken())) {
+            if (translate_cr3(dtb, g_ntos, pa) && phys_read(pa, &mz, 2) && !vmm::mz_ok(mz)) {
                 g_kcr3 = dtb;
                 printf("[+] kernel CR3 0x%llx (from System EPROCESS)\n",
                        (unsigned long long)dtb);
@@ -561,7 +558,7 @@ bool vmm::scan_kernel_cr3() {
 
             uint16_t mz{};
             if (!phys_read(probe & ~0xFFFull, &mz, 2)) continue;
-            if (m != 0x5A4D && (m == 0 || !r0::ntos_mz_broken())) {
+            if (!vmm::mz_ok(mz)) {
                 g_kcr3 = pa;
                 save_cr3_cache(pa);
                 printf("[+] kernel CR3 0x%llx (scan)\n", (unsigned long long)pa);
@@ -586,7 +583,7 @@ bool vmm::sections(std::vector<Section>& out) {
     if (!g_ntos || !g_ntos_size) return false;
 
     IMAGE_DOS_HEADER dos{};
-    if (!kread_trusted(g_ntos, &dos, sizeof(dos)) || if (!((m) == 0x5A4D || ((m) == 0 && r0::ntos_mz_broken()))) return false;dos.e_magic)) return false;
+    if (!kread_trusted(g_ntos, &dos, sizeof(dos)) || !vmm::mz_ok(dos.e_magic)) return false;
     if (dos.e_lfanew >= g_ntos_size) return false;
 
     IMAGE_NT_HEADERS64 nt{};
@@ -625,7 +622,7 @@ bool vmm::export_rva(const char* want, uint64_t& rva) {
     if (!g_ntos || !g_ntos_size) return false;
 
     IMAGE_DOS_HEADER dos{};
-    if (!kread_trusted(g_ntos, &dos, sizeof(dos)) || if (!((m) == 0x5A4D || ((m) == 0 && r0::ntos_mz_broken()))) return false;dos.e_magic)) return false;
+    if (!kread_trusted(g_ntos, &dos, sizeof(dos)) || !vmm::mz_ok(dos.e_magic)) return false;
     if (dos.e_lfanew >= g_ntos_size) return false;
 
     IMAGE_NT_HEADERS64 nt{};
@@ -795,7 +792,7 @@ void vmm::shutdown() {
 // ---------------------------------------------------------------------------
 // MZ check that survives a transposed kernel-VA pair (which zeroes the header).
 // ---------------------------------------------------------------------------
-static bool mz_ok(uint16_t m) {
+bool vmm::mz_ok(uint16_t m) {
     if (m == 0x5A4D) return true;
     return m == 0 && r0::ntos_mz_broken();
 }

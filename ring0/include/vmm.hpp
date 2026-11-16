@@ -140,7 +140,15 @@ bool      phys_map_exact();          // true when built from the registry
 bool      phys_is_ram(uint64_t pa, size_t len);
 uint64_t  phys_ram_end();
 
+// MZ check that survives a transposed kernel-VA pair (which zeroes the header).
+// Used by vmm::sections(), export_rva(), init_kcr3(), cache_valid(), and
+// scan_kernel_cr3() to accept both 0x5A4D and 0x0000 when the kernel-VA
+// pair is transposed.
+bool mz_ok(uint16_t magic);
+
 } // namespace vmm
 
 // MZ check that survives a transposed kernel-VA pair (which zeroes the header).
+
+
 
