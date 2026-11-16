@@ -72,39 +72,65 @@ bool find_our_driver() {
     if (!g_head) {
         if (!find_head(g_head)) return false;
     }
-    uint64_t flink{}, blink{};
-    if (!vmm::kread_trusted(g_head, &flink, 8) || !vmm::kread_trusted(g_head + 8, &blink, 8))
-        return false;
     const char* our_name = driver_image();
     if (!our_name || !*our_name) return false;
+
+    printf("[DEBUG] find_our_driver: our_name=%s\n", our_name);
+
+    // Build wide-char version of our driver name (just the filename part)
     wchar_t our_name_w[128]{};
     size_t len = strlen(our_name);
     for (size_t i = 0; i < len && i < 127; i++) {
         our_name_w[i] = static_cast<wchar_t>(our_name[i]);
     }
+    size_t our_len = strlen(our_name);
+
+    uint64_t flink{};
+    if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
+
     uint64_t cur = flink;
-    while (cur != g_head && cur != 0) {
+    int guard = 0;
+    while (cur != g_head && cur != 0 && guard++ < 4096) {
         uint64_t dll_base{};
+        uint64_t cur_flink{};
         if (!vmm::kread_trusted(cur + 0x30, &dll_base, 8)) break;
+        if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
+
         uint64_t base_dll_name_buffer{};
         if (!vmm::kread_trusted(cur + 0x58, &base_dll_name_buffer, 8)) break;
+        if (!base_dll_name_buffer || base_dll_name_buffer < 0xFFFF800000000000ull) break;
+
         wchar_t base_name[128]{};
         if (!vmm::kread_trusted(base_dll_name_buffer, base_name, sizeof(base_name) - 2)) break;
+
+        printf("[DEBUG] walk: cur=0x%llx dll_base=0x%llx name=",
+               (unsigned long long)cur, (unsigned long long)dll_base);
+        for (size_t i = 0; i < 127 && base_name[i]; i++) printf("%lc", base_name[i]);
+        printf("\n");
+
+        // Case-insensitive suffix match: BaseDllName may be full path like
+        // \SystemRoot\System32\drivers\dbx64.sys
+        size_t blen = 0;
+        while (blen < 127 && base_name[blen]) blen++;
+
+        size_t start = blen;
+        while (start > 0 && base_name[start - 1] != L'\\' && base_name[start - 1] != L'/') start--;
+
         bool match = true;
-        size_t i = 0;
-        while (our_name_w[i] && base_name[i]) {
+        size_t j = 0;
+        for (size_t i = start; i < blen && our_name_w[j]; i++, j++) {
             wchar_t c1 = base_name[i];
-            wchar_t c2 = our_name_w[i];
+            wchar_t c2 = our_name_w[j];
             if (c1 >= L'A' && c1 <= L'Z') c1 = c1 - L'A' + L'a';
             if (c2 >= L'A' && c2 <= L'Z') c2 = c2 - L'A' + L'a';
             if (c1 != c2) { match = false; break; }
-            i++;
         }
-        if (match && our_name_w[i] == 0 && base_name[i] == 0) {
+        if (match && our_name_w[j] == 0) {
             g_our_base = dll_base;
             return true;
         }
-        if (!vmm::kread_trusted(cur, &cur, 8)) break;
+
+        cur = cur_flink;
     }
     return false;
 }
@@ -117,7 +143,10 @@ bool apply(bool commit) {
         if (!find_head(g_head)) return false;
     }
     if (g_our_base == 0) {
-        if (!find_our_driver()) return false;
+        if (!find_our_driver()) {
+            printf("[!] our driver's KLDR_DATA_TABLE_ENTRY not found\n");
+            return false;
+        }
     }
     uint64_t flink{};
     if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
@@ -130,6 +159,11 @@ bool apply(bool commit) {
         if (dll_base == g_our_base) {
             uint64_t cur_blink{};
             if (!vmm::kread_trusted(cur + 8, &cur_blink, 8)) return false;
+            if (!commit) {
+                printf("[*] dry run: would unlink driver entry at 0x%llx (DllBase=0x%llx)\n",
+                       (unsigned long long)cur, (unsigned long long)dll_base);
+                return true;
+            }
             if (!vmm::kwrite_trusted(cur_blink, &cur_flink, 8)) return false;
             if (!vmm::kwrite_trusted(cur_flink + 8, &cur_blink, 8)) return false;
             g_on = false;
@@ -137,6 +171,7 @@ bool apply(bool commit) {
         }
         cur = cur_flink;
     }
+    printf("[!] our driver's entry not found in PsLoadedModuleList\n");
     return false;
 }
 
