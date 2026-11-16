@@ -105,6 +105,7 @@ bool kread(uint64_t va, void* buf, size_t len);
 // The handler's direction is proven once with a zero-payload probe first; if
 // that cannot be proven the page walk is used instead (when a CR3 is known).
 bool kread_trusted(uint64_t va, void* buf, size_t len);
+bool kwrite_trusted(uint64_t va, const void* buf, size_t len);
 
 bool kwrite(uint64_t va, const void* buf, size_t len);
 bool read (uint64_t va, void* buf, size_t len);

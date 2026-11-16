@@ -942,6 +942,26 @@ bool vmm::kread_trusted(uint64_t va, void* buf, size_t len) {
     return false;
 }
 
+bool vmm::kwrite_trusted(uint64_t va, const void* buf, size_t len) {
+    if (!len) return false;
+    if (va < 0xFFFF800000000000ull) return false;
+
+    static bool probe_done = false;
+    static bool probe_ok = false;
+    if (!probe_done) {
+        probe_done = true;
+        probe_ok = g_ntos && r0::vread_probe(g_ntos, 2);
+        if (probe_ok)
+            printf("[+] kernel-VA write path proven (zero-payload probe)\n");
+        else
+            printf("[!] kernel-VA write path NOT proven - page walk required (run --cr3scan)\n");
+    }
+
+    if (probe_ok && r0::vwrite(va, buf, len)) return true;
+    if (g_kcr3) return kwrite(va, buf, len);
+    return false;
+}
+
 bool vmm::kwrite(uint64_t va, const void* buf, size_t len) {
     if (!g_kcr3) return false;
     auto* p = static_cast<const uint8_t*>(buf);

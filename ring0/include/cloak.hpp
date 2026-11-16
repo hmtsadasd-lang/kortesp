@@ -13,6 +13,9 @@ namespace cloak {
 // Dry run by default. commit=false computes and reports, writes nothing.
 bool apply(bool commit = false);
 
+// Initialize cloak with our driver's image name. Must be called before apply().
+bool cloak_init(const char* driver_image_name);
+
 // Re-link the entry and delete the persisted state file.
 //
 // Works in the process that unlinked it, and in a fresh process: the commit

