@@ -6,6 +6,9 @@
 
 namespace vmm {
 
+// ---- simple 3D vector -----------------------------------------------------
+struct Vec3 { double x, y, z; };
+
 enum class PteFlags : uint64_t {
     Present   = 1,
     Write     = 2,
@@ -109,6 +112,8 @@ bool kwrite_trusted(uint64_t va, const void* buf, size_t len);
 
 bool kwrite(uint64_t va, const void* buf, size_t len);
 bool read (uint64_t va, void* buf, size_t len);
+// Kernel-VA -> kread_trusted, user VA -> read (page walk).
+bool rd   (uint64_t va, void* buf, size_t len);
 
 // MZ check that survives a transposed kernel-VA pair (which zeroes the header).
 

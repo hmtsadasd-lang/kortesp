@@ -1,31 +1,37 @@
 #include "ov.hpp"
 #include "../../payload/include/font.hpp"
+#include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
-#include <d3dcompiler.h>
+#include <cstring>
 #include <cwchar>
 #include <cmath>
 
-// Neutral class name: a process enumerating top-level windows sees this
-// string, and "fortesp_r0_overlay" was a direct giveaway.
 namespace { constexpr wchar_t kClass[] = L"OverlayHostWnd"; }
 
-HWND g_wnd{}; HWND g_game{}; ID3D11Device* g_dev{}; ID3D11DeviceContext* g_ctx{}; IDXGISwapChain1* g_sc{}; ID3D11RenderTargetView* g_rtv{}; ID3D11VertexShader* g_vs{}; ID3D11PixelShader* g_ps{}; ID3D11InputLayout* g_il{}; ID3D11Buffer* g_vb{}; ID3D11Buffer* g_cb{}; ID3D11BlendState* g_bl{}; ID3D11RasterizerState* g_rs{}; ID3D11DepthStencilState* g_ds{}; int g_w{}, g_h{}; struct Vert { float x, y, r, g, b, a; }; constexpr int kMax = 1 << 16; Vert g_stage[kMax]{}; int g_n{}; const char* kSrc =
+HWND g_wnd{}; HWND g_game{}; ID3D11Device* g_dev{}; ID3D11DeviceContext* g_ctx{};
+IDXGISwapChain1* g_sc{}; ID3D11RenderTargetView* g_rtv{}; ID3D11VertexShader* g_vs{};
+ID3D11PixelShader* g_ps{}; ID3D11InputLayout* g_il{}; ID3D11Buffer* g_vb{};
+ID3D11Buffer* g_cb{}; ID3D11BlendState* g_bl{}; ID3D11RasterizerState* g_rs{};
+ID3D11DepthStencilState* g_ds{}; int g_w{}, g_h{};
+struct Vert { float x, y, r, g, b, a; };
+constexpr int kMax = 1 << 16;
+Vert g_stage[kMax]{}; int g_n{};
+
+const char* kSrc =
     "cbuffer C:register(b0){float2 sz;};"
     "struct I{float2 p:POS;float4 c:COL;};"
     "struct O{float4 p:SV_POSITION;float4 c:COL;};"
     "O vs(I i){O o;o.p=float4(i.p.x/sz.x*2-1,1-i.p.y/sz.y*2,0,1);o.c=i.c;return o;}"
-    // Premultiplied output. A WS_EX_LAYERED window with a swapchain
-    // composites per-pixel through DWM using the backbuffer's alpha, so the
-    // colour has to be premultiplied or the edges are too bright.
     "float4 ps(O i):SV_TARGET{return float4(i.c.rgb*i.c.a,i.c.a);}";
 
-LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    return DefWindowProcW(h, m, w, l);
+LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcW(h, msg, w, l);
 }
 
-using CompileFn = HRESULT(__stdcall*)(const void*, SIZE_T, const char*, const void*, const void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+using CompileFn = HRESULT(__stdcall*)(const void*, SIZE_T, const char*, const void*,
+    const void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
 bool build_pipeline() {
     HMODULE c = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -37,12 +43,11 @@ bool build_pipeline() {
     const SIZE_T len = strlen(kSrc);
     if (fn(kSrc, len, "o", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err) < 0) return false;
     if (fn(kSrc, len, "o", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err) < 0) return false;
-
     if (g_dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g_vs) < 0) return false;
     if (g_dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g_ps) < 0) return false;
 
     D3D11_INPUT_ELEMENT_DESC ie[] = {
-        { "POS", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "POS", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "COL", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     if (g_dev->CreateInputLayout(ie, 2, vs->GetBufferPointer(), vs->GetBufferSize(), &g_il) < 0) return false;
@@ -62,8 +67,6 @@ bool build_pipeline() {
 
     D3D11_BLEND_DESC bl{};
     bl.RenderTarget[0].BlendEnable = TRUE;
-    // Premultiplied: src factor is ONE, not SRC_ALPHA, because the shader
-    // already multiplied rgb by alpha.
     bl.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
     bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
@@ -82,7 +85,6 @@ bool build_pipeline() {
     dd.DepthEnable = FALSE;
     dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     if (g_dev->CreateDepthStencilState(&dd, &g_ds) < 0) return false;
-
     return true;
 }
 
@@ -102,7 +104,7 @@ void push(float x, float y, ov::Color c) {
 void quad(float l, float t, float r, float b, ov::Color c) {
     push(l, t, c); push(r, t, c); push(r, b, c);
     push(l, t, c); push(r, b, c); push(l, b, c);
-} // namespace
+}
 
 namespace ov {
 
@@ -117,27 +119,12 @@ bool init(HWND game) {
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
     g_wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
-                           WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        kClass, L"", WS_POPUP, 0, 0, 8, 8,
-        nullptr, nullptr, wc.hInstance, nullptr);
+                            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kClass, L"", WS_POPUP, 0, 0, 8, 8, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_wnd) return false;
-
-    // NOTE: do NOT call SetLayeredWindowAttributes(..., LWA_ALPHA) here.
-    // On a WS_EX_LAYERED window that switches the window to a single constant
-    // alpha and discards the per-pixel alpha of the surface - the overlay
-    // becomes an opaque black rectangle over the game. The swapchain's alpha
-    // channel is what DWM composites with, and the shader premultiplies.
 
     ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
 
-    // A DXGI *flip-model* swapchain with AlphaMode=PREMULTIPLIED, presented
-    // into a WS_EX_LAYERED window, is composited per-pixel by DWM. The legacy
-    // DXGI_SWAP_EFFECT_DISCARD path ignores the alpha channel entirely,
-    // which is why the old code "solved" transparency with
-    // SetLayeredWindowAttributes(LWA_ALPHA) - a single constant alpha that
-    // also discarded the surface alpha, leaving an opaque black rectangle.
-    //
-    // So: device first, then a swapchain built from DXGI_SWAP_CHAIN_DESC1.
     const D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL got{};
     if (D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -156,8 +143,7 @@ bool init(HWND game) {
     adap->Release();
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = 8;
-    sd.Height = 8;
+    sd.Width = 8; sd.Height = 8;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -176,24 +162,20 @@ bool init(HWND game) {
 }
 
 void shutdown() {
-    if (g_rtv) g_rtv->Release();
-    if (g_vb) g_vb->Release();
-    if (g_cb) g_cb->Release();
-    if (g_il) g_il->Release();
-    if (g_vs) g_vs->Release();
-    if (g_ps) g_ps->Release();
-    if (g_bl) g_bl->Release();
-    if (g_rs) g_rs->Release();
-    if (g_ds) g_ds->Release();
-    // Swapchain before device: a flip-model swapchain holds a device reference
-    // and ResizeBuffers/Present would touch a released device otherwise.
-    if (g_sc) g_sc->Release();
-    if (g_ctx) g_ctx->Release();
-    if (g_dev) g_dev->Release();
-    if (g_wnd) DestroyWindow(g_wnd);
-    g_rtv = nullptr; g_vb = nullptr; g_cb = nullptr; g_il = nullptr;
-    g_vs = nullptr; g_ps = nullptr; g_bl = nullptr; g_rs = nullptr; g_ds = nullptr;
-    g_ctx = nullptr; g_dev = nullptr; g_sc = nullptr; g_wnd = nullptr;
+    if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+    if (g_vb) { g_vb->Release(); g_vb = nullptr; }
+    if (g_cb) { g_cb->Release(); g_cb = nullptr; }
+    if (g_il) { g_il->Release(); g_il = nullptr; }
+    if (g_vs) { g_vs->Release(); g_vs = nullptr; }
+    if (g_ps) { g_ps->Release(); g_ps = nullptr; }
+    if (g_bl) { g_bl->Release(); g_bl = nullptr; }
+    if (g_rs) { g_rs->Release(); g_rs = nullptr; }
+    if (g_ds) { g_ds->Release(); g_ds = nullptr; }
+    if (g_sc) { g_sc->Release(); g_sc = nullptr; }
+    if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+    if (g_dev) { g_dev->Release(); g_dev = nullptr; }
+    if (g_wnd) { DestroyWindow(g_wnd); g_wnd = nullptr; }
+    g_w = g_h = 0;
 }
 
 void tick() {
@@ -204,7 +186,7 @@ void tick() {
     POINT tl{ 0, 0 };
     ClientToScreen(g_game, &tl);
 
-    int w = r.right - r.left, h = r.bottom - r.top;
+    const int w = r.right - r.left, h = r.bottom - r.top;
     if (w < 8 || h < 8) return;
 
     RECT cur{};
@@ -219,8 +201,7 @@ void tick() {
 
     if (g_sc) {
         if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
-        g_sc->ResizeBuffers(0, static_cast<UINT>(w), static_cast<UINT>(h),
-            DXGI_FORMAT_UNKNOWN, 0);
+        g_sc->ResizeBuffers(0, static_cast<UINT>(w), static_cast<UINT>(h), DXGI_FORMAT_UNKNOWN, 0);
         make_rtv();
     }
 }
@@ -237,7 +218,7 @@ bool pump() {
 void begin() { g_n = 0; }
 
 void end() {
-    if (!g_ctx || !g_rtv) return;
+    if (!g_ctx || !g_rtv || g_w < 1 || g_h < 1) return;
     const float clear[4]{ 0.f, 0.f, 0.f, 0.f };
     g_ctx->ClearRenderTargetView(g_rtv, clear);
 
@@ -250,8 +231,8 @@ void end() {
             float sz[2]{ static_cast<float>(g_w), static_cast<float>(g_h) };
             g_ctx->UpdateSubresource(g_cb, 0, nullptr, sz, 0, 0);
 
-            UINT stride = sizeof(Vert), off = 0;
-            g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &off);
+            UINT stride = sizeof(Vert), offset = 0;
+            g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &offset);
             g_ctx->IASetInputLayout(g_il);
             g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g_ctx->VSSetShader(g_vs, nullptr, 0);
@@ -271,29 +252,29 @@ void end() {
     g_sc->Present(0, 0);
 }
 
-void fill(float l, float t, float r, float b, Color c) { quad(l, t, r, b, c); }
+void fill(float l, float t, float r, float b, ov::Color c) { quad(l, t, r, b, c); }
 
-void box(float l, float t, float r, float b, Color c, float th) {
+void box(float l, float t, float r, float b, ov::Color c, float th) {
     quad(l, t, r, t + th, c);
     quad(l, b - th, r, b, c);
     quad(l, t, l + th, b, c);
     quad(r - th, t, r, b, c);
 }
 
-void line(float x0, float y0, float x1, float y1, float th, Color c) {
-    float dx = x1 - x0, dy = y1 - y0;
-    float len = sqrtf(dx * dx + dy * dy);
+void line(float x0, float y0, float x1, float y1, float th, ov::Color c) {
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len = sqrtf(dx * dx + dy * dy);
     if (len < 0.01f) return;
-    float nx = -dy / len * th * 0.5f, ny = dx / len * th * 0.5f;
+    const float nx = -dy / len * th * 0.5f, ny = dx / len * th * 0.5f;
     push(x0 + nx, y0 + ny, c); push(x1 + nx, y1 + ny, c); push(x1 - nx, y1 - ny, c);
     push(x0 + nx, y0 + ny, c); push(x1 - nx, y1 - ny, c); push(x0 - nx, y0 - ny, c);
 }
 
-void text(float x, float y, const wchar_t* s, Color c, float sc) {
+void text(float x, float y, const wchar_t* s, ov::Color c, float sc) {
     for (; *s; ++s) {
-        int gi = font::index(*s);
+        const int gi = font::index(*s);
         for (int row = 0; row < 7; ++row) {
-            uint8_t bits = font::kGlyphs[gi][row];
+            const uint8_t bits = font::kGlyphs[gi][row];
             for (int col = 0; col < 5; ++col)
                 if (bits & (1 << (4 - col)))
                     quad(x + col * sc, y + row * sc, x + (col + 1) * sc, y + (row + 1) * sc, c);
@@ -308,4 +289,4 @@ int height() { return g_h; }
 int pending() { return g_n; }
 void set_surface(int w, int h) { g_w = w; g_h = h; }
 
-} // namespace
+} // namespace ov

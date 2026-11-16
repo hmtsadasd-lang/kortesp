@@ -10,16 +10,14 @@
 namespace esp {
 
 Config cfg{};
+bool use_actors = false;
 
-// Decode an obfuscated UE FString buffer into plaintext.
-// `src_chars` is the number of wchar_t present (FString.Length - 1; Length
-// counts the null terminator). Pure function - no target needed.
 int decode_fstring(const wchar_t* src, int src_chars, wchar_t* dst, int dst_cap) {
     if (!src || !dst || dst_cap <= 0) return 0;
     dst[0] = 0;
-    int key = (src_chars) & 3, out = 0;
+    int key = src_chars & 3, out = 0;
     for (int i = 0; i < src_chars && out < dst_cap - 1; ++i) {
-        wchar_t c = static_cast<wchar_t>(src[i] - (key & 7));
+        const wchar_t c = static_cast<wchar_t>(src[i] - (key & 7));
         if (c >= 0x20 && c < 0x7F) dst[out++] = c;
         key += 3;
     }
@@ -29,324 +27,396 @@ int decode_fstring(const wchar_t* src, int src_chars, wchar_t* dst, int dst_cap)
 
 namespace {
 
-    // UE5 with LWC: FVector3d / FRotator3d are 24 bytes.
-    struct Vec3d { double x, y, z; };
-    struct Pov { Vec3d loc{}, fwd{}, right{}, up{}; double focal{}; int w{}, h{}; };
+struct Vec3d { double x, y, z; };
+struct Pov { Vec3d loc{}, fwd{}, right{}, up{}; double focal{}; int w{}, h{}; };
+struct Entity { uint64_t pawn{}, state{}; };
 
-    uint64_t g_world{}, g_pc{}, g_my_state{};
-    bool g_ready{};
-    constexpr double kPi = 3.14159265358979323846;
-    inline bool ok(uint64_t p) { return p > 0x10000 && p < 0x7FFFFFFFFFFF && !(p & 3); }
+uint64_t g_world{}, g_pc{}, g_my_state{}, g_my_pawn{};
+bool g_ready{};
+constexpr double kPi = 3.14159265358979323846;
 
-    // Case-insensitive compare of a UTF-16 string against an ASCII literal.
-    bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
-        for (int i = 0;; ++i) {
-            wchar_t x = w[i], y = a[i];
-            if (x >= L'A' && x <= L'Z') x = static_cast<wchar_t>(x + 32);
-            if (y >= L'A' && y <= L'Z') y = static_cast<wchar_t>(y + 32);
-            if (x != y) return false;
-            if (!y) return true;
+// Accept BOTH halves of the address space. Game objects are kernel pool
+// pointers; the PEB chain is user memory. A user-only bound rejects every
+// UObject.
+inline bool ok(uint64_t p) {
+    if (p < 0x10000 || (p & 3)) return false;
+    if (p <= vmm::kUserHi) return true;
+    return p >= 0xFFFF800000000000ull;
+}
+
+bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
+    for (int i = 0;; ++i) {
+        wchar_t x = w[i], y = a[i];
+        if (x >= L'A' && x <= L'Z') x = static_cast<wchar_t>(x + 32);
+        if (y >= L'A' && y <= L'Z') y = static_cast<wchar_t>(y + 32);
+        if (x != y) return false;
+        if (!y) return true;
+    }
+}
+
+// Target base through the target's own PEB. `vmm::rd` routes the PEB, LDR and
+// name buffers to the target CR3 page walk because they are user VAs.
+bool resolve_base() {
+    uint64_t peb{}, ldr{}, head{}, cur{};
+    if (!vmm::rd(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) || !ok(peb)) return false;
+    if (!vmm::rd(peb + off::Peb_Ldr, &ldr, sizeof(ldr)) || !ok(ldr)) return false;
+    if (!vmm::rd(ldr + off::Ldr_InLoadOrder, &head, sizeof(head)) || !ok(head)) return false;
+    if (!vmm::rd(head, &cur, sizeof(cur))) return false;
+
+    for (int g = 0; g < 512 && cur && cur != head; ++g) {
+        uint64_t base{}, size{}, nbuf{};
+        uint16_t nlen{};
+        if (!vmm::rd(cur + off::Ldr_DllBase, &base, sizeof(base))) break;
+        if (!vmm::rd(cur + off::Ldr_SizeOfImage, &size, sizeof(size))) break;
+        if (!vmm::rd(cur + off::Ldr_BaseDllNameLen, &nlen, sizeof(nlen))) break;
+        if (!vmm::rd(cur + off::Ldr_BaseDllNameBuf, &nbuf, sizeof(nbuf))) break;
+        if (!nlen || nlen > 1024) break;
+
+        wchar_t wname[264]{};
+        const int chars = nlen / 2;
+        if (chars > 263) break;
+        if (!vmm::rd(nbuf, wname, nlen)) break;
+
+        if (iequals_ascii(wname, L"FortniteClient-Win64-Shipping.exe")) {
+            vmm::set_base(base, size);
+            return true;
+        }
+        if (!vmm::rd(cur, &cur, sizeof(cur))) break;
+    }
+    return false;
+}
+
+bool build_view(Pov& v) {
+    uint64_t gi{}, arr{}; int count{};
+
+    if (!vmm::rd(g_world + off::World_OwningGameInstance, &gi, sizeof(gi)) || !ok(gi)) return false;
+    if (!vmm::rd(gi + off::GameInstance_LocalPlayers, &arr, sizeof(arr)) || !ok(arr)) return false;
+    if (!vmm::rd(gi + off::GameInstance_LocalPlayers + 8, &count, sizeof(count))) return false;
+    if (count <= 0) return false;
+
+    uint64_t local{};
+    if (!vmm::rd(arr, &local, sizeof(local)) || !ok(local)) return false;
+    if (!vmm::rd(local + off::Player_PlayerController, &g_pc, sizeof(g_pc)) || !ok(g_pc)) return false;
+
+    vmm::rd(g_pc + off::Controller_PlayerState, &g_my_state, sizeof(g_my_state));
+    if (ok(g_my_state)) vmm::rd(g_my_state + off::State_Pawn, &g_my_pawn, sizeof(g_my_pawn));
+
+    uint64_t cam{};
+    if (!vmm::rd(g_pc + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) || !ok(cam)) return false;
+
+    const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
+    Vec3d rot{}; double fov{};
+    if (!vmm::rd(pov + off::POV_Location, &v.loc, sizeof(v.loc))) return false;
+    if (!vmm::rd(pov + off::POV_Rotation, &rot, sizeof(rot))) return false;
+    if (!vmm::rd(pov + off::POV_FOV, &fov, sizeof(fov)) || fov < 1.0 || fov > 179.0) return false;
+    if (!v.loc.x && !v.loc.y && !v.loc.z) return false;
+
+    const double p = rot.x * kPi / 180.0, y = rot.y * kPi / 180.0;
+    v.fwd   = { cos(p) * cos(y), cos(p) * sin(y), sin(p) };
+    v.right = { -sin(y), cos(y), 0.0 };
+    v.up    = { v.fwd.y * v.right.z - v.fwd.z * v.right.y,
+                v.fwd.z * v.right.x - v.fwd.x * v.right.z,
+                v.fwd.x * v.right.y - v.fwd.y * v.right.x };
+
+    v.w = ov::width(); v.h = ov::height();
+    if (v.w < 8 || v.h < 8) return false;
+    v.focal = (v.w * 0.5) / tan(fov * 0.5 * kPi / 180.0);
+    return true;
+}
+
+bool project(const Pov& v, const Vec3d& p, float& sx, float& sy) {
+    const Vec3d d{ p.x - v.loc.x, p.y - v.loc.y, p.z - v.loc.z };
+    const double vz = d.x * v.fwd.x + d.y * v.fwd.y + d.z * v.fwd.z;
+    if (vz < 10.0) return false;
+    sx = static_cast<float>(v.w * 0.5 + (d.x * v.right.x + d.y * v.right.y + d.z * v.right.z) * v.focal / vz);
+    sy = static_cast<float>(v.h * 0.5 - (d.x * v.up.x + d.y * v.up.y + d.z * v.up.z) * v.focal / vz);
+    return sx > -200.f && sy > -200.f && sx < v.w + 200.f && sy < v.h + 200.f;
+}
+
+void read_name(uint64_t state, wchar_t* dst, size_t cap) {
+    dst[0] = 0;
+    uint64_t data{}; int len{};
+    if (!vmm::rd(state + off::State_Name, &data, sizeof(data)) || !ok(data)) return;
+    if (!vmm::rd(state + off::State_Name + 8, &len, sizeof(len))) return;
+    if (len <= 1 || len > 31) return;
+    wchar_t tmp[32]{};
+    if (!vmm::rd(data, tmp, sizeof(wchar_t) * static_cast<size_t>(len - 1))) return;
+    if (!tmp[0]) return;
+    decode_fstring(tmp, len - 1, dst, static_cast<int>(cap));
+}
+
+bool bone_pos(uint64_t mesh, int idx, Vec3d& out) {
+    uint64_t arr{};
+    if (!vmm::rd(mesh + off::Mesh_BoneArray, &arr, sizeof(arr)) || !ok(arr)) return false;
+    const uint64_t at = arr + static_cast<uint64_t>(idx) * off::Xform_Stride + off::Xform_Translation;
+    if (!vmm::rd(at, &out, sizeof(out))) return false;
+    return out.x == out.x && out.z == out.z;
+}
+
+constexpr int kPairs[][2] = {
+    { off::Bone_Head, off::Bone_Neck },       { off::Bone_Neck, off::Bone_Chest },
+    { off::Bone_Chest, off::Bone_Pelvis },
+    { off::Bone_Chest, off::Bone_LShoulder }, { off::Bone_LShoulder, off::Bone_LElbow },
+    { off::Bone_LElbow, off::Bone_LHand },
+    { off::Bone_Chest, off::Bone_RShoulder }, { off::Bone_RShoulder, off::Bone_RElbow },
+    { off::Bone_RElbow, off::Bone_RHand },
+    { off::Bone_Pelvis, off::Bone_LThigh },   { off::Bone_LThigh, off::Bone_LKnee },
+    { off::Bone_LKnee, off::Bone_LFoot },
+    { off::Bone_Pelvis, off::Bone_RThigh },   { off::Bone_RThigh, off::Bone_RKnee },
+    { off::Bone_RKnee, off::Bone_RFoot },
+};
+
+ov::Color team_color(int team, int mine) {
+    if (!cfg.team_colors) return { 0.95f, 0.95f, 0.95f, 1.f };
+    if (team == mine) return { 0.30f, 0.90f, 0.40f, 1.f };
+    switch (team & 7) {
+    case 0: return { 1.00f, 0.35f, 0.35f, 1.f };
+    case 1: return { 0.40f, 0.65f, 1.00f, 1.f };
+    case 2: return { 1.00f, 0.85f, 0.30f, 1.f };
+    case 3: return { 0.80f, 0.45f, 1.00f, 1.f };
+    case 4: return { 0.35f, 1.00f, 0.90f, 1.f };
+    default: return { 1.00f, 0.55f, 0.85f, 1.f };
+    }
+}
+
+void draw_entity(const Pov& v, const Entity& e, int my_team) {
+    const uint64_t pawn = e.pawn;
+    if (!ok(pawn) || pawn == g_my_pawn) return;
+
+    uint8_t dying{};
+    if (!vmm::rd(pawn + off::Pawn_Dying, &dying, sizeof(dying))) return;
+    if (dying & 0x20) return;
+
+    uint64_t mesh{};
+    if (!vmm::rd(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh)) || !ok(mesh)) return;
+
+    Vec3d feet{};
+    if (!vmm::rd(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet))) return;
+    if (feet.x != feet.x || feet.z != feet.z) return;
+
+    const Vec3d d{ feet.x - v.loc.x, feet.y - v.loc.y, feet.z - v.loc.z };
+    const float metres = static_cast<float>(sqrt(d.x * d.x + d.y * d.y + d.z * d.z) / 100.0);
+    if (metres > cfg.max_dist) return;
+
+    float half{};
+    vmm::rd(pawn + off::Pawn_CapsuleHalf, &half, sizeof(half));
+    if (half < 10.f || half > 200.f) half = 88.f;
+    const Vec3d top{ feet.x, feet.y, feet.z + half * 2.0 };
+
+    float bx{}, by{}, tx{}, ty{};
+    if (!project(v, feet, bx, by) || !project(v, top, tx, ty)) return;
+    const float h = static_cast<float>(by - ty);
+    if (h < 6.f || h > 1600.f) return;
+    const float w = static_cast<float>(h * 0.42);
+
+    uint8_t team{};
+    if (ok(e.state)) vmm::rd(e.state + off::State_Team, &team, sizeof(team));
+    if (!cfg.teammates && team == static_cast<uint8_t>(my_team)) return;
+    const ov::Color col = team_color(team, my_team);
+
+    const float l = static_cast<float>(tx - w * 0.5), r = static_cast<float>(tx + w * 0.5);
+
+    if (cfg.boxes) ov::box(l, ty, r, by, col, 1.4f);
+
+    if (cfg.skeleton) {
+        for (const auto& pr : kPairs) {
+            Vec3d a{}, c{};
+            if (!bone_pos(mesh, pr[0], a) || !bone_pos(mesh, pr[1], c)) continue;
+            float ax, ay, cx, cy;
+            if (!project(v, a, ax, ay) || !project(v, c, cx, cy)) continue;
+            ov::line(ax, ay, cx, cy, 1.3f, col);
         }
     }
 
-    // PEB-based module discovery.
-    // The PEB we want is the TARGET's, reached through the target's EPROCESS.
-    // Reading our own GS-segment PEB pointer and then dereferencing it in the
-    // target's address space would read the wrong address entirely.
-    //
-    // x64 PEB:  Ldr at +0x18  (NOT +0x30 - that is ProcessHeap).
-    // PEB_LDR_DATA: InLoadOrderModuleList at +0x10  (NOT +0x20 - that is
-    // InMemoryOrderModuleList).
-    // LDR_DATA_TABLE_ENTRY: BaseDllName (UNICODE_STRING) length +0x58,
-    // buffer +0x60; DllBase +0x30; SizeOfImage +0x40;
-    // InLoadOrderLinks.Flink +0x00.
-    bool resolve_base() {
-        uint64_t peb{}, ldr{}, head{}, cur{};
-        if (!vmm::kread(vmm::g_eprocess + vmm::g_lay.peb, &peb, sizeof(peb))) return false;
-        if (!ok(peb)) return false;
-        if (!vmm::read(peb + 0x18, &ldr, sizeof(ldr))) return false;      // PEB->Ldr
-        if (!vmm::read(ldr + 0x10, &head, sizeof(head))) return false;     // InLoadOrderModuleList
-        if (!vmm::read(head, &cur, sizeof(cur))) return false;
-
-        for (int g = 0; g < 512 && cur && cur != head; ++g) {
-            uint64_t base{}, size{}, nbuf{};
-            uint16_t nlen{};
-
-            if (!vmm::read(cur + 0x30, &base, sizeof(base))) break;   // DllBase
-            if (!vmm::read(cur + 0x40, &size, sizeof(size))) break;   // SizeOfImage
-            if (!vmm::read(cur + 0x58, &nlen, sizeof(nlen))) break;   // BaseDllName.Length
-            if (!vmm::read(cur + 0x60, &nbuf, sizeof(nbuf))) break;   // BaseDllName.Buffer
-            if (nlen == 0 || nlen > 1024) break;
-
-            wchar_t wname[264]{};
-            const int chars = static_cast<int>(nlen / 2);
-            if (chars > 263) break;
-            if (!vmm::read(nbuf, wname, static_cast<size_t>(nlen))) break;
-
-            if (iequals_ascii(wname, L"FortniteClient-Win64-Shipping.exe")) {
-                vmm::g_base = base;
-                vmm::g_size = size;
-                return true;
-            }
-
-            if (!vmm::read(cur + 0x00, &cur, sizeof(cur))) break;     // InLoadOrderLinks.Flink
+    if (cfg.health) {
+        uint64_t hs{}; float cur{}, max{};
+        if (vmm::rd(pawn + off::Pawn_HealthSet, &hs, sizeof(hs)) && ok(hs)) {
+            vmm::rd(hs + off::Health_Current, &cur, sizeof(cur));
+            vmm::rd(hs + off::Health_Max, &max, sizeof(max));
         }
-        return false;
+        if (max <= 0.f) max = 100.f;
+        float frac = cur / max;
+        if (frac < 0.f) frac = 0.f;
+        if (frac > 1.f) frac = 1.f;
+        ov::fill(l - 6.f, ty, l - 3.f, by, { 0.f, 0.f, 0.f, 0.65f });
+        ov::fill(l - 6.f, by - h * frac, l - 3.f, by,
+            frac > 0.6f ? ov::Color{ 0.30f, 0.90f, 0.30f, 1.f }
+            : frac > 0.3f ? ov::Color{ 1.00f, 0.80f, 0.20f, 1.f }
+            : ov::Color{ 1.00f, 0.25f, 0.25f, 1.f });
     }
 
-    bool build_view(Pov& v) {
-        uint64_t gi{}, arr{}; int count{};
-
-        if (!vmm::read(g_world + off::World_OwningGameInstance, &gi, sizeof(gi)) || !ok(gi)) return false;
-        if (!vmm::read(gi + off::GameInstance_LocalPlayers, &arr, sizeof(arr)) || !ok(arr)) return false;
-        vmm::read(gi + off::GameInstance_LocalPlayers + 8, &count, sizeof(count)); if (count <= 0) return false;
-
-        uint64_t local{}; if (!vmm::read(arr, &local, sizeof(local)) || !ok(local)) return false;
-        if (!vmm::read(local + off::Player_PlayerController, &g_pc, sizeof(g_pc)) || !ok(g_pc)) return false;
-
-        vmm::read(g_pc + off::Controller_PlayerState, &g_my_state, sizeof(g_my_state));
-
-        uint64_t cam{}; if (!vmm::read(g_pc + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) || !ok(cam)) return false;
-
-        const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
-        Vec3d rot{}; double fov{};
-
-        if (!vmm::read(pov + off::POV_Location, &v.loc, sizeof(v.loc))) return false;
-        if (!vmm::read(pov + off::POV_Rotation, &rot, sizeof(rot))) return false;
-        if (!vmm::read(pov + off::POV_FOV, &fov, sizeof(fov)) || fov < 1.0 || fov > 179.0) return false;
-        if (!v.loc.x && !v.loc.y && !v.loc.z) return false;
-
-        const double p = rot.x * kPi / 180.0, y = rot.y * kPi / 180.0;
-        v.fwd   = { cos(p) * cos(y), cos(p) * sin(y), sin(p) };
-        v.right = { -sin(y), cos(y), 0.0 };
-        v.up    = { v.fwd.y * v.right.z - v.fwd.z * v.right.y,
-                    v.fwd.z * v.right.x - v.fwd.x * v.right.z,
-                    v.fwd.x * v.right.y - v.fwd.y * v.right.x };
-
-        v.w = ov::width(); v.h = ov::height(); if (v.w < 8 || v.h < 8) return false;
-        v.focal = (v.w * 0.5) / tan(fov * 0.5 * kPi / 180.0);
-        return true;
+    if (cfg.names && ok(e.state)) {
+        wchar_t nm[32]{};
+        read_name(e.state, nm, 32);
+        if (nm[0]) ov::text(tx - ov::textw(nm, 1.f) * 0.5f, ty - 11.f, nm, col);
     }
 
-    bool project(const Pov& v, const Vec3d& p, float& sx, float& sy) {
-        Vec3d d{ p.x - v.loc.x, p.y - v.loc.y, p.z - v.loc.z };
-        const double vz = d.x * v.fwd.x + d.y * v.fwd.y + d.z * v.fwd.z;
-        if (vz < 10.0) return false;
-        sx = static_cast<float>(v.w * 0.5 + (d.x * v.right.x + d.y * v.right.y + d.z * v.right.z) * v.focal / vz);
-        sy = static_cast<float>(v.h * 0.5 - (d.x * v.up.x   + d.y * v.up.y   + d.z * v.up.z)   * v.focal / vz);
-        return sx > -200.f && sy > -200.f && sx < v.w + 200.f && sy < v.h + 200.f;
+    if (cfg.dist) {
+        wchar_t buf[16]{}; wchar_t tmp[8];
+        int n = 0, k = 0, t = static_cast<int>(metres);
+        if (!t) buf[n++] = L'0';
+        while (t) { tmp[k++] = static_cast<wchar_t>(L'0' + t % 10); t /= 10; }
+        while (k) buf[n++] = tmp[--k];
+        buf[n++] = L'M'; buf[n] = 0;
+        ov::text(tx - 7.f, by + 2.f, buf, { 0.85f, 0.85f, 0.85f, 1.f }, 0.8f);
     }
 
-    void read_name(uint64_t state, wchar_t* dst, size_t cap) {
-        dst[0] = 0; uint64_t data{}; int len{};
-        vmm::read(state + off::State_Name, &data, sizeof(data)); if (!ok(data)) return;
-        vmm::read(state + off::State_Name + 8, &len, sizeof(len)); if (len <= 1 || len > 31) return;
-        wchar_t tmp[32]{};
-        vmm::read(data, tmp, sizeof(wchar_t) * static_cast<size_t>(len - 1)); if (!tmp[0]) return;
-        decode_fstring(tmp, len - 1, dst, static_cast<int>(cap));
-    }
+    if (cfg.lines) ov::line(static_cast<float>(v.w) * 0.5f, static_cast<float>(v.h), tx, by, 1.2f, col);
+}
 
-    ov::Color team_color(int team, int mine) {
-        if (!cfg.team_colors) return { 0.95f, 0.95f, 0.95f, 1.f };
-        if (team == mine) return { 0.30f, 0.90f, 0.40f, 1.f };
-        switch (team & 7) {
-        case 0: return { 1.00f, 0.35f, 0.35f, 1.f };
-        case 1: return { 0.40f, 0.65f, 1.00f, 1.f };
-        case 2: return { 1.00f, 0.85f, 0.30f, 1.f };
-        case 3: return { 0.80f, 0.45f, 1.00f, 1.f };
-        case 4: return { 0.35f, 1.00f, 0.90f, 1.f };
-        default: return { 1.00f, 0.55f, 0.85f, 1.f };
-        }
-    }
+bool refresh_world() {
+    uint64_t engine{}, vp{}, world{};
+    if (!vmm::rd(vmm::base() + off::GEngine, &engine, sizeof(engine)) || !ok(engine)) return false;
+    if (!vmm::rd(engine + off::Engine_GameViewportClient, &vp, sizeof(vp)) || !ok(vp)) return false;
+    if (!vmm::rd(vp + off::Viewport_World, &world, sizeof(world)) || !ok(world)) return false;
+    g_world = world;
+    return true;
+}
 
-    void draw_player(const Pov& v, uint64_t state, int my_team) {
-        uint64_t pawn{}; vmm::read(state + off::State_Pawn, &pawn, sizeof(pawn)); if (!ok(pawn)) return;
+// ACharacter validation without a full IsA: a live character has a mesh, a
+// sane capsule and a finite location. Cheaper than UObject::Class -> UClass
+// -> FName and it rejects the vast majority of non-character actors.
+bool looks_character(uint64_t actor, Vec3d& feet) {
+    if (!ok(actor)) return false;
+    uint64_t mesh{};
+    if (!vmm::rd(actor + off::Pawn_Mesh, &mesh, sizeof(mesh)) || !ok(mesh)) return false;
+    if (!vmm::rd(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet))) return false;
+    if (feet.x != feet.x || feet.y != feet.y || feet.z != feet.z) return false;
+    if (!feet.x && !feet.y && !feet.z) return false;
+    return true;
+}
 
-        uint8_t dying{}; vmm::read(pawn + off::Pawn_Dying, &dying, sizeof(dying)); if (dying & 0x20) return;
-        uint64_t mesh{}; vmm::read(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh)); if (!ok(mesh)) return;
-
-        // ComponentToWorld translation: FTransform { FQuat4d; FVector3d; FVector3d }
-        // FQuat4d is 32 bytes, so Translation is at +0x20 and is 3x double.
-        Vec3d base{};
-        vmm::read(mesh + off::Comp_C2W + off::Xform_Translation, &base, sizeof(base));
-        if (base.x != base.x || base.z != base.z) return;   // NaN guard
-
-        Vec3d d{ base.x - v.loc.x, base.y - v.loc.y, base.z - v.loc.z };
-        const double dist = sqrt(d.x * d.x + d.y * d.y + d.z * d.z) / 100.0;
-        const float metres = static_cast<float>(dist);
-        if (metres > cfg.max_dist) return;
-
-        float half{}; vmm::read(pawn + off::Pawn_CapsuleHalf, &half, sizeof(half));
-        if (half < 10.f || half > 200.f) half = 88.f;
-        const Vec3d top{ base.x, base.y, base.z + half * 2.0 };
-
-        float bx{}, by{}, tx{}, ty{};
-        if (!project(v, base, bx, by) || !project(v, top, tx, ty)) return;
-        const float h = static_cast<float>(by - ty); if (h < 6.f || h > 1600.f) return;
-        const float w = static_cast<float>(h * 0.42);
-
-        // Team is a BYTE, not an int32.
-        uint8_t team{}; vmm::read(state + off::State_Team, &team, sizeof(team));
-        if (!cfg.teammates && team == static_cast<uint8_t>(my_team)) return;
-        const ov::Color col = team_color(team, my_team);
-
-        const float l = static_cast<float>(tx - w * 0.5), r = static_cast<float>(tx + w * 0.5);
-
-        if (cfg.boxes) ov::box(l, ty, r, by, col, 1.4f);
-
-        if (cfg.health) {
-            uint64_t hs{}; float cur{}, max{};
-            vmm::read(pawn + off::Pawn_HealthSet, &hs, sizeof(hs));
-            if (ok(hs)) {
-                float cur_f{}, max_f{};
-                vmm::read(hs + off::Health_Current, &cur_f, sizeof(cur_f));
-                vmm::read(hs + off::Health_Max,     &max_f, sizeof(max_f));
-                cur = cur_f; max = max_f;
-            }
-            if (max <= 0.f) max = 100.f;
-            float frac = cur / max; if (frac < 0.f) frac = 0.f; if (frac > 1.f) frac = 1.f;
-            ov::fill(l - 6.f, ty, l - 3.f, by, { 0.f, 0.f, 0.f, 0.65f });
-            ov::fill(l - 6.f, by - h * frac, l - 3.f, by,
-                frac > 0.6f ? ov::Color{ 0.30f, 0.90f, 0.30f, 1.f }
-                : frac > 0.3f ? ov::Color{ 1.00f, 0.80f, 0.20f, 1.f }
-                : ov::Color{ 1.00f, 0.25f, 0.25f, 1.f });
-        }
-
-        if (cfg.names) {
-            wchar_t nm[32]{}; read_name(state, nm, 32);
-            if (nm[0]) ov::text(tx - ov::textw(nm, 1.f) * 0.5f, ty - 11.f, nm, col);
-        }
-
-        if (cfg.dist) {
-            wchar_t buf[16]{}; int n = 0, t = static_cast<int>(metres);
-            wchar_t tmp[8]; int k = 0;
-            if (!t) buf[n++] = L'0';
-            while (t) { tmp[k++] = static_cast<wchar_t>(L'0' + t % 10); t /= 10; }
-            while (k) buf[n++] = tmp[--k];
-            buf[n++] = L'M'; buf[n] = 0;
-            ov::text(tx - 7.f, by + 2.f, buf, { 0.85f, 0.85f, 0.85f, 1.f }, 0.8f);
-        }
-
-        if (cfg.lines) ov::line(static_cast<float>(v.w) * 0.5f, static_cast<float>(v.h), tx, by, 1.2f, col);
-    }
-
-    // Re-resolve the world pointer from the viewport.
-    // g_world is a raw pointer into the client; a new match, a spectate or a
-    // world transition replaces it, and the old value then points at freed
-    // or reused memory. Resolve it every frame.
-    bool refresh_world() {
-        uint64_t engine{}, vp{}, world{};
-        if (!vmm::read(vmm::base() + off::GEngine, &engine, sizeof(engine)) || !ok(engine)) return false;
-        if (!vmm::read(engine + off::Engine_GameViewportClient, &vp, sizeof(vp)) || !ok(vp)) return false;
-        if (!vmm::read(vp + off::Viewport_World, &world, sizeof(world)) || !ok(world)) return false;
-        g_world = world;
-        return true;
-    }
 } // namespace
 
 bool init() {
     if (!vmm::base() && !resolve_base()) return false;
     if (!refresh_world()) return false;
     uint64_t gs{};
-    vmm::read(g_world + off::World_GameState, &gs, sizeof(gs));
-    if (!ok(gs)) return false;
+    if (!vmm::rd(g_world + off::World_GameState, &gs, sizeof(gs)) || !ok(gs)) return false;
     g_ready = true;
     return true;
 }
 
-void shutdown() { g_ready = false; g_world = 0; g_pc = 0; }
+void shutdown() { g_ready = false; g_world = g_pc = g_my_state = g_my_pawn = 0; }
 bool ready() { return g_ready; }
 
 void draw() {
     if (!g_ready || !cfg.on || !vmm::attached()) return;
-
-    // The world pointer moves between matches - re-resolve it.
     if (!refresh_world()) return;
 
-    Pov v{}; if (!build_view(v)) return;
+    Pov v{};
+    if (!build_view(v)) return;
 
-    uint64_t gs{}, arr{}; int count{};
-    vmm::read(g_world + off::World_GameState, &gs, sizeof(gs)); if (!ok(gs)) return;
-    vmm::read(gs + off::GameState_PlayerArray, &arr, sizeof(arr)); if (!ok(arr)) return;
-    vmm::read(gs + off::GameState_PlayerArray + 8, &count, sizeof(count)); if (count <= 0) return;
-    if (count > off::kMaxPlayers) count = off::kMaxPlayers;
-
-    int my_team{-1};
+    int my_team = -1;
     if (ok(g_my_state)) {
-        uint8_t t{}; vmm::read(g_my_state + off::State_Team, &t, sizeof(t));
+        uint8_t t{};
+        vmm::rd(g_my_state + off::State_Team, &t, sizeof(t));
         my_team = t;
     }
 
+    if (use_actors) {
+        uint64_t level{}, arr{};
+        int count{};
+        if (!vmm::rd(g_world + off::World_PersistentLevel, &level, sizeof(level)) || !ok(level)) return;
+        if (!vmm::rd(level + off::Level_Actors, &arr, sizeof(arr)) || !ok(arr)) return;
+        if (!vmm::rd(level + off::Level_Actors + 8, &count, sizeof(count))) return;
+        if (count <= 0) return;
+        if (count > off::kMaxActors) count = off::kMaxActors;
+
+        for (int i = 0; i < count; ++i) {
+            uint64_t actor{};
+            if (!vmm::rd(arr + static_cast<uint64_t>(i) * 8, &actor, sizeof(actor)) || !ok(actor)) continue;
+            Vec3d feet{};
+            if (!looks_character(actor, feet)) continue;
+            Entity e{ actor, 0 };
+            if (!vmm::rd(actor + off::Pawn_PlayerState, &e.state, sizeof(e.state))) e.state = 0;
+            if (ok(e.state)) {
+                uint8_t flags{};
+                vmm::rd(e.state + off::State_Flags, &flags, sizeof(flags));
+                if (!cfg.bots && (flags & 0x08)) continue;
+                if (flags & 0x02) continue;
+                if (flags & 0x20) continue;
+            }
+            draw_entity(v, e, my_team);
+        }
+        return;
+    }
+
+    uint64_t gs{}, arr{};
+    int count{};
+    if (!vmm::rd(g_world + off::World_GameState, &gs, sizeof(gs)) || !ok(gs)) return;
+    if (!vmm::rd(gs + off::GameState_PlayerArray, &arr, sizeof(arr)) || !ok(arr)) return;
+    if (!vmm::rd(gs + off::GameState_PlayerArray + 8, &count, sizeof(count))) return;
+    if (count <= 0) return;
+    if (count > off::kMaxPlayers) count = off::kMaxPlayers;
+
     for (int i = 0; i < count; ++i) {
-        uint64_t state{}; vmm::read(arr + i * 8, &state, sizeof(state)); if (!ok(state)) continue;
+        uint64_t state{};
+        if (!vmm::rd(arr + static_cast<uint64_t>(i) * 8, &state, sizeof(state)) || !ok(state)) continue;
         if (state == g_my_state) continue;
-        uint8_t flags{}; vmm::read(state + off::State_Flags, &flags, sizeof(flags));
+        uint8_t flags{};
+        vmm::rd(state + off::State_Flags, &flags, sizeof(flags));
         if (!cfg.bots && (flags & 0x08)) continue;
         if (flags & 0x02) continue;
         if (flags & 0x20) continue;
-        draw_player(v, state, my_team);
+        Entity e{ 0, state };
+        if (!vmm::rd(state + off::State_Pawn, &e.pawn, sizeof(e.pawn))) continue;
+        draw_entity(v, e, my_team);
     }
 }
 
-// ---------------------------------------------------------------------------
-// probe: walk the chain step by step and report the first rejection.
-// ---------------------------------------------------------------------------
 bool probe() {
-    auto step = [](const char* what, bool ok) {
-        printf("  %-34s %s\n", what, ok ? "ok" : "<- rejected");
-        return ok;
+    auto step = [](const char* what, bool good) {
+        printf("  %-34s %s\n", what, good ? "ok" : "<- rejected");
+        return good;
     };
 
     printf("chain:\n");
-
     uint64_t engine{};
-    if (!step("GEngine", vmm::read(vmm::base() + off::GEngine, &engine, sizeof(engine)) && ok(engine))) return false;
+    if (!step("GEngine", vmm::rd(vmm::base() + off::GEngine, &engine, sizeof(engine)) && ok(engine))) return false;
 
     uint64_t viewport{};
-    if (!step("Engine->GameViewportClient", vmm::read(engine + off::Engine_GameViewportClient, &viewport, sizeof(viewport)) && ok(viewport))) return false;
+    if (!step("Engine->GameViewportClient", vmm::rd(engine + off::Engine_GameViewportClient, &viewport, sizeof(viewport)) && ok(viewport))) return false;
 
     uint64_t world{};
-    if (!step("Viewport->World", vmm::read(viewport + off::Viewport_World, &world, sizeof(world)) && ok(world))) return false;
+    if (!step("Viewport->World", vmm::rd(viewport + off::Viewport_World, &world, sizeof(world)) && ok(world))) return false;
 
     uint64_t gs{};
-    if (!step("World->GameState", vmm::read(world + off::World_GameState, &gs, sizeof(gs)) && ok(gs))) return false;
+    if (!step("World->GameState", vmm::rd(world + off::World_GameState, &gs, sizeof(gs)) && ok(gs))) return false;
 
     uint64_t gi{};
-    if (!step("World->OwningGameInstance", vmm::read(world + off::World_OwningGameInstance, &gi, sizeof(gi)) && ok(gi))) return false;
+    if (!step("World->OwningGameInstance", vmm::rd(world + off::World_OwningGameInstance, &gi, sizeof(gi)) && ok(gi))) return false;
 
-    uint64_t lp_array{}; int lp_count{};
-    if (!step("GameInstance->LocalPlayers", vmm::read(gi + off::GameInstance_LocalPlayers, &lp_array, sizeof(lp_array)) && ok(lp_array))) return false;
-    vmm::read(gi + off::GameInstance_LocalPlayers + 8, &lp_count, sizeof(lp_count));
-    if (!step("LocalPlayers.Count > 0", lp_count > 0)) return false;
+    uint64_t lp{}; int lpc{};
+    if (!step("GameInstance->LocalPlayers", vmm::rd(gi + off::GameInstance_LocalPlayers, &lp, sizeof(lp)) && ok(lp))) return false;
+    vmm::rd(gi + off::GameInstance_LocalPlayers + 8, &lpc, sizeof(lpc));
+    if (!step("LocalPlayers.Count > 0", lpc > 0)) return false;
 
     uint64_t local{};
-    if (!step("LocalPlayers[0]", vmm::read(lp_array, &local, sizeof(local)) && ok(local))) return false;
+    if (!step("LocalPlayers[0]", vmm::rd(lp, &local, sizeof(local)) && ok(local))) return false;
 
     uint64_t ctrl{};
-    if (!step("LocalPlayer->PlayerController", vmm::read(local + off::Player_PlayerController, &ctrl, sizeof(ctrl)) && ok(ctrl))) return false;
+    if (!step("LocalPlayer->PlayerController", vmm::rd(local + off::Player_PlayerController, &ctrl, sizeof(ctrl)) && ok(ctrl))) return false;
 
     uint64_t mystate{};
-    vmm::read(ctrl + off::Controller_PlayerState, &mystate, sizeof(mystate));
+    vmm::rd(ctrl + off::Controller_PlayerState, &mystate, sizeof(mystate));
     if (!step("Controller->PlayerState", ok(mystate))) return false;
 
     uint64_t cam{};
-    if (!step("Controller->PlayerCameraManager", vmm::read(ctrl + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) && ok(cam))) return false;
-
-    uint64_t cache{};
-    if (!step("CameraManager->CameraCachePrivate", vmm::read(cam + off::Camera_CameraCachePrivate, &cache, sizeof(cache)) && ok(cache))) return false;
+    if (!step("Controller->PlayerCameraManager", vmm::rd(ctrl + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) && ok(cam))) return false;
 
     const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
     Vec3d loc{}, rot{}; double fov{};
-    if (!step("POV.Location", vmm::read(pov + off::POV_Location, &loc, sizeof(loc)))) return false;
-    if (!step("POV.Rotation", vmm::read(pov + off::POV_Rotation, &rot, sizeof(rot)))) return false;
-    if (!step("POV.FOV", vmm::read(pov + off::POV_FOV, &fov, sizeof(fov)) && fov >= 1.0 && fov <= 179.0)) return false;
+    if (!step("POV.Location", vmm::rd(pov + off::POV_Location, &loc, sizeof(loc)))) return false;
+    if (!step("POV.Rotation", vmm::rd(pov + off::POV_Rotation, &rot, sizeof(rot)))) return false;
+    if (!step("POV.FOV", vmm::rd(pov + off::POV_FOV, &fov, sizeof(fov)) && fov >= 1.0 && fov <= 179.0)) return false;
 
     printf("\nPOV: location=(%.1f, %.1f, %.1f) rotation=(%.1f, %.1f, %.1f) fov=%.1f\n",
            loc.x, loc.y, loc.z, rot.x, rot.y, rot.z, fov);
 
     uint64_t arr{}; int count{};
-    if (!step("GameState->PlayerArray", vmm::read(gs + off::GameState_PlayerArray, &arr, sizeof(arr)) && ok(arr))) return false;
-    vmm::read(gs + off::GameState_PlayerArray + 8, &count, sizeof(count));
+    if (!step("GameState->PlayerArray", vmm::rd(gs + off::GameState_PlayerArray, &arr, sizeof(arr)) && ok(arr))) return false;
+    vmm::rd(gs + off::GameState_PlayerArray + 8, &count, sizeof(count));
     if (!step("PlayerArray.Count > 0", count > 0)) return false;
     if (count > off::kMaxPlayers) count = off::kMaxPlayers;
 
@@ -354,27 +424,24 @@ bool probe() {
     int shown = 0;
     for (int i = 0; i < count && shown < 3; ++i) {
         uint64_t state{};
-        if (!vmm::read(arr + i * 8, &state, sizeof(state)) || !ok(state)) continue;
+        if (!vmm::rd(arr + static_cast<uint64_t>(i) * 8, &state, sizeof(state)) || !ok(state)) continue;
         if (state == mystate) continue;
 
         wchar_t nm[32]{}; read_name(state, nm, 32);
-        uint64_t pawn{}; vmm::read(state + off::State_Pawn, &pawn, sizeof(pawn));
-        uint64_t mesh{}; if (ok(pawn)) vmm::read(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh));
-
+        uint64_t pawn{}; vmm::rd(state + off::State_Pawn, &pawn, sizeof(pawn));
+        uint64_t mesh{}; if (ok(pawn)) vmm::rd(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh));
         Vec3d feet{};
-        if (ok(mesh)) vmm::read(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet));
-
-        uint8_t team{}; vmm::read(state + off::State_Team, &team, sizeof(team));
-        uint8_t flags{}; vmm::read(state + off::State_Flags, &flags, sizeof(flags));
+        if (ok(mesh)) vmm::rd(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet));
+        uint8_t team{}; vmm::rd(state + off::State_Team, &team, sizeof(team));
+        uint8_t flags{}; vmm::rd(state + off::State_Flags, &flags, sizeof(flags));
 
         printf("  %d. %-18ls team=%u flags=0x%02x pawn=%s mesh=%s pos=(%.0f, %.0f, %.0f)\n",
                shown + 1, nm[0] ? nm : L"(no name)", (unsigned)team, flags,
-               ok(pawn) ? "yes" : "no", ok(mesh) ? "yes" : "no",
-               feet.x, feet.y, feet.z);
+               ok(pawn) ? "yes" : "no", ok(mesh) ? "yes" : "no", feet.x, feet.y, feet.z);
         ++shown;
     }
     if (!shown) printf("  (none readable)\n");
-
     return true;
 }
+
 } // namespace esp

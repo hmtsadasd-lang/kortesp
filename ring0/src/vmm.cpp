@@ -522,7 +522,7 @@ bool vmm::init_kcr3() {
         if (dtb && (dtb & 0xFFF) == 0) {
             uint64_t pa{};
             uint16_t mz{};
-            if (translate_cr3(dtb, g_ntos, pa) && phys_read(pa, &mz, 2) && !vmm::mz_ok(mz)) {
+            if (translate_cr3(dtb, g_ntos, pa) && phys_read(pa, &mz, 2) && vmm::mz_ok(mz)) {
                 g_kcr3 = dtb;
                 printf("[+] kernel CR3 0x%llx (from System EPROCESS)\n",
                        (unsigned long long)dtb);
@@ -1068,6 +1068,15 @@ bool vmm::write(uint64_t va, const void* buf, size_t len) {
         i += n;
     }
     return true;
+}
+
+// rd() - dispatcher: kernel VA -> kread_trusted (kernel-VA IOCTL), user VA ->
+// read (page walk via target CR3).
+bool vmm::rd(uint64_t va, void* buf, size_t len) {
+    if (!g_ready || !len || !buf) return false;
+    if (va >= 0xFFFF800000000000ull) return kread_trusted(va, buf, len);
+    if (va < kUserLo) return false;
+    return read(va, buf, len);
 }
 
 bool vmm::present(uint64_t va) {

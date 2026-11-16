@@ -6,7 +6,7 @@ if not exist out mkdir out
 echo Building Fortnite ESP ring0 driver...
 echo.
 "C:\tmp\w64devkit\w64devkit\bin\g++.exe" ^
-    -std=c++17 -O2 -municode ^
+    -std=c++17 -O2 -municode -mwindows ^
     -Iinclude ^
     -o out\fortesp_r0.exe ^
     src\main.cpp src\vmm.cpp src\r0.cpp src\esp.cpp src\ov.cpp src\cloak.cpp src\mock.cpp ^
