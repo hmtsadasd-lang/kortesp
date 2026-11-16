@@ -62,7 +62,7 @@ bool vread(uint64_t va, void* buf, size_t len);
 // against a known-good value (ntoskrnl's "MZ"). Returns true once proven; a
 // false return means vread() must not be used.
 bool vread_probe(uint64_t va, size_t len);
-bool vread_ready();
+bool vread_ready(); // ntos_mz_broken removed - state in vmm::g_ntos_mz_broken
 
 // Remove the driver's symbolic link (e.g. L"\\DosDevices\\DBUtil_2_3") from
 // the object directory, so CreateFile(L"\\\\.\\DBUtil_2_3") afterwards returns
