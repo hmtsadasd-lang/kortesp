@@ -71,22 +71,35 @@ int wmain() {
     }
     // ---------------------------------------------------------------
 
-    HWND game = nullptr;
-    for (int i = 0; i < 240 && !game; ++i) {
-        game = FindWindowW(L"UnrealWindow", nullptr);
-        Sleep(500);
-    }
-    if (!game) { printf("no UnrealWindow\n"); return 1; }
+    // Only wait for a window when not probe-only.
+    // --probe needs no window; attach directly so the CR3 is mapped.
+    if (!flags.probe) {
+        HWND game = nullptr;
+        for (int i = 0; i < 240 && !game; ++i) {
+            game = FindWindowW(L"UnrealWindow", nullptr);
+            Sleep(500);
+        }
+        if (!game) { printf("no UnrealWindow\n"); return 1; }
 
-    if (!vmm::attach(kImage)) {
-        printf("process not found\n");
-        // restore cloak before exiting if it was applied
-        if (cloak::active()) cloak::restore();
-        return 1;
+        if (!vmm::attach(kImage)) {
+            printf("process not found\n");
+            // restore cloak before exiting if it was applied
+            if (cloak::active()) cloak::restore();
+            return 1;
+        }
+        printf("attached pid %u\n", vmm::pid());
+    } else {
+        // probe mode: attach directly, no window wait
+        if (!vmm::attach(kImage)) {
+            printf("process not found\n");
+            // restore cloak before exiting if it was applied
+            if (cloak::active()) cloak::restore();
+            return 1;
+        }
+        printf("attached pid %u\n", vmm::pid());
     }
-    printf("attached pid %u\n", vmm::pid());
 
-    if (!ov::init(game)) {
+    if (!ov::init(FindWindowW(L"UnrealWindow", nullptr))) {
         printf("overlay failed\n");
         if (cloak::active()) cloak::restore();
         return 1;

