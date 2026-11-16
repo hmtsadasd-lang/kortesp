@@ -52,19 +52,36 @@ struct CmdFlags {
 // this box.
 // ---------------------------------------------------------------------------
 static void boot_output() {
+    bool opened = false;
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        _wfreopen(L"CONOUT$", L"w", stdout);
-        _dup2(_fileno(stdout), _fileno(stderr));
-        return;
+        if (_wfreopen(L"CONOUT$", L"w", stdout)) {
+            _dup2(_fileno(stdout), _fileno(stderr));
+            opened = true;
+        }
     }
-    wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return;
-    wchar_t* s = wcsrchr(path, L'\\');
-    if (!s) return;
-    *(s + 1) = 0;
-    if (wcslen(path) + 12 < MAX_PATH) wcscat(path, L"fortesp.log");
-    _wfreopen(path, L"w", stdout);
-    _dup2(_fileno(stdout), _fileno(stderr));
+    if (!opened) {
+        wchar_t path[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+            wchar_t* s = wcsrchr(path, L'\\');
+            if (s) {
+                *(s + 1) = 0;
+                if (wcslen(path) + 12 < MAX_PATH) wcscat(path, L"fortesp.log");
+                if (_wfreopen(path, L"w", stdout)) {
+                    _dup2(_fileno(stdout), _fileno(stderr));
+                    opened = true;
+                }
+            }
+        }
+    }
+    if (!opened) {
+        // Last resort: allocate a console so we have somewhere to print.
+        if (AllocConsole()) {
+            _wfreopen(L"CONOUT$", L"w", stdout);
+            _dup2(_fileno(stdout), _fileno(stderr));
+        }
+    }
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
 }
 
 bool raw_read(uint64_t pa, size_t len);

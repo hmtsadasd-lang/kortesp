@@ -57,10 +57,38 @@ bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
 // Target base through the target's own PEB. `vmm::rd` routes the PEB, LDR and
 // name buffers to the target CR3 page walk because they are user VAs.
 bool resolve_base() {
+    // Try EPROCESS.SectionBaseAddress first (kernel memory, no page walk needed).
+    uint64_t section_base{};
+    if (vmm::rd(vmm::g_eprocess + off::Eproc_SectionBase, &section_base, sizeof(section_base)) &&
+        section_base > 0x10000 && section_base <= vmm::kUserHi) {
+        uint16_t mz{};
+        if (vmm::rd(section_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
+            vmm::set_base(section_base, 0);
+            printf("[+] found FortniteClient base 0x%llx (via EPROCESS.SectionBaseAddress)\n",
+                   (unsigned long long)section_base);
+            return true;
+        }
+    }
+
+    // Fallback: PEB -> LDR module walk (requires target CR3 for user-space page walk).
     uint64_t peb{}, ldr{}, head{}, cur{};
-    if (!vmm::rd(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) || !ok(peb)) return false;
-    if (!vmm::rd(peb + off::Peb_Ldr, &ldr, sizeof(ldr)) || !ok(ldr)) return false;
-    if (!vmm::rd(ldr + off::Ldr_InLoadOrder, &head, sizeof(head)) || !ok(head)) return false;
+    if (!vmm::rd(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) || !ok(peb)) {
+        printf("[!] resolve_base: PEB read failed at 0x%llx\n",
+               (unsigned long long)vmm::g_eprocess + off::Eproc_Peb);
+        return false;
+    }
+    printf("[+] PEB 0x%llx\n", (unsigned long long)peb);
+    if (!vmm::rd(peb + off::Peb_Ldr, &ldr, sizeof(ldr)) || !ok(ldr)) {
+        printf("[!] resolve_base: LDR read failed at 0x%llx\n", peb + off::Peb_Ldr);
+        return false;
+    }
+    printf("[+] LDR 0x%llx\n", (unsigned long long)ldr);
+    if (!vmm::rd(ldr + off::Ldr_InLoadOrder, &head, sizeof(head)) || !ok(head)) {
+        printf("[!] resolve_base: InLoadOrder head read failed at 0x%llx\n",
+               ldr + off::Ldr_InLoadOrder);
+        return false;
+    }
+    printf("[+] InLoadOrder head 0x%llx\n", (unsigned long long)head);
     if (!vmm::rd(head, &cur, sizeof(cur))) return false;
 
     for (int g = 0; g < 512 && cur && cur != head; ++g) {
@@ -79,6 +107,8 @@ bool resolve_base() {
 
         if (iequals_ascii(wname, L"FortniteClient-Win64-Shipping.exe")) {
             vmm::set_base(base, size);
+            printf("[+] found FortniteClient base 0x%llx size 0x%llx\n",
+                   (unsigned long long)base, (unsigned long long)size);
             return true;
         }
         if (!vmm::rd(cur, &cur, sizeof(cur))) break;
@@ -305,11 +335,23 @@ bool looks_character(uint64_t actor, Vec3d& feet) {
 } // namespace
 
 bool init() {
-    if (!vmm::base() && !resolve_base()) return false;
-    if (!refresh_world()) return false;
+    if (!vmm::base() && !resolve_base()) {
+        printf("[!] resolve_base failed\n");
+        return false;
+    }
+    printf("[+] client base 0x%llx size 0x%llx\n", (unsigned long long)vmm::base(), (unsigned long long)vmm::size());
+    if (!refresh_world()) {
+        printf("[!] refresh_world failed\n");
+        return false;
+    }
+    printf("[+] world 0x%llx\n", (unsigned long long)g_world);
     if (!use_actors) {
         uint64_t gs{};
-        if (!vmm::rd(g_world + off::World_GameState, &gs, sizeof(gs)) || !ok(gs)) return false;
+        if (!vmm::rd(g_world + off::World_GameState, &gs, sizeof(gs)) || !ok(gs)) {
+            printf("[!] World->GameState failed\n");
+            return false;
+        }
+        printf("[+] gamestate 0x%llx\n", (unsigned long long)gs);
     }
     g_ready = true;
     return true;

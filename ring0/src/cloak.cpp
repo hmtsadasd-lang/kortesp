@@ -87,7 +87,7 @@ bool find_our_driver() {
         uint64_t cur_flink{};
         if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
         uint64_t name_buf{};
-        if (!vmm::kread_trusted(cur + 0x58, &name_buf, 8)) break;
+        if (!vmm::kread_trusted(cur + 0x60, &name_buf, 8)) break;
         if (!name_buf || name_buf < 0xFFFF800000000000ull) break;
         wchar_t wname[128]{};
         if (!vmm::kread_trusted(name_buf, wname, sizeof(wname) - 2)) break;

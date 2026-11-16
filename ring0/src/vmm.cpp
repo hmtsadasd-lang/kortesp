@@ -216,7 +216,9 @@ uint64_t vmm::phys_ram_end() {
 // or, worse, hang on a powered-down BAR.
 static bool phys_read(uint64_t pa, void* buf, size_t len) {
     if (!len) return false;
-    if (!vmm::phys_is_ram(pa, len)) return false;
+    // When the RAM map is derived (not exact), page table pages may live in
+    // reserved ranges excluded from the loader list. Be permissive in that case.
+    if (!vmm::phys_is_ram(pa, len) && vmm::phys_map_exact()) return false;
     return r0::pread(pa, buf, len);
 }
 
@@ -917,16 +919,31 @@ bool vmm::attach(const wchar_t* image_name) {
     char want[256]{};
     for (int i = 0; i < 255 && image_name[i]; ++i)
         want[i] = static_cast<char>(image_name[i] > 0x7F ? '?' : image_name[i]);
+    want[14] = 0;  // EPROCESS.ImageFileName is char[15] (14 chars + null)
+
+    printf("[DEBUG] attach: looking for '%.14s'\n", want);
 
     uint64_t cur = g_eprocess;
     for (int guard = 0; guard < 4096; ++guard) {
         uint64_t flink{};
-        if (!kread(cur + g_lay.links, &flink, 8) || !flink) break;
+        if (!kread_trusted(cur + g_lay.links, &flink, 8) || !flink) {
+            printf("[DEBUG] attach: kread_trusted(links) failed at 0x%llx\n", (unsigned long long)cur);
+            break;
+        }
         cur = flink - g_lay.links;
 
         uint64_t pid{}; char name[256]{};
-        if (!kread(cur + g_lay.pid, &pid, 8)) break;
-        if (!kread(cur + g_lay.name, name, sizeof(name))) break;
+        if (!kread_trusted(cur + g_lay.pid, &pid, 8)) {
+            printf("[DEBUG] attach: kread_trusted(pid) failed at 0x%llx\n", (unsigned long long)cur);
+            break;
+        }
+        if (!kread_trusted(cur + g_lay.name, name, sizeof(name))) {
+            printf("[DEBUG] attach: kread_trusted(name) failed at 0x%llx\n", (unsigned long long)cur);
+            break;
+        }
+
+        printf("[DEBUG] attach: PID=%llu Name='%.15s'\n",
+               (unsigned long long)pid, name);
 
         constexpr size_t kEprocNameMax = 15;
         size_t wl = strlen(want);
@@ -935,17 +952,27 @@ bool vmm::attach(const wchar_t* image_name) {
         if (pid == 0 || pid == 4) continue;
 
         uint64_t dtb{};
-        if (!kread(cur + g_lay.dtb, &dtb, 8)) continue;
+        if (!kread_trusted(cur + g_lay.dtb, &dtb, 8)) {
+            printf("[DEBUG] attach: kread_trusted(dtb) failed at 0x%llx\n", (unsigned long long)cur);
+            continue;
+        }
         dtb &= kPteMask;
-        if (!dtb || !phys_is_ram(dtb, 0x1000)) continue;
+        if (!dtb || !phys_is_ram(dtb, 0x1000)) {
+            printf("[DEBUG] attach: DTB invalid 0x%llx at 0x%llx\n", (unsigned long long)dtb, (unsigned long long)cur);
+            continue;
+        }
 
-        if (!peb_has_module(cur, dtb, want)) continue;
+        // PEB module verification requires target CR3 (page walk into user space).
+        // Without CR3 we trust the ImageFileName match; PEB check is skipped.
+        if (g_kcr3 && !peb_has_module(cur, dtb, want)) continue;
 
         g_gcr3 = dtb;
         g_eprocess = cur;
         g_pid  = static_cast<uint32_t>(pid);
         g_ready = true;
         ++g_stamp;
+        printf("[DEBUG] attach: FOUND Fortnite at 0x%llx PID=%u DTB=0x%llx\n",
+               (unsigned long long)cur, g_pid, (unsigned long long)dtb);
         return true;
     }
     return false;

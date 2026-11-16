@@ -99,6 +99,7 @@ constexpr uintptr_t Eproc_Name  = 0x338;   // VERIFIED - char[15]
 constexpr uintptr_t Eproc_Dtb   = 0x28;    // VERIFIED
 constexpr uintptr_t Eproc_Peb   = 0x2E0;   // VERIFIED
 constexpr uintptr_t Eproc_Token = 0x248;   // UNVERIFIED, unused (read-only)
+constexpr uintptr_t Eproc_SectionBase = 0x3F8;  // UNVERIFIED - KPROCESS.SectionBaseAddress (user image base)
 
 // ---- PEB / LDR ---------------------------------------------------------
 constexpr uintptr_t Peb_Ldr  = 0x18;   // VERIFIED - PEB_LDR_DATA*
