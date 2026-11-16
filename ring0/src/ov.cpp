@@ -267,5 +267,7 @@ void text(float x, float y, const wchar_t* s, Color c, float sc) {
 float textw(const wchar_t* s, float sc) { return static_cast<float>(wcslen(s)) * 6.f * sc; }
 int width() { return g_w; }
 int height() { return g_h; }
+int pending() { return g_n; }
+void set_surface(int w, int h) { g_w = w; g_h = h; }
 
 } // namespace

@@ -56,7 +56,9 @@ constexpr uintptr_t Pawn_CapsuleHalf = 0x1E8C;  // VERIFIED - float
 // ---- USceneComponent ----------------------------------------------------
 constexpr uintptr_t Comp_C2W         = 0x100;   // VERIFIED - FTransform, sits in the 0x100..0x140 gap
 // ComponentTransform (RelativeTransform) is at 0x0; Comp_C2W + 0x10 gives Translation.
-constexpr uintptr_t Xform_Translation = 0x10;   // VERIFIED - FTransform.Translation (3x double)
+// UE vectors are float[3] (not double[3]) - the old code read 24 bytes and
+// got garbage in the upper components.
+constexpr uintptr_t Xform_Translation = 0x10;   // VERIFIED - FTransform.Translation (3x float)
 
 // ---- UFortHealthSet (FFortGameplayAttributeData) ------------------------
 constexpr uintptr_t Health_Current = 0x48 + 0x4;  // VERIFIED - CurrentValue

@@ -23,9 +23,10 @@ inline constexpr uint64_t kPteMask  = 0x000FFFFFFFFFF000ull;
 inline constexpr size_t kTlbSize    = 16;
 
 struct TlbEntry {
-    uint64_t page;
-    uint64_t phys;
-    uint32_t stamp;
+    uint64_t page;   // VA page base
+    uint64_t phys;   // PA page base
+    uint64_t cr3;    // owning CR3 - a scan walks many CR3s at the same VA
+    uint32_t stamp;  // bumped on attach/detach
 };
 extern std::array<TlbEntry, kTlbSize> g_tlb;
 extern uint32_t g_stamp;
@@ -36,7 +37,8 @@ extern uint64_t  g_gcr3;
 extern uint64_t  g_base;
 extern uint64_t  g_size;
 extern uint64_t  g_eprocess;
-extern uint64_t  g_ntos;      // ntoskrnl base, for export resolution
+extern uint64_t  g_ntos;      // ntoskrnl base
+extern uint64_t  g_ntos_size; // ntoskrnl image size
 extern uint32_t  g_pid;
 extern bool      g_ready;
 extern bool      g_attached;
@@ -44,14 +46,15 @@ extern bool      g_attached;
 // Layout for EPROCESS field walks
 struct Layout {
     uint64_t pid;
-    uint64_t links;
-    uint64_t name;
-    uint64_t dtb;
+    uint64_t links;   // offset of the LIST_ENTRY inside the EPROCESS
+    uint64_t name;    // ImageFileName
+    uint64_t dtb;     // DirectoryTableBase
+    uint64_t peb;     // PEB
 };
 extern Layout g_lay;
 
 // Public API
-bool init();
+bool init();                  // ntoskrnl base + kernel CR3 + System EPROCESS
 void shutdown();
 
 bool attach(const wchar_t* image_name);

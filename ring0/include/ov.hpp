@@ -23,4 +23,14 @@ void text(float x, float y, const wchar_t* s, Color c, float scale = 1.f);
 float textw(const wchar_t* s, float scale = 1.f);
 int width();
 int height();
+
+// Number of vertices staged since the last begin(). Lets a test assert that
+// the ESP actually emitted geometry without needing a visible window.
+int pending();
+
+// Force the drawing surface size. The real path derives it from the game
+// window client rect in tick(); this is the seam the lab mock uses so no
+// window or D3D device is required.
+void set_surface(int w, int h);
+
 } // namespace ov
