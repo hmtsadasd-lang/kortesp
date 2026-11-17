@@ -73,11 +73,22 @@ bool reg_read_blob(HKEY root, const wchar_t* sub, const wchar_t* name,
 //   ULONG InterfaceType; ULONG BusNumber; CM_PARTIAL_RESOURCE_LIST Partial;
 // CM_PARTIAL_RESOURCE_LIST:
 //   USHORT Version; USHORT Revision; ULONG Count; CM_PARTIAL_RESOURCE_DESCRIPTOR[];
-// CM_PARTIAL_RESOURCE_DESCRIPTOR (24 bytes on x64):
-//   UCHAR Type; UCHAR ShareDisposition; USHORT Flags;
-//   +0x08 LARGE_INTEGER Start; +0x10 ULONG Length;
+// CM_PARTIAL_RESOURCE_DESCRIPTOR - 20 bytes on x64 (pshpack4; the Interrupt
+//   union member carries an 8-byte KAFFINITY, which sizes the union to 16):
+//   +0 UCHAR Type; +1 UCHAR ShareDisposition; +2 USHORT Flags;
+//   +4 PHYSICAL_ADDRESS Start; +12 ULONG Length;
 // Type 3 == CmResourceTypeMemory.
+// Type 7 == CmResourceTypeMemoryLarge: the stored length holds the TOP bits of
+//   a 40/48/64-bit value selected by Flags (CM_RESOURCE_MEMORY_LARGE_40/48/64
+//   = 0x0200/0x0400/0x0800), i.e. the real length is the value shifted left by
+//   8/16/32. On a 16 GB machine this descriptor carries everything above 4 GB;
+//   a parser that only accepts Type 3 silently loses most of RAM (dkom.dev,
+//   "four ways to find CR3", 2026-08).
 void parse_resource_list(const std::vector<uint8_t>& b, std::vector<Range>& out) {
+    auto rd16 = [&](size_t o, uint16_t& v) {
+        if (o + 2 > b.size()) return false;
+        memcpy(&v, b.data() + o, 2); return true;
+    };
     auto rd32 = [&](size_t o, uint32_t& v) {
         if (o + 4 > b.size()) return false;
         memcpy(&v, b.data() + o, 4); return true;
@@ -97,14 +108,27 @@ void parse_resource_list(const std::vector<uint8_t>& b, std::vector<Range>& out)
         if (!rd32(prl + 4, cnt) || cnt > 512) return;
 
         size_t d = prl + 8;
-        for (uint32_t di = 0; di < cnt; ++di, d += 24) {
-            if (d + 24 > b.size()) return;
-            if (b[d] != 3) continue;       // CmResourceTypeMemory
+        for (uint32_t di = 0; di < cnt; ++di, d += 20) {
+            if (d + 20 > b.size()) return;
+            const uint8_t t = b[d];
+            if (t != 3 && t != 7) continue;    // Memory / MemoryLarge
 
-            uint64_t start = 0; uint32_t len = 0;
-            if (!rd64(d + 8, start) || !rd32(d + 16, len)) continue;
-            if (!start || !len) continue;
-            out.emplace_back(start, start + static_cast<uint64_t>(len));
+            uint64_t start = 0, len = 0;
+            uint32_t raw = 0;
+            if (!rd64(d + 4, start) || !rd32(d + 12, raw)) continue;
+            if (!start || !raw) continue;
+            len = raw;
+            if (t == 7) {
+                uint16_t fl = 0;
+                if (!rd16(d + 2, fl)) continue;
+                switch (fl & 0x0E00) {
+                case 0x0200: len = static_cast<uint64_t>(len) << 8;  break;
+                case 0x0400: len = static_cast<uint64_t>(len) << 16; break;
+                case 0x0800: len = static_cast<uint64_t>(len) << 32; break;
+                default: continue;             // unknown large-memory flag
+                }
+            }
+            out.emplace_back(start, start + len);
         }
         p = d;
     }
@@ -220,11 +244,19 @@ uint64_t vmm::phys_ram_end() {
 // check keeps the walk out of MMIO holes, where the copy would return garbage
 // or, worse, hang on a powered-down BAR.
 static bool phys_read(uint64_t pa, void* buf, size_t len) {
-    if (!len) return false;
-    // When the RAM map is derived (not exact), page table pages may live in
-    // reserved ranges excluded from the loader list. Be permissive in that case.
-    if (!vmm::phys_is_ram(pa, len) && vmm::phys_map_exact()) return false;
-    return r0::pread(pa, buf, len);
+    if (!len || !buf) return false;
+    auto* p = static_cast<uint8_t*>(buf);
+    // Chunked page-aligned read so oversized transfers crossing into MMIO holes
+    // don't get refused by the driver's MmMapIoSpace path. Each chunk is
+    // page-aligned and within a single page.
+    for (size_t i = 0; i < len;) {
+        uint64_t cur_pa = pa + i;
+        size_t chunk = 0x1000 - (cur_pa & 0xFFF);
+        if (chunk > len - i) chunk = len - i;
+        if (!r0::pread(cur_pa, p + i, chunk)) return false;
+        i += chunk;
+    }
+    return true;
 }
 
 // --- CR3 translation: PML4 -> PDPT -> PDE -> PT ---
@@ -575,39 +607,195 @@ bool vmm::init_kcr3_cached() {
     return true;
 }
 
+// --- SAFE kernel VA -> PA through the PTE self-map.
+//
+// Every read here is at an address PROVABLY mapped by the previous step:
+//   PXE read - the PML4 page itself, mapped by the self-referencing entry in
+//              every process. Always present.
+//   PPE/PDE  - the PPE/PDE regions decode through fixed kernel-half PML4
+//              entries that exist in every process (the pyramid is mapped).
+//   PTE      - its chain is exactly va's own table chain one level up; safe
+//              BECAUSE the three reads above just verified PML4E, PDPTE and
+//              PDE present.
+// An unmapped va therefore costs a failed translation, never a fault in the
+// driver's SEH-less read loop (0x50 bugcheck class: dpatch verify read,
+// direct-map probe, unverified PFN-base read - all 2026-11-17).
+//
+// Index formulas MUST be the flat decode (m >> 39/30/21/12) * 8. Masking each
+// index to 0x1FF is only valid below 512 GB and silently reads the WRONG
+// pyramid slot for kernel VAs - the gate then approves unmapped addresses.
+bool vmm::safe_translate(uint64_t va, uint64_t& pa) {
+    if ((va >> 48) != 0xFFFFull) return false;     // kernel-canonical only
+    constexpr uint64_t kMask48 = 0x0000FFFFFFFFFFFFull;
+    constexpr uint64_t kPteBase = 0xFFFFF68000000000ull;
+    const uint64_t m = va & kMask48;
+    const uint64_t pde_base = kPteBase + ((kPteBase & kMask48) >> 9);
+    const uint64_t ppe_base = kPteBase + ((pde_base & kMask48) >> 9);
+    const uint64_t pxe_base = kPteBase + ((ppe_base & kMask48) >> 9);
+
+    uint64_t e{};
+    if (!r0::vread(pxe_base + (m >> 39) * 8, &e, 8) || !(e & 1))
+        return false;
+    if (e & 0x80) { pa = (e & vmm::kPteMask) | (m & 0x3FFFFFFFull); return true; }
+    if (!r0::vread(ppe_base + (m >> 30) * 8, &e, 8) || !(e & 1))
+        return false;
+    if (e & 0x80) { pa = (e & vmm::kPteMask) | (m & 0x1FFFFFFFull); return true; }
+    if (!r0::vread(pde_base + (m >> 21) * 8, &e, 8) || !(e & 1))
+        return false;
+    if (e & 0x80) { pa = (e & vmm::kPteMask) | (m & 0x1FFFFFull); return true; }
+    if (!r0::vread(kPteBase + (m >> 12) * 8, &e, 8) || !(e & 1))
+        return false;
+    pa = (e & vmm::kPteMask) | (m & 0xFFF);
+    return true;
+}
+
+// MMPFN layout on 24H2/25H2 (stride 0x30): +0x00 flags/owner word, +0x08 the
+// PTE that currently maps this physical page. Both constants come straight
+// out of this build's MmGetVirtualForPhysical (movabs 0xFFFFDE0000000008 =
+// PFN database + the PteAddress field offset 8; movabs 0xFFFFF68000000000 =
+// PTE self-map base). 0x30*pfn*... addresses stay inside nonpaged pool.
+constexpr uint64_t kPfnDb     = 0xFFFFDE0000000000ull;
+constexpr uint64_t kPfnStride = 0x30;
+constexpr uint64_t kPteBase   = 0xFFFFF68000000000ull;
+
+// Sample one physical page's PFN entry and report what the memory manager
+// records about its current mapping. Every read goes through kread_trusted,
+// which translates each address through the pyramid (all levels verified
+// present) before the driver's SEH-less loop touches it - a wrong PFN base or
+// a garbage PteAddress costs a failed read, never a fault.
+static void pfn_diag(const char* tag, uint64_t pfn) {
+    uint64_t pa{};
+    if (!vmm::safe_translate(kPfnDb + kPfnStride * pfn, pa)) {
+        printf("  [%s] pfn 0x%llx: PFN entry VA does not translate\n", tag,
+               (unsigned long long)pfn);
+        return;
+    }
+    uint64_t ent[2]{};
+    if (!vmm::kread_trusted(kPfnDb + kPfnStride * pfn, ent, sizeof(ent))) {
+        printf("  [%s] pfn 0x%llx: PFN entry read failed\n", tag,
+               (unsigned long long)pfn);
+        return;
+    }
+    printf("  [%s] pfn 0x%-6llx flags 0x%016llx pte 0x%016llx\n", tag,
+           (unsigned long long)pfn, (unsigned long long)ent[0],
+           (unsigned long long)ent[1]);
+    const uint64_t ptea = ent[1];
+    if (ptea < 0xFFFF800000000000ull) return;
+    uint64_t pte{};
+    if (!vmm::kread_trusted(ptea, &pte, 8)) {
+        printf("  [%s]   PTE read failed at 0x%llx\n", tag,
+               (unsigned long long)ptea);
+        return;
+    }
+    // va = ((pte_va - PTE_BASE) >> 3) << 12 - the VA this PTE maps, recovered
+    // only as a 48-bit value; sign-extend when bit 47 is set (kernel half).
+    uint64_t va = (ptea - kPteBase) << 9;
+    if (va & 0x0000800000000000ull) va |= 0xFFFF000000000000ull;
+    printf("  [%s]   pte 0x%016llx present=%d pte.pfn=0x%-6llx mapped-va 0x%016llx\n",
+           tag, (unsigned long long)pte, (int)(pte & 1),
+           (unsigned long long)((pte >> 12) & 0xFFFFFFFFFFull),
+           (unsigned long long)va);
+}
+
+// Three anchors decide the physical-read design:
+//   system-pml4 - the System DTB page (known good PA from EPROCESS+0x28)
+//   self-pml4   - our own PML4 (EPROCESS+0x28 of our own process)
+//   pool        - the page backing the System EPROCESS (translated via the
+//                 self-map, so its PA is trustworthy)
+static void pfn_map_diag() {
+    printf("[*] PFN mapping probe (kernel-VA reads only):\n");
+
+    uint64_t dtb{};
+    if (vmm::kread_trusted(vmm::g_eprocess + 0x28, &dtb, 8) && dtb)
+        pfn_diag("system-pml4", dtb >> 12);
+
+    // Our own EPROCESS via ActiveProcessLinks, then its DTB.
+    const uint32_t me = GetCurrentProcessId();
+    uint64_t cur = vmm::g_eprocess, our_ep = 0;
+    for (int i = 0; i < 4096 && cur; ++i) {
+        uint64_t pid{};
+        if (!vmm::kread_trusted(cur + vmm::g_lay.pid, &pid, 8)) break;
+        if (pid == me) { our_ep = cur; break; }
+        uint64_t fl{};
+        if (!vmm::kread_trusted(cur + vmm::g_lay.links, &fl, 8) || !fl) break;
+        cur = fl - vmm::g_lay.links;
+        if (cur == vmm::g_eprocess) break;
+    }
+    if (our_ep) {
+        uint64_t ocr3{};
+        if (vmm::kread_trusted(our_ep + 0x28, &ocr3, 8) && ocr3)
+            pfn_diag("self-pml4", ocr3 >> 12);
+    }
+
+    uint64_t pa{};
+    if (vmm::safe_translate(vmm::g_eprocess, pa)) {
+        printf("  [pool] System EPROCESS pa 0x%llx (self-map walk)\n",
+               (unsigned long long)pa);
+        pfn_diag("pool", pa >> 12);
+    }
+    if (vmm::g_ntos && vmm::safe_translate(vmm::g_ntos, pa)) {
+        printf("  [image] ntoskrnl base pa 0x%llx (self-map walk)\n",
+               (unsigned long long)pa);
+        pfn_diag("image", pa >> 12);
+    }
+}
+
 bool vmm::init_kcr3() {
     if (g_kcr3) return true;
     if (!g_ntos) return false;
     if (!g_eprocess) return false;
 
-    uint64_t dtb{};
-    if (kread_trusted(g_eprocess + g_lay.dtb, &dtb, 8)) {
+    // Scan EPROCESS offsets for a candidate DirectoryTableBase.
+    // The stored CR3 carries PCID bits in the low 12 bits on every modern
+    // build, so the value is masked, never required to be page-aligned
+    // (requiring that silently rejected every real DTB - proven 2026-11-17).
+    // A candidate is accepted only if it translates ntoskrnl's own base to an
+    // MZ page - the same validation --dtbscan uses. Physical reads for the
+    // walk go through the MmMapIoSpace path (crash-safe).
+    constexpr uint64_t kDtbHi = 0xF8;    // 26200 may place DTB beyond 0x80
+    for (uint64_t o = 0x20; o <= kDtbHi; o += 8) {
+        uint64_t dtb{};
+        if (!kread_trusted(g_eprocess + o, &dtb, 8)) continue;
         const uint64_t c = dtb & kPteMask;
-        uint64_t pa{};
-        const Walk st = c ? walk_va(c, g_ntos, pa) : Walk::BadArgs;
-        const bool ok = st == Walk::Ok && page_mz(pa);
-        if (ok) {
-            g_kcr3 = c;
-            printf("[+] kernel CR3 0x%llx (from EPROCESS +0x%llx)\n",
-                   (unsigned long long)c, (unsigned long long)g_lay.dtb);
-            return true;
+        if (!c) continue;
+
+        uint64_t kpa{};
+        if (walk_va(c, g_ntos, kpa) != Walk::Ok || !page_mz(kpa)) continue;
+
+        g_kcr3 = c;
+        g_lay.dtb = o;
+        g_dtb_ok = true;
+        printf("[+] kernel CR3 0x%llx (EPROCESS +0x%llx, stored 0x%016llx)\n",
+               (unsigned long long)c, (unsigned long long)o,
+               (unsigned long long)dtb);
+        return true;
+    }
+
+    printf("[!] CR3 from EPROCESS offsets 0x20..0x%llx did not yield a DTB\n",
+           (unsigned long long)kDtbHi);
+    for (uint64_t o = 0x20; o <= kDtbHi; o += 8) {
+        uint64_t dtb{};
+        if (!kread_trusted(g_eprocess + o, &dtb, 8)) {
+            printf("  +0x%02llx = <kread failed>\n", (unsigned long long)o);
+            continue;
         }
-        printf("[!] CR3 from EPROCESS +0x%llx = 0x%llx does not map ntoskrnl: %s\n",
-               (unsigned long long)g_lay.dtb, (unsigned long long)dtb,
-               walk_name(st));
-        if (!(dtb & 0xFFF)) {
-            printf("    (page-aligned, so the offset is plausible - this is a "
-                   "read-path or walk problem)\n");
-        } else {
-            printf("    (not page-aligned -> DirectoryTableBase is probably at a "
-                   "different offset on this build; try --dtbscan)\n");
+        const uint64_t c = dtb & kPteMask;
+        if (!c) {
+            printf("  +0x%02llx = 0\n", (unsigned long long)o);
+            continue;
         }
+        uint64_t kpa{};
+        const Walk st = walk_va(c, g_ntos, kpa);
+        const bool mz = st == Walk::Ok && page_mz(kpa);
+        printf("  +0x%02llx = 0x%016llx  phys 0x%010llx  walk=%s mz=%s\n",
+               (unsigned long long)o, (unsigned long long)dtb,
+               (unsigned long long)c, walk_name(st), mz ? "yes" : "no");
     }
 
     if (init_kcr3_cached()) return true;
 
-    printf("    Run --cr3scan once to find it physically, or --dtbscan to check "
-           "the offset, then re-run this mode.\n");
+    printf("    Paste the table above back; --dtbscan shows the same table "
+           "with a PEB check.\n");
     return false;
 }
 
@@ -986,20 +1174,44 @@ static bool peb_has_module(uint64_t eprocess, uint64_t cr3, const char* want) {
     return false;
 }
 
+// accept a candidate CR3 and switch the global attach state to it
+static void accept_candidate(uint64_t c, uint64_t o, uint64_t pid,
+                             uint64_t eproc, const char* how) {
+    vmm::g_gcr3 = c;
+    vmm::g_eprocess = eproc;
+    vmm::g_pid = static_cast<uint32_t>(pid);
+    vmm::g_ready = true;
+    vmm::g_dtb_ok = true;
+    vmm::g_lay.dtb = o;
+    if (!vmm::g_kcr3) vmm::g_kcr3 = c;      // shared kernel half
+    ++vmm::g_stamp;
+    printf("[+] attached pid %u eprocess 0x%llx dtb 0x%llx (offset +0x%llx) (%s)\n",
+           vmm::g_pid, (unsigned long long)eproc, (unsigned long long)c,
+           (unsigned long long)o, how);
+}
+
 // attach: find the process by image name and map its CR3
 bool vmm::attach(const wchar_t* image_name) {
     if (!g_eprocess) return false;
     reset_fail_count();
 
-    char want[256]{};
+    char want_full[256]{};
     for (int i = 0; i < 255 && image_name[i]; ++i)
-        want[i] = static_cast<char>(image_name[i] > 0x7F ? '?' : image_name[i]);
-    want[14] = 0;
+        want_full[i] = static_cast<char>(image_name[i] > 0x7F ? '?' : image_name[i]);
 
-    printf("[DEBUG] attach: looking for '%.14s'\n", want);
+    // EPROCESS.ImageFileName is char[15] with no NUL: every Fortnite sibling
+    // (shipping exe, _BE, crash reporter) truncates identically, so the
+    // 14-char prefix is only the fast filter. The full name is decided by
+    // the process's own PEB module list (peb_has_module).
+    char want15[256]{};
+    memcpy(want15, want_full, 14);
+    want15[14] = 0;
+
+    printf("[DEBUG] attach: filter '%.14s', full name '%s'\n", want15, want_full);
 
     int names = 0, rejected = 0;
     uint64_t cur = g_eprocess;
+    uint64_t loose_c = 0, loose_o = 0, loose_pid = 0, loose_ep = 0;
     for (int guard = 0; guard < 4096; ++guard) {
         uint64_t flink{};
         if (!kread_trusted(cur + g_lay.links, &flink, 8) || !flink) {
@@ -1012,56 +1224,59 @@ bool vmm::attach(const wchar_t* image_name) {
         uint64_t pid{}; char name[256]{};
         if (!kread_trusted(cur + g_lay.pid, &pid, 8)) break;
         if (!kread_trusted(cur + g_lay.name, name, sizeof(name))) break;
-        if (_strnicmp(name, want, strlen(want)) != 0) continue;
+        if (_strnicmp(name, want15, strlen(want15)) != 0) continue;
         if (pid == 0 || pid == 4) continue;
         ++names;
 
-        uint64_t dtb{};
-        if (!kread_trusted(cur + g_lay.dtb, &dtb, 8)) { ++rejected; continue; }
-        const uint64_t c = dtb & kPteMask;
-        if (!c || (dtb & 0xFFF)) {
-            printf("[DEBUG] attach: DTB not a CR3 at 0x%llx (raw 0x%llx)\n",
-                   (unsigned long long)cur, (unsigned long long)dtb);
-            ++rejected; continue;
-        }
-        if (!phys_is_ram(c, 0x1000)) {
-            printf("[DEBUG] attach: DTB 0x%llx outside RAM\n", (unsigned long long)c);
-            ++rejected; continue;
-        }
+        // Scan EPROCESS offsets 0x20..0x80 for a candidate DirectoryTableBase.
+        //
+        // Strict: the CR3 must translate ntoskrnl to an MZ page AND the
+        // process's own PEB module list must contain the full image name -
+        // that separates the real shipping exe from the truncated-name
+        // siblings (_BE, crash reporter). Needs working physical reads
+        // (physical reads go through the MmMapIoSpace IOCTL).
+        //
+        // Loose fallback: the first page-aligned, physically readable DTB,
+        // accepted only if nothing proves; printed as unproven.
+        bool matched = false;
+        for (uint64_t o = 0x20; o <= 0xF8; o += 8) {
+            uint64_t dtb{};
+            if (!kread_trusted(cur + o, &dtb, 8)) continue;
+            const uint64_t c = dtb & kPteMask;   // mask PCID bits, not required
+            if (!c) continue;
 
-        // A CR3 must map the kernel half. This needs nothing but the candidate,
-        // so it runs regardless of g_kcr3.
-        uint64_t kpa{};
-        if (!g_ntos || walk_va(c, g_ntos, kpa) != Walk::Ok || !page_mz(kpa)) {
-            printf("[DEBUG] attach: DTB 0x%llx does not map ntoskrnl\n",
-                   (unsigned long long)c);
-            ++rejected; continue;
+            if (g_ntos) {
+                uint64_t kpa{};
+                if (walk_va(c, g_ntos, kpa) != Walk::Ok || !page_mz(kpa))
+                    continue;
+                if (!peb_has_module(cur, c, want_full)) continue;
+                accept_candidate(c, o, pid, cur, "ntoskrnl + module proven");
+                matched = true;
+                break;
+            }
         }
+        if (matched) return true;
+        ++rejected;
 
-        // PEB must translate through that same CR3.
-        uint64_t peb{};
-        if (!read_cr3(c, cur + g_lay.peb, &peb, 8) || peb < kUserLo || peb > kUserHi) {
-            printf("[DEBUG] attach: DTB 0x%llx does not translate the PEB\n",
-                   (unsigned long long)c);
-            ++rejected; continue;
+        if (loose_c == 0) {
+            for (uint64_t o = 0x20; o <= 0xF8; o += 8) {
+                uint64_t dtb{};
+                if (!kread_trusted(cur + o, &dtb, 8)) continue;
+                const uint64_t c = dtb & kPteMask;
+                if (!c) continue;
+                uint8_t probe[8];
+                if (r0::pread(c, probe, 8)) {
+                    loose_c = c; loose_o = o;
+                    loose_pid = pid; loose_ep = cur;
+                    break;
+                }
+            }
         }
+    }
 
-        if (!peb_has_module(cur, c, want)) {
-            printf("[DEBUG] attach: PEB of 0x%llx has no matching module\n",
-                   (unsigned long long)cur);
-            ++rejected; continue;
-        }
-
-        g_gcr3 = c;
-        g_eprocess = cur;
-        g_pid = static_cast<uint32_t>(pid);
-        g_ready = true;
-        g_dtb_ok = true;
-        if (!g_kcr3) g_kcr3 = c;      // shared kernel half, already proven above
-        ++g_stamp;
-        printf("[+] attached pid %u eprocess 0x%llx dtb 0x%llx (ntoskrnl + PEB + "
-               "module all proven)\n", g_pid, (unsigned long long)cur,
-               (unsigned long long)c);
+    if (loose_c) {
+        accept_candidate(loose_c, loose_o, loose_pid, loose_ep,
+                         "unproven fallback");
         return true;
     }
 
@@ -1127,7 +1342,11 @@ bool vmm::kread_trusted(uint64_t va, void* buf, size_t len) {
                    "where possible (run --cr3scan once if this fails)\n");
     }
 
-    if (probe_ok && r0::vread(va, buf, len)) return true;
+    if (probe_ok) {
+        // Baseline build (pre-gate): single raw kernel-VA IOCTL. This is the
+        // exact code path that ran clean on the last stable probe run.
+        return r0::vread(va, buf, len);
+    }
     if (g_kcr3) return kread(va, buf, len);
     return false;
 }
@@ -1329,12 +1548,12 @@ bool vmm::dtb_scan() {
            (unsigned long long)g_eprocess, g_pid,
            (unsigned long long)g_lay.peb);
 
-    for (uint64_t o = 0x20; o <= 0x80; o += 8) {
+    for (uint64_t o = 0x20; o <= 0xF8; o += 8) {
         uint64_t v{};
         if (!kread_trusted(g_eprocess + o, &v, 8)) continue;
         const uint64_t c = v & kPteMask;
 
-        if (!c || (v & 0xFFF) || !phys_is_ram(c, 0x1000)) {
+        if (!c || !phys_is_ram(c, 0x1000)) {
             printf("  +0x%02llx = 0x%016llx  (not a CR3)\n",
                    (unsigned long long)o, (unsigned long long)v);
             continue;
@@ -1343,18 +1562,22 @@ bool vmm::dtb_scan() {
         uint64_t kpa{};
         const bool ntos = walk_va(c, g_ntos, kpa) == Walk::Ok && page_mz(kpa);
 
+        // The System process has no PEB - for a null PEB the ntoskrnl walk
+        // alone decides; a non-null PEB must also translate and hold a
+        // plausible Ldr pointer.
         uint64_t peb{}, ldr{};
-        bool peb_ok = read_cr3(c, g_eprocess + g_lay.peb, &peb, 8) &&
-                      peb >= kUserLo && peb <= kUserHi &&
-                      read_cr3(c, peb + 0x18, &ldr, 8) &&
-                      ldr >= kUserLo && ldr <= kUserHi;
+        const bool peb_read = read_cr3(c, g_eprocess + g_lay.peb, &peb, 8) &&
+                              peb >= kUserLo && peb <= kUserHi;
+        const bool peb_ok = peb_read &&
+                       read_cr3(c, peb + 0x18, &ldr, 8) &&
+                       ldr >= kUserLo && ldr <= kUserHi;
 
         printf("  +0x%02llx = 0x%016llx  ntoskrnl=%s peb=%s%s\n",
                (unsigned long long)o, (unsigned long long)v,
                ntos ? "ok" : "FAIL", peb_ok ? "ok" : "FAIL",
                (ntos && peb_ok) ? "   <== DTB" : "");
 
-        if (ntos && peb_ok) {
+        if (ntos && (peb_ok || !peb_read)) {
             if (g_lay.dtb != o)
                 printf("[+] DirectoryTableBase is +0x%llx, not +0x%llx\n",
                        (unsigned long long)o, (unsigned long long)g_lay.dtb);

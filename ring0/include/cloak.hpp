@@ -30,6 +30,11 @@ bool restore();
 
 bool active();
 
+// Locate our driver's DllBase and SizeOfImage while the KLDR entry is still
+// linked in PsLoadedModuleList (i.e. before --cloak unlinks it). Returns
+// false once the driver is cloaked - so run --dpatch BEFORE --cloak.
+bool module_base(uint64_t& base, uint32_t& size);
+
 // The image name the driver was loaded under, e.g. "dbutil_2_3.sys" or the
 // random name run_r0.bat installed it as. Must match what the service was
 // created from, or our_base() cannot find the KLDR entry. Precedence:

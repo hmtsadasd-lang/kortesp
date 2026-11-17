@@ -54,10 +54,10 @@ bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
     }
 }
 
-// Target base through the target's own PEB. `vmm::rd` routes the PEB, LDR and
-// name buffers to the target CR3 page walk because they are user VAs.
 bool resolve_base() {
-    // Try EPROCESS.SectionBaseAddress first (kernel VA read, no page walk needed).
+    // EPROCESS.SectionBaseAddress: plain kernel-VA read, no page walk needed.
+    // (The old PEB/LDR fallback lived here; it needs user page-walk reads,
+    // which the unpatched physical path cannot serve.)
     uint64_t section_base{};
     if (vmm::rd(vmm::g_eprocess + off::Eproc_SectionBase, &section_base, sizeof(section_base)) &&
         section_base > 0x10000 && section_base <= vmm::kUserHi) {
@@ -66,63 +66,8 @@ bool resolve_base() {
                (unsigned long long)section_base);
         return true;
     }
-
-    // Try PEB.ImageBaseAddress (single user-mode page walk read).
-    uint64_t peb{}, image_base{};
-    if (!vmm::rd(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) || !ok(peb)) {
-        printf("[!] resolve_base: PEB read failed at 0x%llx\n",
-               (unsigned long long)vmm::g_eprocess + off::Eproc_Peb);
-        return false;
-    }
-    printf("[+] PEB 0x%llx\n", (unsigned long long)peb);
-    if (vmm::rd(peb + off::Peb_ImageBaseAddress, &image_base, sizeof(image_base)) &&
-        image_base > 0x10000 && image_base <= vmm::kUserHi) {
-        uint16_t mz{};
-        if (vmm::rd(image_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
-            vmm::set_base(image_base, 0);
-            printf("[+] found FortniteClient base 0x%llx (via PEB.ImageBaseAddress)\n",
-                   (unsigned long long)image_base);
-            return true;
-        }
-    }
-
-    // Fallback: PEB -> LDR module walk (requires page walking user memory).
-    uint64_t ldr{}, head{}, cur{};
-    if (!vmm::rd(peb + off::Peb_Ldr, &ldr, sizeof(ldr)) || !ok(ldr)) {
-        printf("[!] resolve_base: LDR read failed at 0x%llx\n", peb + off::Peb_Ldr);
-        return false;
-    }
-    printf("[+] LDR 0x%llx\n", (unsigned long long)ldr);
-    if (!vmm::rd(ldr + off::Ldr_InLoadOrder, &head, sizeof(head)) || !ok(head)) {
-        printf("[!] resolve_base: InLoadOrder head read failed at 0x%llx\n",
-               ldr + off::Ldr_InLoadOrder);
-        return false;
-    }
-    printf("[+] InLoadOrder head 0x%llx\n", (unsigned long long)head);
-    if (!vmm::rd(head, &cur, sizeof(cur))) return false;
-
-    for (int g = 0; g < 512 && cur && cur != head; ++g) {
-        uint64_t base{}, size{}, nbuf{};
-        uint16_t nlen{};
-        if (!vmm::rd(cur + off::Ldr_DllBase, &base, sizeof(base))) break;
-        if (!vmm::rd(cur + off::Ldr_SizeOfImage, &size, sizeof(size))) break;
-        if (!vmm::rd(cur + off::Ldr_BaseDllNameLen, &nlen, sizeof(nlen))) break;
-        if (!vmm::rd(cur + off::Ldr_BaseDllNameBuf, &nbuf, sizeof(nbuf))) break;
-        if (!nlen || nlen > 1024) break;
-
-        wchar_t wname[264]{};
-        const int chars = nlen / 2;
-        if (chars > 263) break;
-        if (!vmm::rd(nbuf, wname, nlen)) break;
-
-        if (iequals_ascii(wname, L"FortniteClient-Win64-Shipping.exe")) {
-            vmm::set_base(base, size);
-            printf("[+] found FortniteClient base 0x%llx size 0x%llx\n",
-                   (unsigned long long)base, (unsigned long long)size);
-            return true;
-        }
-        if (!vmm::rd(cur, &cur, sizeof(cur))) break;
-    }
+    printf("[!] resolve_base: SectionBaseAddress read failed (eprocess 0x%llx)\n",
+           (unsigned long long)vmm::g_eprocess + off::Eproc_SectionBase);
     return false;
 }
 

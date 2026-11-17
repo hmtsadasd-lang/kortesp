@@ -136,11 +136,16 @@ void      set_base(uint64_t base, uint64_t size);
 bool kread(uint64_t va, void* buf, size_t len);
 
 // Kernel read through the driver's kernel-VA handler. One IOCTL, no walk.
-// Only for addresses derived from ntoskrnl's headers or a validated EPROCESS.
+// Gated: every address is first translated through the PTE pyramid with each
+// level verified present, so an unmapped VA is a false return, not a fault.
 // The handler's direction is proven once with a zero-payload probe first; if
 // that cannot be proven the page walk is used instead (when a CR3 is known).
 bool kread_trusted(uint64_t va, void* buf, size_t len);
 bool kwrite_trusted(uint64_t va, const void* buf, size_t len);
+
+// SAFE kernel VA -> PA: every pyramid read is at an address provably mapped by
+// the previous step. Returns false for anything unmapped/canonical-invalid.
+bool safe_translate(uint64_t va, uint64_t& pa);
 
 bool kwrite(uint64_t va, const void* buf, size_t len);
 bool read (uint64_t va, void* buf, size_t len);

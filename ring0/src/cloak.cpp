@@ -115,6 +115,27 @@ bool find_our_driver() {
 
 } // namespace
 
+// Locate our driver's DllBase and SizeOfImage while the KLDR entry is still
+// linked. SizeOfImage is read from the image's own PE header:
+//   e_lfanew at base+0x3C, then SizeOfImage at optional-header offset 0x38,
+//   i.e. base + lfanew + 0x50.
+bool module_base(uint64_t& base, uint32_t& size) {
+    if (g_our_base == 0) {
+        if (!find_our_driver()) return false;
+    }
+    uint16_t mz{};
+    if (!vmm::kread_trusted(g_our_base, &mz, 2) || mz != 0x5A4D) return false;
+    uint32_t lfanew{};
+    if (!vmm::kread_trusted(g_our_base + 0x3C, &lfanew, 4)) return false;
+    if (lfanew < 0x40 || lfanew > 0x1000) return false;
+    uint32_t img{};
+    if (!vmm::kread_trusted(g_our_base + lfanew + 0x50, &img, 4)) return false;
+    if (img < 0x1000 || img > (1u << 26)) return false;
+    base = g_our_base;
+    size = img;
+    return true;
+}
+
 bool apply(bool commit) {
     if (!g_on) return false;
     if (!g_head) {

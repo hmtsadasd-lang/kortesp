@@ -66,4 +66,13 @@ bool vread_ready();
 // on the link, so the caller must be elevated.
 bool hide_symlink(const wchar_t* link);
 
+// Live-patch the loaded DBUtil_2_3.sys so its physical path maps with
+// MmCached instead of MmNonCached: on this build the kernel refuses
+// MmNonCached mappings of active OS RAM, which is every page-table page
+// and every game structure. Refuses outright when HVCI is running (the
+// write would bugcheck), verifies every byte before writing, and needs
+// the driver still listed in the kernel module list - so run it BEFORE
+// --cloak, and re-run it on every boot (it lives only in memory).
+bool patch_cached_map();
+
 } // namespace r0

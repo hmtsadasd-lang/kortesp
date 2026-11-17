@@ -1,7 +1,8 @@
 #include "r0.hpp"
 #include <windows.h>
 #include <winternl.h>
-#include "vmm.hpp"          // only for vmm::g_ntos_mz_broken
+#include "vmm.hpp"          // phys_is_ram guard for the MmMapIoSpace path
+#include "cloak.hpp"        // loader-list locator, primary driver-base source
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -275,8 +276,20 @@ bool alive() { return g_be != nullptr; }
 
 void set_backend(const Backend* be) { g_be = be; }
 
+// Physical reads. 2026-11-17: the kernel direct map (0xFFFF800000000000 + pa)
+// is NOT a valid read path on build 26200 - the System DTB page (pa 0x1ae000)
+// faulted at 0xffff8000001ae000 through the driver's SEH-less read loop
+// (0x50). MmGetVirtualForPhysical on this build consults the PFN entry's
+// PteAddress instead of a flat base, so there is no fixed direct-map address
+// for arbitrary RAM. Physical reads therefore go ONLY through the driver's
+// MmMapIoSpace IOCTL: the driver refuses unmappable ranges with a NULL
+// mapping instead of faulting, so a wrong address costs a failed read, never
+// a bugcheck. The RAM-range guard additionally keeps the walk out of MMIO
+// holes, where the copy would return garbage or hang on a powered-down BAR.
 bool pread(uint64_t pa, void* buf, size_t len) {
     if (!g_be) return false;
+    if (!len) return true;
+    if (!vmm::phys_is_ram(pa, len)) return false;
     return g_be->read(pa, buf, len);
 }
 
@@ -370,6 +383,267 @@ bool hide_symlink(const wchar_t* link) {
                "the link was not removed\n", err);
         return false;
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Cached physical mapping patch (--dpatch).
+//
+// The shipped driver calls MmMapIoSpace(pa, len, MmNonCached). On this build
+// the kernel refuses MmNonCached mappings of pages that are in use as OS RAM
+// (the cache-attribute conflict check inside MmMapIoSpaceEx) - which is every
+// page-table page and every game structure. Only firmware-reserved low pages
+// (below the first managed page, ~0x1ae000 on this machine) map. That is why
+// every page-table walk died with "physical read refused" while --raw 0x400
+// "worked": the reads that failed were exactly the reads of real RAM.
+//
+// The fix is applied live through the proven kernel-VA write. The driver's
+// import slot for MmMapIoSpace (RVA 0x12048) is redirected to an 18-byte
+// stub planted in the driver's own int3 padding (RVA 0x1161e, .text, which
+// is MEM_NOT_PAGED so the stub can never be paged out):
+//
+//   41 b8 01 00 00 00     mov  $1,%r8d        ; CacheType = MmCached
+//   48 b8 <real>          movabs $real,%rax   ; real = ntos!MmMapIoSpace
+//   ff e0                 jmp  %rax
+//
+// Reading RAM through a cached mapping is correct: the CPU keeps cached
+// mappings coherent, and the kernel itself writes page tables through
+// cached mappings. MMIO is never touched by this tool. Every byte written
+// is verified first (padding must be pure int3, the import slot must hold
+// exactly ntos!MmMapIoSpace, and the bytes at that address must match the
+// shipped MmMapIoSpace prologue). If HVCI is running, kernel code pages are
+// read-only and a write there bugchecks - so the patch refuses outright
+// instead. The patch lives only in memory: re-run --dpatch after every
+// boot, BEFORE --cloak (it needs the driver still in the module list).
+// ---------------------------------------------------------------------------
+namespace {
+
+using NtQuerySystemInformationFn = NTSTATUS (NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+
+NtQuerySystemInformationFn get_query_system_info() {
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (!nt) return nullptr;
+    return reinterpret_cast<NtQuerySystemInformationFn>(
+        reinterpret_cast<void*>(GetProcAddress(nt, "NtQuerySystemInformation")));
+}
+
+#pragma pack(push, 8)
+struct RtlProcessModuleInfo {
+    void*     Section;
+    void*     MappedBase;
+    void*     ImageBase;
+    uint32_t  ImageSize;
+    uint32_t  Flags;
+    uint16_t  LoadCount;
+    uint16_t  OffsetToFileName;
+    char      FullPathName[256];
+};
+#pragma pack(pop)
+
+bool hvci_running() {
+    const auto qs = get_query_system_info();
+    if (!qs) return true;   // cannot check - refuse on the safe side
+    struct { ULONG length; ULONG options; } ci{ 8, 0 };
+    ULONG ret = 0;
+    // SystemCodeIntegrityInformation = 103; option bit 0x2 = HVCI enabled.
+    if (qs(103, &ci, sizeof(ci), &ret) < 0) return true;
+    return (ci.options & 0x2) != 0;
+}
+
+bool find_driver_base(uint64_t& base, uint32_t& size) {
+    const auto qs = get_query_system_info();
+    if (!qs) {
+        printf("[-] fallback: NtQuerySystemInformation not resolvable\n");
+        return false;
+    }
+    std::vector<uint8_t> buf(1u << 21);
+    NTSTATUS st = 0;
+    // SystemModuleInformation = 11. Grow once if the caller-reported size is
+    // bigger than the first guess.
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        ULONG need = 0;
+        st = qs(11, buf.data(), static_cast<ULONG>(buf.size()), &need);
+        if (st >= 0) break;
+        if (!need || need > (1u << 24)) {
+            printf("[-] fallback: module query failed, status 0x%08lx\n",
+                   static_cast<unsigned long>(st));
+            return false;
+        }
+        buf.resize(static_cast<size_t>(need) + 0x1000);
+    }
+    if (st < 0) {
+        printf("[-] fallback: module query failed, status 0x%08lx\n",
+               static_cast<unsigned long>(st));
+        return false;
+    }
+    if (buf.size() < 8) return false;
+    const uint32_t count = *reinterpret_cast<uint32_t*>(buf.data());
+    if (count > 4096) {
+        printf("[-] fallback: implausible module count %u\n", count);
+        return false;
+    }
+    const auto* mods = reinterpret_cast<const RtlProcessModuleInfo*>(buf.data() + 8);
+    for (uint32_t i = 0; i < count; ++i) {
+        const RtlProcessModuleInfo& m = mods[i];
+        char lower[256]{};
+        const size_t n = strnlen(m.FullPathName, sizeof(m.FullPathName));
+        for (size_t k = 0; k < n && k < sizeof(lower) - 1; ++k)
+            lower[k] = (m.FullPathName[k] >= 'A' && m.FullPathName[k] <= 'Z')
+                       ? static_cast<char>(m.FullPathName[k] + 32)
+                       : m.FullPathName[k];
+        if (!strstr(lower, "dbutil_2_3")) continue;
+        base = reinterpret_cast<uint64_t>(m.ImageBase);
+        size = m.ImageSize;
+        return true;
+    }
+    printf("[-] fallback: %u module(s) queried, none named dbutil_2_3\n", count);
+    printf("[*] fallback: first 0x80 bytes of the module buffer:\n    ");
+    for (size_t i = 0; i < 0x80 && i < buf.size(); ++i)
+        printf("%02x%s", buf[i], (i % 16 == 15) ? "\n    " : " ");
+    printf("\n[-] fallback: first entries as parsed (stride 296):\n");
+    for (uint32_t i = 0; i < count && i < 6; ++i)
+        printf("    [%u] base 0x%llx size 0x%x '%s'\n", i,
+               (unsigned long long)reinterpret_cast<uintptr_t>(mods[i].ImageBase),
+               mods[i].ImageSize, mods[i].FullPathName);
+    return false;
+}
+
+} // anonymous namespace
+
+bool patch_cached_map() {
+    if (hvci_running()) {
+        printf("[!] HVCI is running - kernel code pages are read-only and the\n"
+               "    cached-map patch would bugcheck. The patch is refused.\n");
+        return false;
+    }
+
+    if (!vmm::g_ntos) {
+        printf("[!] ntoskrnl base unknown\n");
+        return false;
+    }
+
+    // ntos!MmMapIoSpace (RVA taken from the shipped ntoskrnl.exe of this
+    // build; the prologue check below proves the RVA before anything is
+    // written).
+    const uint64_t real_map = vmm::g_ntos + 0x487ab0ull;
+    static const uint8_t kMmMapIoSpaceHead[16] = {
+        0x48, 0x83, 0xEC, 0x28, 0x41, 0x0F, 0xB6, 0xC0,
+        0x83, 0xF8, 0x06, 0x73, 0x2B, 0x41, 0xB8, 0x40 };
+    uint8_t head[16]{};
+    if (!vread(real_map, head, sizeof(head))) {
+        printf("[!] cannot read ntos!MmMapIoSpace at 0x%llx\n",
+               (unsigned long long)real_map);
+        return false;
+    }
+    if (memcmp(head, kMmMapIoSpaceHead, sizeof(head)) != 0) {
+        printf("[!] bytes at ntos+0x487ab0 are not MmMapIoSpace - not patching\n");
+        return false;
+    }
+
+    uint64_t drv{};
+    uint32_t drv_size{};
+    // Primary: the proven loader-list walk (same locator --cloak uses).
+    // Fallback: NtQuerySystemInformation with full diagnostics.
+    bool have = cloak::module_base(drv, drv_size);
+    if (!have) {
+        printf("[*] loader-list locator failed - trying the module query\n");
+        have = find_driver_base(drv, drv_size);
+    }
+    if (!have) {
+        printf("[!] DBUtil_2_3 module not located\n");
+        printf("    either the driver is not loaded (sc start DBUtil_2_3) or\n"
+               "    it is already cloaked this boot: reboot, load the driver,\n"
+               "    then run --dpatch BEFORE --cloak\n");
+        return false;
+    }
+    printf("[+] driver module base 0x%llx size 0x%x\n",
+           (unsigned long long)drv, drv_size);
+
+    // Layout facts from disassembling the shipped image:
+    //   0x12048  import slot for MmMapIoSpace (shared by read and write)
+    //   0x15165  xor %r8d,%r8d  -> CacheType = MmNonCached before the call
+    //   0x1161e  18 bytes of int3 padding in .text - room for the stub
+    const uint64_t kImport = drv + 0x12048ull;
+    const uint64_t kPad    = drv + 0x1161eull;
+    const uint64_t stub    = kPad;
+
+    uint64_t imp{};
+    if (!vread(kImport, &imp, 8)) {
+        printf("[!] cannot read the import slot\n");
+        return false;
+    }
+    if (imp == stub) {
+        printf("[*] import already points at the cached-map stub\n");
+    } else {
+        if (imp != real_map) {
+            printf("[!] import slot holds 0x%llx, expected ntos!MmMapIoSpace "
+                   "0x%llx - not patching\n",
+                   (unsigned long long)imp, (unsigned long long)real_map);
+            return false;
+        }
+
+        uint8_t kStub[18] = {
+            0x41, 0xB8, 0x01, 0x00, 0x00, 0x00,          // mov $1,%r8d (MmCached)
+            0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,          // movabs $real,%rax
+            0xFF, 0xE0 };                                // jmp %rax
+        const uint64_t t = real_map;
+        memcpy(kStub + 8, &t, 8);
+
+        uint8_t pad[18]{};
+        if (!vread(kPad, pad, sizeof(pad))) {
+            printf("[!] cannot read the stub slot\n");
+            return false;
+        }
+        if (memcmp(pad, kStub, 6) != 0) {
+            for (uint8_t b : pad) {
+                if (b != 0xCC) {
+                    printf("[!] stub slot 0x%llx is not int3 padding "
+                           "(found 0x%02x) - not patching\n",
+                           (unsigned long long)kPad, b);
+                    return false;
+                }
+            }
+            if (!vwrite(kPad, kStub, sizeof(kStub))) {
+                printf("[!] stub write failed\n");
+                return false;
+            }
+            uint8_t chk[18]{};
+            if (!vread(kPad, chk, sizeof(chk)) ||
+                memcmp(chk, kStub, sizeof(chk)) != 0) {
+                printf("[!] stub read-back mismatch\n");
+                return false;
+            }
+            printf("[+] cached-map stub planted at 0x%llx\n",
+                   (unsigned long long)kPad);
+        }
+
+        if (!vwrite(kImport, &stub, 8)) {
+            printf("[!] import pointer write failed\n");
+            return false;
+        }
+        uint64_t chk2{};
+        if (!vread(kImport, &chk2, 8) || chk2 != stub) {
+            printf("[!] import read-back mismatch\n");
+            return false;
+        }
+        printf("[+] MmMapIoSpace import redirected to the stub (MmCached)\n");
+    }
+
+    // Prove it: the two addresses that refused before, plus a known-good one.
+    struct T { uint64_t pa; const char* tag; };
+    const T tests[] = {
+        { 0x1ae000, "System PML4, refused before" },
+        { 0x200000, "RAM, refused before" },
+        { 0x400,    "firmware BDA, worked before" },
+    };
+    for (const T& tc : tests) {
+        uint8_t b[16]{};
+        const bool ok = pread(tc.pa, b, sizeof(b));
+        printf("[*] phys read 0x%llx (%s): %s  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+               (unsigned long long)tc.pa, tc.tag, ok ? "OK" : "FAIL",
+               b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    }
+    printf("[*] patch is memory-only: re-run --dpatch on every boot\n");
     return true;
 }
 

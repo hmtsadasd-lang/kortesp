@@ -41,6 +41,7 @@ struct CmdFlags {
     bool preflight{ false };
     bool dtbscan{ false };
     bool dump_cr3{ false };
+    bool dpatch{ false };
     bool actors{ false };
     uint64_t raw_pa{ 0 };
     size_t   raw_len{ 16 };
@@ -90,8 +91,10 @@ bool raw_read(uint64_t pa, size_t len);
 
 bool run_preflight() {
     printf("preflight:\n");
-    if (!raw_read(0x400, 16))  { printf("[!] step 1/5 physical read 0x400 failed\n"); return false; }
-    if (!raw_read(0x1000, 16)) { printf("[!] step 2/5 physical read 0x1000 failed\n"); return false; }
+    // step 1/2: low physical addresses (0x400, 0x1000) are not RAM on 26200
+    // and pread() refuses them - skip, diagnostic only.
+    // if (!raw_read(0x400, 16))  { printf("[!] step 1/5 physical read 0x400 failed\n"); return false; }
+    // if (!raw_read(0x1000, 16)) { printf("[!] step 2/5 physical read 0x1000 failed\n"); return false; }
     if (!vmm::init_ntos())     { printf("[!] step 3/5 ntoskrnl not found\n"); return false; }
     if (!vmm::init_system())   { printf("[!] step 4/5 System EPROCESS not found\n"); return false; }
     if (!vmm::init_kcr3())     printf("[*] no CR3 - kernel-VA path only\n");
@@ -122,6 +125,7 @@ CmdFlags parse_cmd() {
             if (wcscmp(argv[i], L"--eproc") == 0) f.only_eproc = true;
             if (wcscmp(argv[i], L"--dtbscan") == 0) f.dtbscan = true;
             if (wcscmp(argv[i], L"--dump-cr3") == 0) f.dump_cr3 = true;
+            if (wcscmp(argv[i], L"--dpatch") == 0) f.dpatch = true;
             if (wcscmp(argv[i], L"--driver-name") == 0 && i + 1 < argc)
                 f.driver_name = argv[++i];
             if (wcscmp(argv[i], L"--raw") == 0) {
@@ -364,14 +368,9 @@ int wmain() {
     }
 
     if (flags.cloak) {
-        cloak::cloak_init(narrow(flags.driver_name).c_str());
-        const bool ok = cloak::apply(flags.cloak_commit);
-        if (ok && flags.cloak_commit)
-            printf("[+] driver unlinked\n");
-        else if (ok)
-            printf("[*] cloak dry run ok\n");
-        else
-            printf("[!] cloak failed\n");
+        const bool ok = cloak::apply(true);
+        vmm::shutdown();
+        return ok ? 0 : 1;
     }
 
     if (flags.hide_symlink) {
