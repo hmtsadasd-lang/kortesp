@@ -66,6 +66,22 @@ bool resolve_base() {
                (unsigned long long)section_base);
         return true;
     }
+    // Fallback: PEB.ImageBaseAddress — EPROCESS->Peb is a kernel VA (kread_trusted),
+    // PEB->ImageBaseAddress is user VA (rd -> page walk -> phys_read, ok for
+    // process-owned tables).
+    uint64_t peb{}, image_base{};
+    if (vmm::kread_trusted(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) &&
+        peb >= vmm::kUserLo && peb <= vmm::kUserHi &&
+        vmm::rd(peb + off::Peb_ImageBaseAddress, &image_base, sizeof(image_base)) &&
+        image_base > 0x10000) {
+        uint16_t mz{};
+        if (vmm::rd(image_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
+            vmm::set_base(image_base, 0);
+            printf("[+] found FortniteClient base 0x%llx (via PEB.ImageBaseAddress)\n",
+                   (unsigned long long)image_base);
+            return true;
+        }
+    }
     printf("[!] resolve_base: SectionBaseAddress read failed (eprocess 0x%llx)\n",
            (unsigned long long)vmm::g_eprocess + off::Eproc_SectionBase);
     return false;

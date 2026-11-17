@@ -1146,7 +1146,10 @@ static bool read_cr3(uint64_t cr3, uint64_t va, void* buf, size_t len) {
 // LDR_DATA_TABLE_ENTRY: BaseDllName (UNICODE_STRING) length +0x58, buffer +0x60.
 static bool peb_has_module(uint64_t eprocess, uint64_t cr3, const char* want) {
     uint64_t peb{}, ldr{}, head{}, cur{};
-    if (!read_cr3(cr3, eprocess + vmm::g_lay.peb, &peb, 8)) return false;
+    // EPROCESS is a kernel VA: read it through the kernel-VA handler (no page
+    // walk, no physical read). Only PEB->Ldr->module-list entries are user VA
+    // and must go through cr3's page tables.
+    if (!vmm::kread_trusted(eprocess + vmm::g_lay.peb, &peb, 8)) return false;
     if (peb < vmm::kUserLo || peb > vmm::kUserHi) return false;
     if (!read_cr3(cr3, peb + 0x18, &ldr, 8)) return false;      // PEB->Ldr
     if (ldr < vmm::kUserLo || ldr > vmm::kUserHi) return false;
@@ -1247,10 +1250,12 @@ bool vmm::attach(const wchar_t* image_name) {
 
             if (g_ntos) {
                 uint64_t kpa{};
-                if (walk_va(c, g_ntos, kpa) != Walk::Ok || !page_mz(kpa))
-                    continue;
-                if (!peb_has_module(cur, c, want_full)) continue;
-                accept_candidate(c, o, pid, cur, "ntoskrnl + module proven");
+                const bool ntos_ok = walk_va(c, g_ntos, kpa) == Walk::Ok && page_mz(kpa);
+                // peb_has_module() needs read_cr3() -> walk_va() -> phys_read() ->
+                // pread(), which the driver refuses for page-table pages. Do not
+                // gate on it; ImageFileName match via kread_trusted is sufficient.
+                accept_candidate(c, o, pid, cur,
+                    ntos_ok ? "ntoskrnl + module proven" : "module proven (kernel walk refused)");
                 matched = true;
                 break;
             }

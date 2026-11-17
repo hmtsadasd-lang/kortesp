@@ -106,7 +106,27 @@ bool open_dev() {
     g_dev = CreateFileW(L"\\\\.\\DBUtil_2_3", GENERIC_READ | GENERIC_WRITE,
                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                         OPEN_EXISTING, 0, nullptr);
-    return g_dev != INVALID_HANDLE_VALUE;
+    if (g_dev != INVALID_HANDLE_VALUE) return true;
+
+    // Symlink gizlendiğinde \\.\DBUtil_2_3 bulunamaz. NT yoluyla device
+    // nesnesine direkt eriş: \Device\DBUtil_2_3.
+    const wchar_t* p = L"\\Device\\DBUtil_2_3";
+    UNICODE_STRING un{};
+    un.Buffer = const_cast<PWSTR>(p);
+    un.Length = un.MaximumLength = (USHORT)(wcslen(p) * sizeof(wchar_t));
+    OBJECT_ATTRIBUTES oa{};
+    InitializeObjectAttributes(&oa, &un, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+    IO_STATUS_BLOCK iosb{};
+    using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+                                PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+    const auto nt = reinterpret_cast<Fn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+    if (!nt) return false;
+    HANDLE h = nullptr;
+    if (nt(&h, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &oa, &iosb, nullptr, 0,
+           FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0, nullptr, 0) < 0) return false;
+    g_dev = h;
+    return true;
 }
 
 void close_dev() {

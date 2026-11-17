@@ -316,6 +316,13 @@ int wmain() {
         return ok ? 0 : 1;
     }
 
+    if (flags.dpatch) {
+        if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
+        const bool ok = r0::patch_cached_map();
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
+
     if (flags.actors) esp::use_actors = true;
 
     if (flags.preflight || flags.esp_mode) {
