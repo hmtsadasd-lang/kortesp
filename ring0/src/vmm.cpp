@@ -1,4 +1,5 @@
 #include "vmm.hpp"
+#include "offsets.hpp"   // single source of truth for EPROCESS offsets
 #include "r0.hpp"
 #include <windows.h>
 #include <cstring>
@@ -21,10 +22,14 @@ uint64_t  vmm::g_ntos_size = 0;
 uint32_t  vmm::g_pid = 0;
 bool      vmm::g_ready = false;
 bool      vmm::g_attached = false;
+bool      vmm::g_dtb_ok = false;
 
 // EPROCESS layout candidates, most likely first.
 // { pid, links, name, dtb, peb } - Win11 24H2/25H2.
-vmm::Layout   vmm::g_lay{ 0x1D0, 0x1D8, 0x338, 0x28, 0x2E0 };
+// Single source of truth: offsets.hpp. Only the 23H2/Win10 fallback candidate
+// is not yet in the header.
+vmm::Layout   vmm::g_lay{ off::Eproc_Pid, off::Eproc_Links, off::Eproc_Name,
+                          off::Eproc_Dtb, off::Eproc_Peb };
 
 // ===========================================================================
 // Physical address space map
@@ -223,53 +228,112 @@ static bool phys_read(uint64_t pa, void* buf, size_t len) {
 }
 
 // --- CR3 translation: PML4 -> PDPT -> PDE -> PT ---
-bool translate_cr3(uint64_t cr3, uint64_t va, uint64_t& pa) {
-    uint64_t page = va & ~0xFFFull;
+
+uint32_t g_fail_seen = 0;
+
+// Reject a zero page unless the header was proven zeroed by a transposed pair,
+// and even then require at least one non-zero byte in the page.
+bool page_mz(uint64_t pa) {
+    uint8_t p[16]{};
+    if (!phys_read(pa & ~0xFFFull, p, sizeof(p))) return false;
+    uint16_t mz{};
+    memcpy(&mz, p, 2);
+    if (mz == 0x5A4D) return true;
+    if (mz == 0 && vmm::g_ntos_mz_broken) {
+        for (uint8_t b : p) if (b) return true;
+    }
+    return false;
+}
+
+void reset_fail_count() { g_fail_seen = 0; }
+
+void report_fail(const char* who, uint64_t cr3, uint64_t va, vmm::Walk st) {
+    if (st == vmm::Walk::Ok) return;
+    if (g_fail_seen >= 8) { ++g_fail_seen; return; }
+    ++g_fail_seen;
+    printf("[!] %s: walk stopped at %s cr3=0x%llx va=0x%llx%s\n", who,
+           vmm::walk_name(st), (unsigned long long)cr3,
+           (unsigned long long)va,
+           st == vmm::Walk::PhysFail
+               ? "  <- driver/map problem, not the CR3" : "");
+}
+
+// Canonical-form check for 4-level paging: bits 63:48 must sign-extend
+// bit 47. A 5-level VA (bits above 47 set with bit 47 clear) is rejected
+// rather than walked with 4-level indices.
+bool va_canonical(uint64_t va) {
+    const uint64_t sign = (va >> 47) & 1;
+    return sign ? (va >> 48) == 0xFFFFull : (va >> 48) == 0;
+}
+
+// The real walk. Never short-circuits a stage without naming it.
+vmm::Walk walk_va(uint64_t cr3, uint64_t va, uint64_t& pa) {
+    cr3 &= vmm::kPteMask;
+    if (!cr3 || !va_canonical(va)) return vmm::Walk::BadArgs;
+
+    const uint64_t page = va & ~0xFFFull;
     auto& e = vmm::g_tlb[(page >> 12) & (vmm::kTlbSize - 1)];
     if (e.page == page && e.cr3 == cr3 && e.stamp == vmm::g_stamp) {
         pa = e.phys + (va & 0xFFF);
-        return true;
+        return vmm::Walk::Ok;
     }
 
-    cr3 &= vmm::kPteMask;
+    auto store = [&](uint64_t phys, vmm::Walk r) {
+        e.page = page; e.cr3 = cr3; e.phys = phys & ~0xFFFull;
+        e.stamp = vmm::g_stamp;
+        return r;
+    };
 
     uint64_t pml4e{};
-    if (!phys_read(cr3 + 8 * ((va >> 39) & 0x1FF), &pml4e, 8)) return false;
-    if (!(pml4e & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
-    uint64_t pdpt = pml4e & vmm::kPteMask;
+    if (!phys_read(cr3 + 8 * ((va >> 39) & 0x1FF), &pml4e, 8)) return vmm::Walk::PhysFail;
+    if (!(pml4e & static_cast<uint64_t>(vmm::PteFlags::Present))) return vmm::Walk::Pml4;
+    const uint64_t pdpt = pml4e & vmm::kPteMask;
 
     uint64_t pdpte{};
-    if (!phys_read(pdpt + 8 * ((va >> 30) & 0x1FF), &pdpte, 8)) return false;
-    if (!(pdpte & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+    if (!phys_read(pdpt + 8 * ((va >> 30) & 0x1FF), &pdpte, 8)) return vmm::Walk::PhysFail;
+    if (!(pdpte & static_cast<uint64_t>(vmm::PteFlags::Present))) return vmm::Walk::Pdpt;
 
-    if (pdpte & 0x80) {                       // 1 GB large page
-        uint64_t lp = (pdpte & 0x000FFFFFC0000000ull) + (va & 0x3FFFFFFFull);
-        e.page = page; e.cr3 = cr3; e.phys = lp & ~0xFFFull; e.stamp = vmm::g_stamp;
-        pa = lp;
-        return true;
+    if (pdpte & 0x80) {                                    // 1 GB large page
+        pa = (pdpte & 0x000FFFFFC0000000ull) + (va & 0x3FFFFFFFull);
+        return store(pa, vmm::Walk::Ok);
     }
 
-    uint64_t pd = pdpte & vmm::kPteMask;
+    const uint64_t pd = pdpte & vmm::kPteMask;
     uint64_t pde{};
-    if (!phys_read(pd + 8 * ((va >> 21) & 0x1FF), &pde, 8)) return false;
-    if (!(pde & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+    if (!phys_read(pd + 8 * ((va >> 21) & 0x1FF), &pde, 8)) return vmm::Walk::PhysFail;
+    if (!(pde & static_cast<uint64_t>(vmm::PteFlags::Present))) return vmm::Walk::Pde;
 
-    if (pde & 0x80) {                         // 2 MB large page
-        uint64_t lp = (pde & 0x000FFFFFFFE00000ull) + (va & 0x1FFFFFull);
-        e.page = page; e.cr3 = cr3; e.phys = lp & ~0xFFFull; e.stamp = vmm::g_stamp;
-        pa = lp;
-        return true;
+    if (pde & 0x80) {                                      // 2 MB large page
+        pa = (pde & 0x000FFFFFFFE00000ull) + (va & 0x1FFFFFull);
+        return store(pa, vmm::Walk::Ok);
     }
 
-    uint64_t pt = pd & vmm::kPteMask;
+    const uint64_t pt = pde & vmm::kPteMask;
     uint64_t pte{};
-    if (!phys_read(pt + 8 * ((va >> 12) & 0x1FF), &pte, 8)) return false;
-    if (!(pte & static_cast<uint64_t>(vmm::PteFlags::Present))) return false;
+    if (!phys_read(pt + 8 * ((va >> 12) & 0x1FF), &pte, 8)) return vmm::Walk::PhysFail;
+    if (!(pte & static_cast<uint64_t>(vmm::PteFlags::Present))) return vmm::Walk::Pte;
 
-    uint64_t leaf = (pte & vmm::kPteMask) + (va & 0xFFF);
-    e.page = page; e.cr3 = cr3; e.phys = leaf & ~0xFFFull; e.stamp = vmm::g_stamp;
-    pa = leaf;
-    return true;
+    pa = (pte & vmm::kPteMask) + (va & 0xFFF);
+    return store(pa, vmm::Walk::Ok);
+}
+
+const char* vmm::walk_name(vmm::Walk s) {
+    switch (s) {
+    case vmm::Walk::Ok:         return "ok";
+    case vmm::Walk::PhysFail:   return "physical read refused";
+    case vmm::Walk::Pml4:       return "PML4E not present (wrong CR3)";
+    case vmm::Walk::Pdpt:       return "PDPTE not present";
+    case vmm::Walk::Pde:        return "PDE not present";
+    case vmm::Walk::Pte:        return "PTE not present (wrong VA)";
+    case vmm::Walk::NotPresent: return "not present";
+    case vmm::Walk::BadArgs:    return "bad arguments";
+    }
+    return "?";
+}
+
+// Compat wrapper - every existing call site keeps working.
+static bool translate_cr3(uint64_t cr3, uint64_t va, uint64_t& pa) {
+    return walk_va(cr3, va, pa) == vmm::Walk::Ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,9 +520,7 @@ bool cache_valid(const Cr3Cache& c) {
 
     uint64_t probe{};
     if (!translate_cr3(c.cr3, vmm::g_ntos, probe)) return false;
-    uint16_t mz{};
-    if (!phys_read(probe & ~0xFFFull, &mz, 2) || !vmm::mz_ok(mz)) return false;
-    return true;
+    return page_mz(probe);
 }
 
 bool try_cached_cr3(uint64_t& cr3) {
@@ -520,24 +582,32 @@ bool vmm::init_kcr3() {
 
     uint64_t dtb{};
     if (kread_trusted(g_eprocess + g_lay.dtb, &dtb, 8)) {
-        dtb &= kPteMask;
-        if (dtb && (dtb & 0xFFF) == 0) {
-            uint64_t pa{};
-            uint16_t mz{};
-            if (translate_cr3(dtb, g_ntos, pa) && phys_read(pa, &mz, 2) && vmm::mz_ok(mz)) {
-                g_kcr3 = dtb;
-                printf("[+] kernel CR3 0x%llx (from System EPROCESS)\n",
-                       (unsigned long long)dtb);
-                return true;
-            }
+        const uint64_t c = dtb & kPteMask;
+        uint64_t pa{};
+        const Walk st = c ? walk_va(c, g_ntos, pa) : Walk::BadArgs;
+        const bool ok = st == Walk::Ok && page_mz(pa);
+        if (ok) {
+            g_kcr3 = c;
+            printf("[+] kernel CR3 0x%llx (from EPROCESS +0x%llx)\n",
+                   (unsigned long long)c, (unsigned long long)g_lay.dtb);
+            return true;
+        }
+        printf("[!] CR3 from EPROCESS +0x%llx = 0x%llx does not map ntoskrnl: %s\n",
+               (unsigned long long)g_lay.dtb, (unsigned long long)dtb,
+               walk_name(st));
+        if (!(dtb & 0xFFF)) {
+            printf("    (page-aligned, so the offset is plausible - this is a "
+                   "read-path or walk problem)\n");
+        } else {
+            printf("    (not page-aligned -> DirectoryTableBase is probably at a "
+                   "different offset on this build; try --dtbscan)\n");
         }
     }
 
     if (init_kcr3_cached()) return true;
 
-    printf("[!] CR3 not resolved from EPROCESS (DirectoryTableBase at +0x%llx "
-           "did not translate ntoskrnl)\n", (unsigned long long)g_lay.dtb);
-    printf("    Run --cr3scan once to find it physically, then re-run this mode.\n");
+    printf("    Run --cr3scan once to find it physically, or --dtbscan to check "
+           "the offset, then re-run this mode.\n");
     return false;
 }
 
@@ -621,10 +691,7 @@ bool vmm::scan_kernel_cr3() {
 
             uint64_t probe{};
             if (!translate_cr3(pa, g_ntos, probe)) continue;
-
-            uint16_t mz{};
-            if (!phys_read(probe & ~0xFFFull, &mz, 2)) continue;
-            if (!vmm::mz_ok(mz)) continue;
+            if (!page_mz(probe)) continue;
             g_kcr3 = pa;
             save_cr3_cache(pa);
             printf("[+] kernel CR3 0x%llx (scan)\n", (unsigned long long)pa);
@@ -864,10 +931,17 @@ static bool read_cr3(uint64_t cr3, uint64_t va, void* buf, size_t len) {
     auto* p = static_cast<uint8_t*>(buf);
     for (size_t i = 0; i < len;) {
         uint64_t pa{};
-        if (!translate_cr3(cr3, va + i, pa)) return false;
+        const vmm::Walk st = walk_va(cr3, va + i, pa);
+        if (st != vmm::Walk::Ok) {
+            report_fail("read_cr3", cr3, va + i, st);
+            return false;
+        }
         size_t n = 0x1000 - ((va + i) & 0xFFF);
         if (n > len - i) n = len - i;
-        if (!phys_read(pa, p + i, n)) return false;
+        if (!phys_read(pa, p + i, n)) {
+            report_fail("read_cr3(phys)", cr3, va + i, vmm::Walk::PhysFail);
+            return false;
+        }
         i += n;
     }
     return true;
@@ -915,71 +989,89 @@ static bool peb_has_module(uint64_t eprocess, uint64_t cr3, const char* want) {
 // attach: find the process by image name and map its CR3
 bool vmm::attach(const wchar_t* image_name) {
     if (!g_eprocess) return false;
+    reset_fail_count();
 
     char want[256]{};
     for (int i = 0; i < 255 && image_name[i]; ++i)
         want[i] = static_cast<char>(image_name[i] > 0x7F ? '?' : image_name[i]);
-    want[14] = 0;  // EPROCESS.ImageFileName is char[15] (14 chars + null)
+    want[14] = 0;
 
     printf("[DEBUG] attach: looking for '%.14s'\n", want);
 
+    int names = 0, rejected = 0;
     uint64_t cur = g_eprocess;
     for (int guard = 0; guard < 4096; ++guard) {
         uint64_t flink{};
         if (!kread_trusted(cur + g_lay.links, &flink, 8) || !flink) {
-            printf("[DEBUG] attach: kread_trusted(links) failed at 0x%llx\n", (unsigned long long)cur);
+            printf("[DEBUG] attach: kread_trusted(links) failed at 0x%llx\n",
+                   (unsigned long long)cur);
             break;
         }
         cur = flink - g_lay.links;
 
         uint64_t pid{}; char name[256]{};
-        if (!kread_trusted(cur + g_lay.pid, &pid, 8)) {
-            printf("[DEBUG] attach: kread_trusted(pid) failed at 0x%llx\n", (unsigned long long)cur);
-            break;
-        }
-        if (!kread_trusted(cur + g_lay.name, name, sizeof(name))) {
-            printf("[DEBUG] attach: kread_trusted(name) failed at 0x%llx\n", (unsigned long long)cur);
-            break;
-        }
-
-        printf("[DEBUG] attach: PID=%llu Name='%.15s'\n",
-               (unsigned long long)pid, name);
-
-        constexpr size_t kEprocNameMax = 15;
-        size_t wl = strlen(want);
-        if (wl > kEprocNameMax) wl = kEprocNameMax;
-        if (_strnicmp(name, want, wl) != 0) continue;
+        if (!kread_trusted(cur + g_lay.pid, &pid, 8)) break;
+        if (!kread_trusted(cur + g_lay.name, name, sizeof(name))) break;
+        if (_strnicmp(name, want, strlen(want)) != 0) continue;
         if (pid == 0 || pid == 4) continue;
+        ++names;
 
         uint64_t dtb{};
-        if (!kread_trusted(cur + g_lay.dtb, &dtb, 8)) {
-            printf("[DEBUG] attach: kread_trusted(dtb) failed at 0x%llx\n", (unsigned long long)cur);
-            continue;
+        if (!kread_trusted(cur + g_lay.dtb, &dtb, 8)) { ++rejected; continue; }
+        const uint64_t c = dtb & kPteMask;
+        if (!c || (dtb & 0xFFF)) {
+            printf("[DEBUG] attach: DTB not a CR3 at 0x%llx (raw 0x%llx)\n",
+                   (unsigned long long)cur, (unsigned long long)dtb);
+            ++rejected; continue;
         }
-        dtb &= kPteMask;
-        if (!dtb || !phys_is_ram(dtb, 0x1000)) {
-            printf("[DEBUG] attach: DTB invalid 0x%llx at 0x%llx\n", (unsigned long long)dtb, (unsigned long long)cur);
-            continue;
+        if (!phys_is_ram(c, 0x1000)) {
+            printf("[DEBUG] attach: DTB 0x%llx outside RAM\n", (unsigned long long)c);
+            ++rejected; continue;
         }
 
-        // PEB module verification requires target CR3 (page walk into user space).
-        // Without CR3 we trust the ImageFileName match; PEB check is skipped.
-        if (g_kcr3 && !peb_has_module(cur, dtb, want)) continue;
+        // A CR3 must map the kernel half. This needs nothing but the candidate,
+        // so it runs regardless of g_kcr3.
+        uint64_t kpa{};
+        if (!g_ntos || walk_va(c, g_ntos, kpa) != Walk::Ok || !page_mz(kpa)) {
+            printf("[DEBUG] attach: DTB 0x%llx does not map ntoskrnl\n",
+                   (unsigned long long)c);
+            ++rejected; continue;
+        }
 
-        g_gcr3 = dtb;
+        // PEB must translate through that same CR3.
+        uint64_t peb{};
+        if (!read_cr3(c, cur + g_lay.peb, &peb, 8) || peb < kUserLo || peb > kUserHi) {
+            printf("[DEBUG] attach: DTB 0x%llx does not translate the PEB\n",
+                   (unsigned long long)c);
+            ++rejected; continue;
+        }
+
+        if (!peb_has_module(cur, c, want)) {
+            printf("[DEBUG] attach: PEB of 0x%llx has no matching module\n",
+                   (unsigned long long)cur);
+            ++rejected; continue;
+        }
+
+        g_gcr3 = c;
         g_eprocess = cur;
-        g_pid  = static_cast<uint32_t>(pid);
+        g_pid = static_cast<uint32_t>(pid);
         g_ready = true;
+        g_dtb_ok = true;
+        if (!g_kcr3) g_kcr3 = c;      // shared kernel half, already proven above
         ++g_stamp;
-        printf("[DEBUG] attach: FOUND Fortnite at 0x%llx PID=%u DTB=0x%llx\n",
-               (unsigned long long)cur, g_pid, (unsigned long long)dtb);
+        printf("[+] attached pid %u eprocess 0x%llx dtb 0x%llx (ntoskrnl + PEB + "
+               "module all proven)\n", g_pid, (unsigned long long)cur,
+               (unsigned long long)c);
         return true;
     }
+
+    printf("[DEBUG] attach: %d name match(es), %d rejected, none usable\n",
+           names, rejected);
     return false;
 }
 
 void vmm::detach() {
-    g_ready = false; g_gcr3 = 0; ++g_stamp;
+    g_ready = false; g_gcr3 = 0; g_dtb_ok = false; ++g_stamp;
 }
 
 bool vmm::attached() { return g_ready; }
@@ -987,6 +1079,7 @@ uint32_t  vmm::pid()      { return g_pid; }
 uint64_t  vmm::base()     { return g_base; }
 uint64_t  vmm::size()     { return g_size; }
 void      vmm::set_base(uint64_t b, uint64_t s) { g_base = b; g_size = s; }
+bool      vmm::dtb_proven() { return g_dtb_ok; }
 
 // kread - page walk, safe for unvalidated addresses.
 bool vmm::kread(uint64_t va, void* buf, size_t len) {
@@ -994,10 +1087,17 @@ bool vmm::kread(uint64_t va, void* buf, size_t len) {
     auto* p = static_cast<uint8_t*>(buf);
     for (size_t i = 0; i < len;) {
         uint64_t pa{};
-        if (!translate_cr3(g_kcr3, va + i, pa)) return false;
+        const Walk st = walk_va(g_kcr3, va + i, pa);
+        if (st != Walk::Ok) {
+            report_fail("kread", g_kcr3, va + i, st);
+            return false;
+        }
         size_t n = 0x1000 - ((va + i) & 0xFFF);
         if (n > len - i) n = len - i;
-        if (!phys_read(pa, p + i, n)) return false;
+        if (!phys_read(pa, p + i, n)) {
+            report_fail("kread(phys)", g_kcr3, va + i, Walk::PhysFail);
+            return false;
+        }
         i += n;
     }
     return true;
@@ -1059,7 +1159,11 @@ bool vmm::kwrite(uint64_t va, const void* buf, size_t len) {
         uint64_t pa{};
         // Walk first: it validates that every page is present, so the memmove
         // cannot fault halfway through.
-        if (!translate_cr3(g_kcr3, va + i, pa)) return false;
+        const Walk st = walk_va(g_kcr3, va + i, pa);
+        if (st != Walk::Ok) {
+            report_fail("kwrite", g_kcr3, va + i, st);
+            return false;
+        }
         size_t n = 0x1000 - ((va + i) & 0xFFF);
         if (n > len - i) n = len - i;
         if (!r0::vwrite(va + i, p + i, n)) return false;
@@ -1074,10 +1178,17 @@ bool vmm::read(uint64_t va, void* buf, size_t len) {
     auto* p = static_cast<uint8_t*>(buf);
     for (size_t i = 0; i < len;) {
         uint64_t pa{};
-        if (!translate_cr3(g_gcr3, va + i, pa)) return false;
+        const Walk st = walk_va(g_gcr3, va + i, pa);
+        if (st != Walk::Ok) {
+            report_fail("read", g_gcr3, va + i, st);
+            return false;
+        }
         size_t n = 0x1000 - ((va + i) & 0xFFF);
         if (n > len - i) n = len - i;
-        if (!phys_read(pa, p + i, n)) return false;
+        if (!phys_read(pa, p + i, n)) {
+            report_fail("read(phys)", g_gcr3, va + i, Walk::PhysFail);
+            return false;
+        }
         i += n;
     }
     return true;
@@ -1088,7 +1199,11 @@ bool vmm::write(uint64_t va, const void* buf, size_t len) {
     auto* p = static_cast<const uint8_t*>(buf);
     for (size_t i = 0; i < len;) {
         uint64_t pa{};
-        if (!translate_cr3(g_gcr3, va + i, pa)) return false;
+        const Walk st = walk_va(g_gcr3, va + i, pa);
+        if (st != Walk::Ok) {
+            report_fail("write", g_gcr3, va + i, st);
+            return false;
+        }
         size_t n = 0x1000 - ((va + i) & 0xFFF);
         if (n > len - i) n = len - i;
         if (!r0::pwrite(pa, p + i, n)) return false;
@@ -1108,10 +1223,152 @@ bool vmm::rd(uint64_t va, void* buf, size_t len) {
 
 bool vmm::present(uint64_t va) {
     uint64_t pa{};
-    return g_ready && translate_cr3(g_gcr3, va, pa);
+    const Walk st = walk_va(g_gcr3, va, pa);
+    if (st != Walk::Ok) report_fail("present", g_gcr3, va, st);
+    return st == Walk::Ok;
 }
 
+// ---------------------------------------------------------------------------
+// Target CR3 proof, independent of g_kcr3.
+// ---------------------------------------------------------------------------
+bool vmm::prove_target_cr3() {
+    if (!g_gcr3 || !g_ntos) return false;
+    uint64_t pa{};
+    const Walk st = walk_va(g_gcr3, g_ntos, pa);
+    if (st != Walk::Ok) {
+        printf("[!] target CR3 0x%llx does not map ntoskrnl: %s\n",
+               (unsigned long long)g_gcr3, walk_name(st));
+        return false;
+    }
+    if (!page_mz(pa)) {
+        printf("[!] target CR3 0x%llx maps ntoskrnl to 0x%llx but not MZ\n",
+               (unsigned long long)g_gcr3, (unsigned long long)(pa & ~0xFFFull));
+        return false;
+    }
+    g_dtb_ok = true;
+    if (!g_kcr3) g_kcr3 = g_gcr3;
+    return true;
+}
 
+// ---------------------------------------------------------------------------
+// raw_walk - print the four unmasked page-table entries for a VA.
+// ---------------------------------------------------------------------------
+static void raw_walk(const char* tag, uint64_t cr3, uint64_t va) {
+    printf("[*] raw walk %s va=0x%llx cr3=0x%llx\n", tag,
+           (unsigned long long)va, (unsigned long long)cr3);
+    static const int kShift[4] = { 39, 30, 21, 12 };
+    static const char* kName[4] = { "PML4E", "PDPTE", "PDE", "PTE" };
+
+    uint64_t tbl = cr3 & vmm::kPteMask;
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t idx = (va >> kShift[i]) & 0x1FF;
+        const uint64_t at = tbl + 8 * idx;
+        uint64_t e{};
+        if (!phys_read(at, &e, 8)) {
+            printf("    %s[%llu] @0x%llx  READ FAILED\n", kName[i],
+                   (unsigned long long)idx, (unsigned long long)at);
+            return;
+        }
+        printf("    %s[%llu] @0x%llx = 0x%016llx  present=%d ps=%d\n", kName[i],
+               (unsigned long long)idx, (unsigned long long)at,
+               (unsigned long long)e, !!(e & 1), !!(e & 0x80));
+        if (!(e & 1)) { printf("    -> chain stops here\n"); return; }
+        if (e & 0x80) { printf("    -> large page, chain ends\n"); return; }
+        tbl = e & vmm::kPteMask;
+    }
+    printf("    -> leaf 0x%llx\n", (unsigned long long)(tbl + (va & 0xFFF)));
+}
+
+// ---------------------------------------------------------------------------
+// --dump-cr3: raw +0x28 and the four unmasked entries for ntoskrnl and PEB+0x18.
+// ---------------------------------------------------------------------------
+bool vmm::dump_cr3() {
+    if (!g_eprocess || !g_ntos) return false;
+
+    uint64_t dtb{};
+    if (!kread_trusted(g_eprocess + g_lay.dtb, &dtb, 8)) {
+        printf("[!] +0x%llx read failed\n", (unsigned long long)g_lay.dtb);
+        return false;
+    }
+    printf("[*] EPROCESS 0x%llx pid %u\n", (unsigned long long)g_eprocess, g_pid);
+    printf("[*] +0x%llx = 0x%016llx  page_aligned=%s  in_ram=%s\n",
+           (unsigned long long)g_lay.dtb, (unsigned long long)dtb,
+           (dtb & 0xFFF) ? "no" : "yes",
+           phys_is_ram(dtb & kPteMask, 0x1000) ? "yes" : "no");
+
+    const uint64_t c = dtb & kPteMask;
+    if (!c) return false;
+
+    raw_walk("ntoskrnl", c, g_ntos);
+
+    uint64_t peb{};
+    if (!read_cr3(c, g_eprocess + g_lay.peb, &peb, 8)) {
+        printf("[!] PEB read through 0x%llx failed\n", (unsigned long long)c);
+        return false;
+    }
+    printf("[*] PEB 0x%llx\n", (unsigned long long)peb);
+    raw_walk("PEB+0x18", c, peb + 0x18);
+
+    uint64_t ldr{};
+    if (read_cr3(c, peb + 0x18, &ldr, 8) && ldr >= kUserLo && ldr <= kUserHi) {
+        printf("[+] PEB->Ldr = 0x%llx (user, plausible)\n", (unsigned long long)ldr);
+        return true;
+    }
+    printf("[!] PEB->Ldr unusable\n");
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// --dtbscan: sweep DTB offsets 0x20..0x80, accept the one that maps ntoskrnl
+// and translates the PEB.
+// ---------------------------------------------------------------------------
+bool vmm::dtb_scan() {
+    if (!g_eprocess || !g_ntos) return false;
+
+    printf("[*] DTB offset scan, EPROCESS 0x%llx (pid %u), peb off +0x%llx\n",
+           (unsigned long long)g_eprocess, g_pid,
+           (unsigned long long)g_lay.peb);
+
+    for (uint64_t o = 0x20; o <= 0x80; o += 8) {
+        uint64_t v{};
+        if (!kread_trusted(g_eprocess + o, &v, 8)) continue;
+        const uint64_t c = v & kPteMask;
+
+        if (!c || (v & 0xFFF) || !phys_is_ram(c, 0x1000)) {
+            printf("  +0x%02llx = 0x%016llx  (not a CR3)\n",
+                   (unsigned long long)o, (unsigned long long)v);
+            continue;
+        }
+
+        uint64_t kpa{};
+        const bool ntos = walk_va(c, g_ntos, kpa) == Walk::Ok && page_mz(kpa);
+
+        uint64_t peb{}, ldr{};
+        bool peb_ok = read_cr3(c, g_eprocess + g_lay.peb, &peb, 8) &&
+                      peb >= kUserLo && peb <= kUserHi &&
+                      read_cr3(c, peb + 0x18, &ldr, 8) &&
+                      ldr >= kUserLo && ldr <= kUserHi;
+
+        printf("  +0x%02llx = 0x%016llx  ntoskrnl=%s peb=%s%s\n",
+               (unsigned long long)o, (unsigned long long)v,
+               ntos ? "ok" : "FAIL", peb_ok ? "ok" : "FAIL",
+               (ntos && peb_ok) ? "   <== DTB" : "");
+
+        if (ntos && peb_ok) {
+            if (g_lay.dtb != o)
+                printf("[+] DirectoryTableBase is +0x%llx, not +0x%llx\n",
+                       (unsigned long long)o, (unsigned long long)g_lay.dtb);
+            g_lay.dtb = o;
+            g_gcr3 = c;
+            g_dtb_ok = true;
+            if (!g_kcr3) g_kcr3 = c;
+            return true;
+        }
+    }
+    printf("[!] no offset in 0x20..0x80 produced a working CR3\n");
+    return false;
+}
 
 // Global state: set by vread_probe when kernel-VA pair direction is proved transposed.
 bool vmm::g_ntos_mz_broken = false;
+

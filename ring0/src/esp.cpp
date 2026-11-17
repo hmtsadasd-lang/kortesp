@@ -57,27 +57,37 @@ bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
 // Target base through the target's own PEB. `vmm::rd` routes the PEB, LDR and
 // name buffers to the target CR3 page walk because they are user VAs.
 bool resolve_base() {
-    // Try EPROCESS.SectionBaseAddress first (kernel memory, no page walk needed).
+    // Try EPROCESS.SectionBaseAddress first (kernel VA read, no page walk needed).
     uint64_t section_base{};
     if (vmm::rd(vmm::g_eprocess + off::Eproc_SectionBase, &section_base, sizeof(section_base)) &&
         section_base > 0x10000 && section_base <= vmm::kUserHi) {
-        uint16_t mz{};
-        if (vmm::rd(section_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
-            vmm::set_base(section_base, 0);
-            printf("[+] found FortniteClient base 0x%llx (via EPROCESS.SectionBaseAddress)\n",
-                   (unsigned long long)section_base);
-            return true;
-        }
+        vmm::set_base(section_base, 0);
+        printf("[+] found FortniteClient base 0x%llx (via EPROCESS.SectionBaseAddress)\n",
+               (unsigned long long)section_base);
+        return true;
     }
 
-    // Fallback: PEB -> LDR module walk (requires target CR3 for user-space page walk).
-    uint64_t peb{}, ldr{}, head{}, cur{};
+    // Try PEB.ImageBaseAddress (single user-mode page walk read).
+    uint64_t peb{}, image_base{};
     if (!vmm::rd(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) || !ok(peb)) {
         printf("[!] resolve_base: PEB read failed at 0x%llx\n",
                (unsigned long long)vmm::g_eprocess + off::Eproc_Peb);
         return false;
     }
     printf("[+] PEB 0x%llx\n", (unsigned long long)peb);
+    if (vmm::rd(peb + off::Peb_ImageBaseAddress, &image_base, sizeof(image_base)) &&
+        image_base > 0x10000 && image_base <= vmm::kUserHi) {
+        uint16_t mz{};
+        if (vmm::rd(image_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
+            vmm::set_base(image_base, 0);
+            printf("[+] found FortniteClient base 0x%llx (via PEB.ImageBaseAddress)\n",
+                   (unsigned long long)image_base);
+            return true;
+        }
+    }
+
+    // Fallback: PEB -> LDR module walk (requires page walking user memory).
+    uint64_t ldr{}, head{}, cur{};
     if (!vmm::rd(peb + off::Peb_Ldr, &ldr, sizeof(ldr)) || !ok(ldr)) {
         printf("[!] resolve_base: LDR read failed at 0x%llx\n", peb + off::Peb_Ldr);
         return false;

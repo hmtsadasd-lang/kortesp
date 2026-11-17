@@ -46,6 +46,7 @@ extern uint64_t  g_ntos_size; // ntoskrnl image size
 extern uint32_t  g_pid;
 extern bool      g_ready;
 extern bool      g_attached;
+extern bool      g_dtb_ok;      // target CR3 proven: ntoskrnl + PEB translate
 
 // Layout for EPROCESS field walks
 struct Layout {
@@ -83,6 +84,37 @@ struct Section {
 // lives behind its own --cr3scan mode.
 
 // ---------------------------------------------------------------------------
+// Why a walk stopped. Returned by the internals so a failure is falsifiable
+// instead of just "false".
+enum class Walk : int {
+    Ok = 0,
+    PhysFail,       // the driver refused the page-table read itself
+    Pml4,           // PML4E absent      -> wrong CR3
+    Pdpt,           // PDPTE absent
+    Pde,            // PDE absent
+    Pte,            // PTE absent        -> wrong VA inside a mapped region
+    NotPresent,     // reserved
+    BadArgs         // null CR3 / non-canonical VA
+};
+const char* walk_name(Walk s);
+
+// Walk one VA through a given CR3, reporting the first failing stage.
+// Used by attach/dump/dtbscan before g_kcr3 is trusted.
+
+// Reject a zero page unless the header was proven zeroed by a transposed pair.
+
+// Report where a walk stopped (capped at 8 prints per attach).
+
+// Prove the ATTACHED process's CR3 by translating ntoskrnl's own base through
+// it and requiring MZ. Independent of g_kcr3. On success it also fills g_kcr3,
+// because the kernel half of a user CR3 is the same mapping.
+bool prove_target_cr3();
+bool dtb_proven();
+
+// Diagnostics. Both operate on the attached EPROCESS and need no g_ready.
+bool dump_cr3();     // raw +0x28 and the four unmasked entries for PEB+0x18
+bool dtb_scan();     // sweep DTB offsets 0x20..0x80, accept the one that works
+
 bool init();                  // every stage
 bool init_ntos();
 bool init_kcr3_cached();
@@ -114,6 +146,15 @@ bool kwrite(uint64_t va, const void* buf, size_t len);
 bool read (uint64_t va, void* buf, size_t len);
 // Kernel-VA -> kread_trusted, user VA -> read (page walk).
 bool rd   (uint64_t va, void* buf, size_t len);
+
+// Walk one VA through a given CR3, reporting the first failing stage.
+// Used by attach/dump/dtbscan before g_kcr3 is trusted.
+
+// MZ check that survives a transposed kernel-VA pair (which zeroes the header).
+// Rejects a zero page unless the header was proven zeroed by a transposed pair,
+
+// Report where a walk stopped (capped at 8 prints per attach).
+// void report_fail(const char* who, uint64_t cr3, uint64_t va, Walk st);
 
 // MZ check that survives a transposed kernel-VA pair (which zeroes the header).
 

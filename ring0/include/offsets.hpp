@@ -104,6 +104,7 @@ constexpr uintptr_t Eproc_SectionBase = 0x3F8;  // UNVERIFIED - KPROCESS.Section
 // ---- PEB / LDR ---------------------------------------------------------
 constexpr uintptr_t Peb_Ldr  = 0x18;   // VERIFIED - PEB_LDR_DATA*
 constexpr uintptr_t Peb_Params = 0x20; // VERIFIED - RTL_USER_PROCESS_PARAMETERS*
+constexpr uintptr_t Peb_ImageBaseAddress = 0x10; // VERIFIED - ImageBaseAddress (PEB->ImageBaseAddress)
 constexpr uintptr_t Ldr_InLoadOrder = 0x10;   // VERIFIED
 constexpr uintptr_t Ldr_DllBase     = 0x30;   // VERIFIED
 constexpr uintptr_t Ldr_SizeOfImage = 0x40;   // VERIFIED

@@ -39,6 +39,8 @@ struct CmdFlags {
     bool only_eproc{ false };
     bool esp_mode{ false };
     bool preflight{ false };
+    bool dtbscan{ false };
+    bool dump_cr3{ false };
     bool actors{ false };
     uint64_t raw_pa{ 0 };
     size_t   raw_len{ 16 };
@@ -118,9 +120,12 @@ CmdFlags parse_cmd() {
             if (wcscmp(argv[i], L"--ntos")  == 0) f.only_ntos = true;
             if (wcscmp(argv[i], L"--cr3scan") == 0) f.only_cr3 = true;
             if (wcscmp(argv[i], L"--eproc") == 0) f.only_eproc = true;
+            if (wcscmp(argv[i], L"--dtbscan") == 0) f.dtbscan = true;
+            if (wcscmp(argv[i], L"--dump-cr3") == 0) f.dump_cr3 = true;
             if (wcscmp(argv[i], L"--driver-name") == 0 && i + 1 < argc)
                 f.driver_name = argv[++i];
             if (wcscmp(argv[i], L"--raw") == 0) {
+                f.raw = true;
                 f.raw_pa = wcstoull(argv[++i], nullptr, 0);
                 if (i + 1 < argc && argv[i + 1][0] != L'-') {
                     const unsigned long long l = wcstoull(argv[++i], nullptr, 0);
@@ -287,6 +292,22 @@ int wmain() {
 
     if (flags.raw) {
         const bool ok = raw_read(flags.raw_pa, flags.raw_len);
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
+
+    if (flags.dtbscan) {
+        if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
+        if (!vmm::init_system()) { vmm::shutdown(); return 1; }
+        const bool ok = vmm::dtb_scan();
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
+
+    if (flags.dump_cr3) {
+        if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
+        if (!vmm::init_system()) { vmm::shutdown(); return 1; }
+        const bool ok = vmm::dump_cr3();
         vmm::shutdown();
         return ok ? 0 : 1;
     }
