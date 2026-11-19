@@ -58,6 +58,6 @@ bool hide_symlink(const wchar_t* link);
 // PFN is owned as a page table, so every PML4/PDPTE/PDE/PTE read fails while
 // plain RAM reads fine. Must run BEFORE --cloak (it needs the driver still in
 // PsLoadedModuleList) and be re-run every boot (memory-only patch).
-bool patch_cached_map();
+bool patch_cached_map(bool dry_run = false, const char* step = nullptr);
 
 } // namespace r0

@@ -40,6 +40,7 @@ bool module_base(uint64_t& base, uint32_t& size);
 // created from, or our_base() cannot find the KLDR entry. Precedence:
 // --driver-name > FORTESP_DRIVER_IMAGE > "dbutil_2_3.sys".
 void set_driver_image(const char* name);
+const char* driver_image();
 
 // Diagnostics for the dry run.
 struct Plan {

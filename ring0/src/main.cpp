@@ -21,10 +21,14 @@ struct CmdFlags {
     bool probe{ false }, esp_mode{ false }, cloak{ false };
     bool cloak_restore{ false }, cloak_dry{ false }, hide_symlink{ false }, kwtest{ false };
     bool only_ntos{ false }, only_eproc{ false }, dump_cr3{ false }, dtbscan{ false };
-    bool dpatch{ false }, actors{ false }, raw{ false }, mock{ false };
+    bool dpatch{ false }, dpatch_dry{ false }, actors{ false }, raw{ false }, mock{ false };
+    bool kvread{ false };
     std::string backend;
+    std::string dpatch_step;
     uint64_t raw_pa{ 0 };
+    uint64_t kvread_va{ 0 };
     size_t   raw_len{ 16 };
+    size_t   kvread_len{ 16 };
     std::wstring driver_name;
 };
 
@@ -67,6 +71,19 @@ static CmdFlags parse_cmd() {
             f.backend = narrow(argv[++i]);
         }
         else if (!wcscmp(a, L"--dpatch")) f.dpatch = true;
+        else if (!wcscmp(a, L"--dpatch-dry")) { f.dpatch = true; f.dpatch_dry = true; }
+        else if (!wcscmp(a, L"--dpatch-step") && i + 1 < argc) {
+            f.dpatch = true;
+            f.dpatch_step = narrow(argv[++i]);
+        }
+        else if (!wcscmp(a, L"--kvread")) {
+            f.kvread = true;
+            if (i + 1 < argc) f.kvread_va = wcstoull(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                const unsigned long long l = wcstoull(argv[++i], nullptr, 0);
+                if (l && l <= 0x1000) f.kvread_len = static_cast<size_t>(l);
+            }
+        }
         else if (!wcscmp(a, L"--cloak-dry")) f.cloak_dry = true;
     }
     LocalFree(argv);
@@ -94,8 +111,12 @@ static bool enable_debug_privilege() {
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
     const BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr);
+    const DWORD err = GetLastError();
     CloseHandle(hToken);
-    return ok != FALSE;
+    // AdjustTokenPrivileges returns TRUE even when the privilege is not held;
+    // the documented failure signal is ERROR_NOT_ALL_ASSIGNED.
+    if (!ok) return false;
+    return err != ERROR_NOT_ALL_ASSIGNED;
 }
 
 static HWND wait_window(DWORD ms) {
@@ -134,7 +155,12 @@ static bool raw_read(uint64_t pa, size_t len) {
     printf("[*] in RAM map: %s%s\n", in_ram ? "yes" : "NO",
            in_ram ? "" : " - reading anyway, that is what --raw is for");
     std::vector<uint8_t> b(len, 0xCC);
-    if (!r0::phys_read_raw(pa, b.data(), len)) { printf("[!] IOCTL failed\n"); return false; }
+    if (!r0::phys_read_raw(pa, b.data(), len)) {
+        const DWORD err = GetLastError();
+        printf("[!] IOCTL failed (GetLastError=%lu / 0x%lx)\n",
+               (unsigned long)err, (unsigned long)err);
+        return false;
+    }
     bool any = false;
     for (uint8_t v : b) any |= (v != 0);
     for (size_t i = 0; i < len; i += 16) {
@@ -142,8 +168,35 @@ static bool raw_read(uint64_t pa, size_t len) {
         for (size_t j = 0; j < 16 && i + j < len; ++j) printf("%02x ", b[i + j]);
         printf("\n");
     }
-    if (!any) { printf("[!] all zeros\n"); return false; }
-    printf("[+] read returned data\n");
+    // The IOCTL succeeded, so the read direction is proven by construction.
+    // Zero bytes are data: an untouched free page above 4 GB is normally
+    // zero-filled, and treating that as a failure would make the documented
+    // --raw 0x100000000 test unpassable on a healthy machine.
+    if (!any) printf("[+] read returned zeros (IOCTL succeeded; page is zero-filled)\n");
+    else printf("[+] read returned data\n");
+    return true;
+}
+
+// --kvread: one kernel-VA read through the proven handler. Writes nothing.
+static bool kvread(uint64_t va, size_t len) {
+    if (!len || va < 0xFFFF800000000000ull) {
+        printf("[!] --kvread needs a kernel VA and len 1..4096\n");
+        return false;
+    }
+    if (!r0::vread_ready()) {
+        printf("[!] kernel-VA read direction not proven - refusing to touch 0x%llx\n",
+               (unsigned long long)va);
+        return false;
+    }
+    printf("[*] kernel-VA read 0x%llx, %zu bytes (no writes)\n",
+           (unsigned long long)va, len);
+    std::vector<uint8_t> b(len, 0xCC);
+    if (!r0::vread(va, b.data(), len)) { printf("[!] vread failed\n"); return false; }
+    for (size_t i = 0; i < len; i += 16) {
+        printf("  %016llx  ", (unsigned long long)(va + i));
+        for (size_t j = 0; j < 16 && i + j < len; ++j) printf("%02x ", b[i + j]);
+        printf("\n");
+    }
     return true;
 }
 
@@ -210,7 +263,15 @@ int wmain() {
     if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
     if (f.only_ntos) { vmm::shutdown(); return 0; }
 
-    if (f.dpatch) { const bool ok = r0::patch_cached_map(); vmm::shutdown(); return ok ? 0 : 1; }
+    if (f.kvread) { const bool ok = kvread(f.kvread_va, f.kvread_len); vmm::shutdown(); return ok ? 0 : 1; }
+
+    if (f.dpatch) {
+        vmm::init_pte_base();
+        const bool ok = r0::patch_cached_map(
+            f.dpatch_dry, f.dpatch_step.empty() ? nullptr : f.dpatch_step.c_str());
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
 
     if (!vmm::init_system()) { vmm::shutdown(); return 1; }
     if (f.only_eproc) { vmm::shutdown(); return 0; }

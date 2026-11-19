@@ -63,7 +63,7 @@ void drop_state() {
     if (state_path(p, MAX_PATH)) DeleteFileW(p);
 }
 
-const char* driver_image() {
+const char* driver_image_name() {
     if (!g_driver_name.empty()) return g_driver_name.c_str();
     const char* e = getenv("FORTESP_DRIVER_IMAGE");
     if (e && *e) return e;
@@ -72,11 +72,24 @@ const char* driver_image() {
     return "dbutil_2_3.sys";
 }
 
+// A trusted (kernel-VA) read is only safe for an address whose page is
+// provably present. safe_translate() walks the PTE self-map and fails closed,
+// so a decoy qword in ntoskrnl .data can no longer fault the driver's memmove
+// (the 0x50 path).
+bool safe_read(uint64_t va, void* buf, size_t len) {
+    if (!len) return false;
+    for (size_t i = 0; i < len; i += 0x1000) {
+        uint64_t pa{};
+        if (!vmm::safe_translate(va + i, pa)) return false;
+    }
+    return vmm::kread_trusted(va, buf, len);
+}
+
 bool valid_head(uint64_t h) {
     if (h < 0xFFFF800000000000ull || (h & 0xF)) return false;
     uint64_t flink{}, blink{};
-    if (!vmm::kread_trusted(h, &flink, 8)) return false;
-    if (!vmm::kread_trusted(h + 8, &blink, 8)) return false;
+    if (!safe_read(h, &flink, 8)) return false;
+    if (!safe_read(h + 8, &blink, 8)) return false;
     if (flink < 0xFFFF800000000000ull || blink < 0xFFFF800000000000ull) return false;
     return true;
 }
@@ -99,7 +112,7 @@ bool find_head(uint64_t& head) {
         for (uint64_t page = lo & ~0xFFFull; page < hi; page += kChunk) {
             size_t n = kChunk;
             if (page + n > hi) n = static_cast<size_t>(hi - page);
-            if (!vmm::kread_trusted(page, buf.data(), n)) continue;
+            if (!safe_read(page, buf.data(), n)) continue;
             for (size_t off = 0; off + 8 <= n; off += 8) {
                 const uint64_t cand_addr = page + off;
                 if (cand_addr < lo || cand_addr + 8 > hi) continue;
@@ -126,20 +139,20 @@ bool find_our_driver() {
     const size_t wl = strlen(lwant);
 
     uint64_t flink{};
-    if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
+    if (!safe_read(g_head, &flink, 8)) return false;
     uint64_t cur = flink;
     for (int guard = 0; cur && cur != g_head && guard < 4096; ++guard) {
         uint64_t dll_base{}, cur_flink{}, name_buf{};
         uint16_t nlen{};
-        if (!vmm::kread_trusted(cur + 0x30, &dll_base, 8)) break;
-        if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
-        if (!vmm::kread_trusted(cur + 0x58, &nlen, 2)) break;
-        if (!vmm::kread_trusted(cur + 0x60, &name_buf, 8)) break;
+        if (!safe_read(cur + 0x30, &dll_base, 8)) break;
+        if (!safe_read(cur, &cur_flink, 8)) break;
+        if (!safe_read(cur + 0x58, &nlen, 2)) break;
+        if (!safe_read(cur + 0x60, &name_buf, 8)) break;
 
         if (name_buf >= 0xFFFF800000000000ull && nlen > 3 && nlen < 512) {
             wchar_t wname[256]{};
             const int chars = nlen / 2;
-            if (chars < 255 && vmm::kread_trusted(name_buf, wname, nlen)) {
+            if (chars < 255 && safe_read(name_buf, wname, nlen)) {
                 char aname[256]{};
                 for (int i = 0; i < chars; ++i)
                     aname[i] = wname[i] < 128 ? static_cast<char>(wname[i]) : '?';
@@ -163,15 +176,17 @@ bool find_our_driver() {
 
 } // namespace
 
+const char* driver_image() { return driver_image_name(); }
+
 bool module_base(uint64_t& base, uint32_t& size) {
     if (g_our_base == 0 && !find_our_driver()) return false;
     uint16_t mz{};
-    if (!vmm::kread_trusted(g_our_base, &mz, 2) || mz != 0x5A4D) return false;
+    if (!safe_read(g_our_base, &mz, 2) || mz != 0x5A4D) return false;
     uint32_t lfanew{};
-    if (!vmm::kread_trusted(g_our_base + 0x3C, &lfanew, 4)) return false;
+    if (!safe_read(g_our_base + 0x3C, &lfanew, 4)) return false;
     if (lfanew < 0x40 || lfanew > 0x1000) return false;
     uint32_t img{};
-    if (!vmm::kread_trusted(g_our_base + lfanew + 0x50, &img, 4)) return false;
+    if (!safe_read(g_our_base + lfanew + 0x50, &img, 4)) return false;
     if (img < 0x1000 || img > (1u << 26)) return false;
     base = g_our_base;
     size = img;
@@ -198,16 +213,16 @@ bool apply(bool commit) {
     }
 
     uint64_t flink{};
-    if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
+    if (!safe_read(g_head, &flink, 8)) return false;
     uint64_t cur = flink;
     for (int guard = 0; cur && cur != g_head && guard < 4096; ++guard) {
         uint64_t dll_base{}, cur_flink{};
-        if (!vmm::kread_trusted(cur + 0x30, &dll_base, 8)) break;
-        if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
+        if (!safe_read(cur + 0x30, &dll_base, 8)) break;
+        if (!safe_read(cur, &cur_flink, 8)) break;
         if (dll_base != g_our_base) { cur = cur_flink; continue; }
 
         uint64_t cur_blink{};
-        if (!vmm::kread_trusted(cur + 8, &cur_blink, 8)) return false;
+        if (!safe_read(cur + 8, &cur_blink, 8)) return false;
 
         printf("[*] entry 0x%llx DllBase 0x%llx prev 0x%llx next 0x%llx\n",
                (unsigned long long)cur, (unsigned long long)dll_base,
@@ -232,7 +247,7 @@ bool apply(bool commit) {
         }
 
         uint64_t a{}, b{};
-        if (!vmm::kread_trusted(cur_blink, &a, 8) || !vmm::kread_trusted(cur_flink + 8, &b, 8) ||
+        if (!safe_read(cur_blink, &a, 8) || !safe_read(cur_flink + 8, &b, 8) ||
             a != cur_flink || b != cur_blink) {
             printf("[!] read-back does not show an unlinked list\n");
             return false;
@@ -267,7 +282,7 @@ bool restore() {
     }
 
     uint64_t pf{}, nb{};
-    if (!vmm::kread_trusted(s.prev, &pf, 8) || !vmm::kread_trusted(s.next + 8, &nb, 8)) return false;
+    if (!safe_read(s.prev, &pf, 8) || !safe_read(s.next + 8, &nb, 8)) return false;
 
     if (pf == s.entry && nb == s.entry) {
         printf("[*] list already re-linked - clearing state\n");
@@ -285,7 +300,7 @@ bool restore() {
     if (!vmm::kwrite_trusted(s.next + 8, &s.entry, 8)) return false;
 
     uint64_t a{}, b{};
-    if (!vmm::kread_trusted(s.prev, &a, 8) || !vmm::kread_trusted(s.next + 8, &b, 8) ||
+    if (!safe_read(s.prev, &a, 8) || !safe_read(s.next + 8, &b, 8) ||
         a != s.entry || b != s.entry) {
         printf("[!] read-back does not show a re-linked list\n");
         return false;

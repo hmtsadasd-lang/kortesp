@@ -1,0 +1,19 @@
+fortesp ring0
+[r0] direction proven: 0x9B0C1F40=read 0x9B0C1F44=write
+[+] driver ok
+[+] physical map: 5 range(s), 0x3ed87e000 usable bytes (loader list)
+[+] kernel-VA read path proven
+[+] ntoskrnl base 0xfffff80189200000 size 0x1450000
+[*] pte base candidate 0xffffac8000000000 (18 of 18 site(s))
+[+] pte base self-map proof: private VA 0x1b985a80000 -> pte 0x80000003f09c5867 -> pa 0x3f09c5000
+[+] PTE self-map base 0xffffac8000000000 (validated)
+[+] MmMapIoSpace = ntos+0x487ab0 (0xfffff80189687ab0), prologue: 48 83 ec 28 41 0f b6 c0 83 f8 06 73 2b 41 b8 40
+[+] driver module base 0xfffff80118bc0000 size 0x7000
+[*] driver SizeOfImage 0x7000, 6 section(s)
+[*] MmMapIoSpace IAT slot 0xfffff80118bc2048 (rva 0x2048) currently 0xfffff80189687ab0
+[*] stub site 0xfffff80118bc1b55 (rva 0x1b55, 17 int3 bytes, 11-byte stub)
+[*] stub bytes (11): 41 b8 01 00 00 00 e9 50 5f ac 70
+[*] physical: slot 0xfffff80118bc2048 -> 0x385a048, stub 0xfffff80118bc1b55 -> 0x385cb55
+[*] dry run: no writes
+[*] plan: stub 0xfffff80118bc1b55 <- 11 bytes; slot 0xfffff80118bc2048 <- 0xfffff80118bc1b55
+exit=0 

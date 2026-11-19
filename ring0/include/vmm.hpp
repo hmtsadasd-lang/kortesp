@@ -38,6 +38,9 @@ extern uint32_t g_stamp;
 // Global state
 extern uint64_t  g_kcr3;
 extern uint64_t  g_gcr3;
+// Runtime PTE self-map base (nt!MiPteBase). Randomized since Win10 1607;
+// discovered from MiGetPteAddress and validated against ntoskrnl's own PTE.
+extern uint64_t  g_pte_base;
 extern uint64_t  g_base;
 extern uint64_t  g_size;
 extern uint64_t  g_eprocess;
@@ -136,6 +139,7 @@ bool dtb_scan();     // sweep DTB offsets 0x20..0x80, accept the one that works
 
 bool init();                  // every stage
 bool init_ntos();
+bool init_pte_base();
 bool init_kcr3_cached();
 bool init_system();
 bool init_kcr3();

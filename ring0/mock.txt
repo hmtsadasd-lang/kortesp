@@ -1,0 +1,43 @@
+[!] enable_debug_privilege failed (module ImageBase will read 0)
+fortesp ring0
+ring0 mock self-test (no kernel driver required)
+
+[!] kernel-VA read path NOT proven
+1. page walk
+  [PASS] 8-byte read through a 2MB large-page mapping
+  [PASS] 1-byte read does not overflow the destination
+  [PASS] read from a second 2MB chunk lands on the right physical page
+  [PASS] read at base+0x1F000000 (far past the first chunk) resolves
+
+2. kernel-space read (mock EPROCESS)
+  [PASS] EPROCESS->Peb resolves to the target PEB
+
+3. PEB / LDR module walk
+[+] client base 0x7ff600000000 (PEB.ImageBaseAddress)
+[+] client base 0x7ff600000000
+[+] world 0x7ff600102000
+[+] gamestate 0x7ff600108000
+  [PASS] resolve_base() finds the client through PEB->Ldr
+  [PASS] module base is the client image
+
+4. offset chain
+  [PASS] esp::init() resolved GEngine->Viewport->World->GameState
+
+5. FString decode
+  [PASS] encode/decode round-trips a name
+  [PASS] the name read out of the FString decodes correctly
+
+6. LWC doubles
+  [PASS] POV.Location reads back as 3x double
+  [PASS] FTransform.Translation reads back as 3x double
+  [PASS] State_Team reads back as a byte
+
+7. projection and drawing
+  [PASS] exactly one player drew a box and a health bar
+  [PASS] the local player was excluded
+
+8. cleanup
+  [PASS] esp::shutdown() clears readiness
+  [PASS] backend detached
+
+17 passed, 0 failed

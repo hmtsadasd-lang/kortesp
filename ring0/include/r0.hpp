@@ -77,6 +77,6 @@ bool hide_symlink(const wchar_t* link);
 // write would bugcheck), verifies every byte before writing, and needs
 // the driver still listed in the kernel module list - so run it BEFORE
 // --cloak, and re-run it on every boot (it lives only in memory).
-bool patch_cached_map();
+bool patch_cached_map(bool dry_run = false, const char* step = nullptr);
 
 } // namespace r0

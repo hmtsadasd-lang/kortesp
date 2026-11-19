@@ -13,6 +13,7 @@ uint32_t                                 vmm::g_stamp = 1;
 
 uint64_t  vmm::g_kcr3 = 0;
 uint64_t  vmm::g_gcr3 = 0;
+uint64_t  vmm::g_pte_base = 0;
 uint64_t  vmm::g_base = 0;
 uint64_t  vmm::g_size = 0;
 uint64_t  vmm::g_eprocess = 0;
@@ -485,8 +486,9 @@ bool vmm::page_table_read_ok() {
 
 bool vmm::safe_translate(uint64_t va, uint64_t& pa) {
     if ((va >> 48) != 0xFFFFull) return false;
+    if (!g_pte_base && !init_pte_base()) return false;
     constexpr uint64_t kMask48 = 0x0000FFFFFFFFFFFFull;
-    constexpr uint64_t kPteBase = 0xFFFFF68000000000ull;
+    const uint64_t kPteBase = g_pte_base;
     const uint64_t m = va & kMask48;
     const uint64_t pde_base = kPteBase + ((kPteBase & kMask48) >> 9);
     const uint64_t ppe_base = kPteBase + ((pde_base & kMask48) >> 9);
@@ -668,6 +670,130 @@ bool vmm::export_rva(const char* want, uint64_t& rva) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Runtime PTE self-map base (nt!MiPteBase).
+//
+// Win10 1607+ randomizes the base that used to be the constant
+// 0xFFFFF68000000000. MiGetPteAddress in this build is
+//
+//   48 C1 E9 09                    shr  rcx, 9
+//   48 23 C8                       and  rcx, rax        ; rax = 7FFFFFFFF8h
+//   48 B8 <imm64 = MiPteBase>      mov  rax, MiPteBase
+//   48 03 C8                       add  rcx, rax
+//
+// The image stores the link-time 0xFFFFF68000000000 in many inlined copies;
+// the loader relocates each one to the randomized runtime base. Reading the
+// instruction stream therefore yields the live value directly - no .data
+// pointer scan and no blind candidate dereference. The sites must agree, and
+// the winner is proven against ntoskrnl's own self-map PTE (present, PFN page
+// starts with a PE image header).
+// ---------------------------------------------------------------------------
+bool vmm::init_pte_base() {
+    if (g_pte_base) return true;
+    if (!g_ntos || !g_ntos_size) return false;
+
+    std::vector<Section> secs;
+    if (!sections(secs)) {
+        printf("[!] pte base: ntoskrnl section table unavailable\n");
+        return false;
+    }
+
+    // shr rcx,9 ; and rcx,rax ; mov rax, imm64  (exactly 9 bytes before imm64)
+    static const uint8_t kSig[9] = {
+        0x48, 0xC1, 0xE9, 0x09, 0x48, 0x23, 0xC8, 0x48, 0xB8
+    };
+
+    uint64_t votes[8]{};
+    size_t  counts[8]{};
+    int nvotes = 0;
+    size_t total = 0;
+    auto vote = [&](uint64_t v) {
+        ++total;
+        for (int i = 0; i < nvotes; ++i) if (votes[i] == v) { ++counts[i]; return; }
+        if (nvotes < 8) { votes[nvotes] = v; counts[nvotes] = 1; ++nvotes; }
+    };
+
+    constexpr size_t kChunk = 0x10000;
+    constexpr size_t kTail = sizeof(kSig) + 8;
+    std::vector<uint8_t> buf(kChunk + kTail);
+    for (const auto& s : secs) {
+        if (!(s.chars & IMAGE_SCN_MEM_EXECUTE) || !s.size) continue;
+        const uint64_t lo = g_ntos + s.va;
+        const uint64_t hi = lo + s.size;
+        for (uint64_t page = lo; page < hi; page += kChunk) {
+            size_t rn = kChunk;
+            if (page + rn > hi) rn = static_cast<size_t>(hi - page);
+            if (page + rn + kTail <= hi) rn += kTail;   // overlap for split matches
+            if (!r0::vread(page, buf.data(), rn)) continue;
+            for (size_t i = 0; i + kTail <= rn; ++i) {
+                if (memcmp(buf.data() + i, kSig, sizeof(kSig)) != 0) continue;
+                uint64_t v{};
+                memcpy(&v, buf.data() + i + sizeof(kSig), 8);
+                vote(v);
+            }
+        }
+    }
+
+    if (!nvotes) {
+        printf("[!] pte base: MiGetPteAddress pattern not found in ntoskrnl\n");
+        return false;
+    }
+    int best = 0;
+    for (int i = 1; i < nvotes; ++i) if (counts[i] > counts[best]) best = i;
+    const uint64_t cand = votes[best];
+    printf("[*] pte base candidate 0x%llx (%zu of %zu site(s))\n",
+           (unsigned long long)cand, counts[best], total);
+
+    // The self-map occupies one 512 GB PML4 slot, so the base is naturally
+    // 512 GB aligned. Refuse anything else before dereferencing it.
+    if ((cand >> 48) != 0xFFFFull || cand < 0xFFFF800000000000ull ||
+        (cand & 0x7FFFFFFFFFull) != 0) {
+        printf("[!] pte base: 0x%llx is not a canonical 512 GB-aligned base\n",
+               (unsigned long long)cand);
+        return false;
+    }
+
+    // Prove the candidate on a page that is guaranteed 4 KB-mapped: allocate
+    // a private page in this process, write a nonce, translate it through the
+    // candidate self-map, then read the decoded PFN physically and require the
+    // nonce. ntoskrnl is 2 MB mapped here, so its "PTE slot" aliases the image
+    // page itself (an MZ header) instead of a PTE - that is not a valid proof.
+    void* probe = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                               PAGE_READWRITE);
+    if (!probe) {
+        printf("[!] pte base: private probe page allocation failed\n");
+        return false;
+    }
+    const uint64_t nonce = 0x9E3779B97F4A7C15ull;
+    volatile uint64_t* words = static_cast<volatile uint64_t*>(probe);
+    words[0] = nonce;
+    words[1] = ~nonce;
+
+    const uint64_t probe_va = reinterpret_cast<uint64_t>(probe);
+    const uint64_t probe_pte = cand + ((probe_va & 0x0000FFFFFFFFFFFFull) >> 12) * 8;
+    uint64_t e{};
+    const bool present = r0::vread(probe_pte, &e, sizeof e) && (e & 1);
+    const uint64_t pfn = present ? (e & kPteMask) >> 12 : 0;
+    uint8_t got[16]{};
+    const bool match = pfn && r0::pread(pfn << 12, got, sizeof got) &&
+                       memcmp(got, &nonce, 8) == 0;
+    VirtualFree(probe, 0, MEM_RELEASE);
+    if (!match) {
+        printf("[!] pte base 0x%llx failed the private-page self-map proof "
+               "(pte 0x%llx, present=%d, pfn 0x%llx)\n",
+               (unsigned long long)cand, (unsigned long long)e,
+               present ? 1 : 0, (unsigned long long)pfn);
+        return false;
+    }
+    printf("[+] pte base self-map proof: private VA 0x%llx -> pte 0x%llx -> pa 0x%llx\n",
+           (unsigned long long)probe_va, (unsigned long long)e,
+           (unsigned long long)(pfn << 12));
+
+    g_pte_base = cand;
+    printf("[+] PTE self-map base 0x%llx (validated)\n", (unsigned long long)cand);
+    return true;
+}
+
 namespace {
 
 constexpr uint64_t kKernelLo = 0xFFFF800000000000ull;
@@ -685,8 +811,18 @@ bool has_bytes(const uint8_t* hay, size_t n, const char* needle) {
     return false;
 }
 
-bool validate_system_eprocess(uint64_t p) {
+bool validate_system_eprocess(uint64_t p, bool page_gate) {
     if (!in_kernel_va(p) || (p & 7)) return false;
+    // A .data decoy can point at a paged-out page; gate every header page
+    // through the PTE self-map before touching it with the trusted read.
+    // The PsInitialSystemProcess export is already authoritative, so it may
+    // bypass the gate (and keep --eproc usable if PTE-base discovery fails).
+    if (page_gate) {
+        for (size_t i = 0; i < 0x600; i += 0x1000) {
+            uint64_t pa{};
+            if (!vmm::safe_translate(p + i, pa)) return false;
+        }
+    }
     uint8_t buf[0x600];
     if (!vmm::kread_trusted(p, buf, sizeof buf)) return false;
     if (!has_bytes(buf, sizeof buf, "System")) return false;
@@ -724,7 +860,7 @@ static bool find_system_eprocess(uint64_t& out) {
     uint64_t sym = 0;
     if (vmm::export_rva("PsInitialSystemProcess", sym)) {
         uint64_t p = 0;
-        if (kq(vmm::g_ntos + sym, p) && validate_system_eprocess(p)) { out = p; return true; }
+        if (kq(vmm::g_ntos + sym, p) && validate_system_eprocess(p, /*page_gate=*/false)) { out = p; return true; }
     }
 
     std::vector<vmm::Section> secs;
@@ -747,7 +883,7 @@ static bool find_system_eprocess(uint64_t& out) {
                 uint64_t cand{};
                 memcpy(&cand, buf.data() + off, 8);
                 if (!in_kernel_va(cand) || (cand & 7)) continue;
-                if (validate_system_eprocess(cand)) { out = cand; return true; }
+                if (validate_system_eprocess(cand, /*page_gate=*/true)) { out = cand; return true; }
             }
         }
     }
@@ -768,24 +904,54 @@ bool vmm::discover_offsets(uint64_t p) {
     }
     if (!o.image) return false;
 
-    // links: Flink kernel VA ve Flink->Blink == &entry olan LIST_ENTRY
-    for (size_t i = 0x100; i + 8 <= sizeof buf; i += 8) {
-        uint64_t fl = *(uint64_t*)(buf + i);
+    // pid + links: System'in kendi PID'i 4'tur. Adayi yalnizca degeriyle kabul
+    // etmiyoruz. ActiveProcessLinks her NT build'inde UniqueProcessId'yi hemen
+    // izler ve zincirdeki her dugum gecerli bir PID ile gorunur bir
+    // ImageFileName tasir. Bu kosullar, ayni EPROCESS icindeki
+    // SessionProcessLinks gibi baska dairesel listelerin yanlislikla
+    // secilmesini engeller (o liste yalnizca System'in oturumunu dolasir ve
+    // Fortnite'i asla bulamaz).
+    auto image_ok = [&](uint64_t e) {
+        char img[16]{};
+        if (!vmm::kread_trusted(e + o.image, img, sizeof img - 1)) return false;
+        for (char c : img) {
+            if (c == 0) return true;
+            if (c < 0x20 || c > 0x7E) return false;
+        }
+        return false;
+    };
+    auto walk = [&](uint64_t e, size_t links, size_t pid, int max) {
+        uint64_t cur = e;
+        for (int n = 0; n < max; ++n) {
+            uint64_t fl = 0, back = 0;
+            if (!kq(cur + links, fl)) return false;
+            if (!in_kernel_va(fl) || (fl & 7)) return false;
+            const uint64_t next = fl - links;
+            if (next == e) return n > 0;
+            if (!in_kernel_va(next) || (next & 7)) return false;
+            uint64_t np = 0;
+            if (!kq(next + pid, np)) return false;
+            if (!np || np > 0x100000 || (np & 3)) return false;
+            if (!image_ok(next)) return false;
+            if (!kq(next + links + 8, back) || back != cur + links) return false;
+            cur = next;
+        }
+        return true;   // max dugum boyunca tutarli zincir
+    };
+
+    for (size_t i = 0x100; i + 16 <= sizeof buf; i += 8) {
+        if (*(uint64_t*)(buf + i) != 4) continue;
+        const size_t l = i + 8;          // ActiveProcessLinks, PID'yi izler
+        uint64_t fl = *(uint64_t*)(buf + l);
         if (!in_kernel_va(fl) || (fl & 7)) continue;
         uint64_t back = 0;
-        if (!kq(fl + 8, back)) continue;
-        if (back != p + i) continue;
-        o.links = (uint32_t)i;
+        if (!kq(fl + 8, back) || back != p + l) continue;
+        if (!walk(p, l, i, 8)) continue;
+        o.pid = (uint32_t)i;
+        o.links = (uint32_t)l;
         break;
     }
-    if (!o.links) return false;
-
-    // pid: 4 olan ilk hizali qword'u al (System EPROCESS'in kendi pid'i 4'dur).
-    // links zaten LIST_ENTRY ile dogrulanmistir; DTB +0x28 gecerligi ayrı kontrol edilmistir.
-    for (size_t i = 0x100; i + 8 <= sizeof buf; i += 8) {
-        if (*(uint64_t*)(buf + i) == 4) { o.pid = (uint32_t)i; break; }
-    }
-    if (!o.pid) return false;
+    if (!o.pid || !o.links) return false;
 
     vmm::g_off = o;
     vmm::g_off_ready = true;
