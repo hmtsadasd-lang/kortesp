@@ -342,5 +342,6 @@ inline void text(float x, float y, const wchar_t* s, Color c, float sc);
 inline float textw(const wchar_t* s, float sc);
 inline int width() { return detail::g_w; }
 inline int height() { return detail::g_h; }
+inline int pending() { return detail::g_n; }
 
 } // namespace ov

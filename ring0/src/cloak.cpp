@@ -1,5 +1,6 @@
 #include "cloak.hpp"
 #include "vmm.hpp"
+#include "r0.hpp"
 #include <windows.h>
 #include <cstring>
 #include <cstdlib>
@@ -180,6 +181,10 @@ bool module_base(uint64_t& base, uint32_t& size) {
 bool apply(bool commit) {
     if (!g_on) {
         printf("[!] cloak not initialised\n");
+        return false;
+    }
+    if (!r0::g_write_ok) {
+        printf("[!] kernel write path not proven - refusing cloak\n");
         return false;
     }
     if (!g_head && !find_head(g_head)) {

@@ -10,7 +10,7 @@ echo Building fortesp_r0.exe (MinGW-w64)...
     -Wno-unused-parameter -Wno-cast-function-type ^
     -Iinclude -Isrc ^
     -o out\fortesp_r0.exe ^
-    src\main.cpp src\vmm.cpp src\r0.cpp src\esp.cpp src\cloak.cpp ^
+    src\main.cpp src\vmm.cpp src\r0.cpp src\esp.cpp src\cloak.cpp src\mock.cpp src\mem.cpp ^
     -ld3d11 -ldxgi -ld3dcompiler -lgdi32 -luser32 -lole32 -static-libgcc -static-libstdc++
 if errorlevel 1 (
     echo Build FAILED

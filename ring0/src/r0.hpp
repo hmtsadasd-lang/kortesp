@@ -37,8 +37,12 @@ void set_backend(const Backend* be);
 
 bool pread(uint64_t pa, void* buf, size_t len);
 bool pwrite(uint64_t pa, const void* buf, size_t len);
+bool phys_read_raw(uint64_t pa, void* buf, size_t len);
 bool vwrite(uint64_t va, const void* buf, size_t len);
 bool vread(uint64_t va, void* buf, size_t len);
+
+extern bool g_write_ok;
+bool kwtest(uint64_t sys_eproc);
 
 // Prove which half of the kernel-VA pair 0x9B0C1EC4 really is.
 bool vread_probe(uint64_t va, size_t len);

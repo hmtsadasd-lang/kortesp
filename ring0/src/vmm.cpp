@@ -1,6 +1,7 @@
 #include "vmm.hpp"
 #include "offsets.hpp"
 #include "r0.hpp"
+#include "mem.hpp"
 #include <windows.h>
 #include <cstring>
 #include <cstdio>
@@ -24,6 +25,10 @@ bool      vmm::g_ntos_mz_broken = false;
 
 vmm::Layout vmm::g_lay{ off::Eproc_Pid, off::Eproc_Links, off::Eproc_Name,
                         off::Eproc_Dtb, off::Eproc_Peb };
+
+vmm::ProcOffsets vmm::g_off{};
+bool           vmm::g_off_ready = false;
+vmm::Target    vmm::g_target{};
 
 namespace {
 
@@ -549,6 +554,10 @@ bool vmm::init_kcr3() {
     return false;
 }
 
+namespace {
+bool pml4e_plausible(uint64_t cr3, uint64_t va);
+}
+
 bool vmm::scan_kernel_cr3() {
     if (g_kcr3) {
         printf("[*] kernel CR3 already 0x%llx\n", (unsigned long long)g_kcr3);
@@ -578,6 +587,7 @@ bool vmm::scan_kernel_cr3() {
             memcpy(&e, buf.data() + off, 8);
             if (!(e & 1)) continue;
             const uint64_t pa = base + off;
+            if (!pml4e_plausible(pa, g_ntos)) continue;
             uint64_t probe{};
             if (!translate_cr3(pa, g_ntos, probe)) continue;
             if (!page_mz(probe)) continue;
@@ -660,89 +670,145 @@ bool vmm::export_rva(const char* want, uint64_t& rva) {
 
 namespace {
 
-bool looks_eprocess(uint64_t p, const vmm::Layout& l) {
-    if (p < 0xFFFF800000000000ull || (p & 7)) return false;
+constexpr uint64_t kKernelLo = 0xFFFF800000000000ull;
+constexpr uint64_t kKernelHi = 0xFFFFFFFFFFFFFFFFull;
 
-    uint64_t pid{};
-    char name[16]{};
-    if (!vmm::kread_trusted(p + l.pid, &pid, 8)) return false;
-    if (pid != 4) return false;
-    if (!vmm::kread_trusted(p + l.name, name, sizeof(name))) return false;
-    if (memcmp(name, "System", 7) != 0) return false;
+bool in_kernel_va(uint64_t a) { return a >= kKernelLo && a <= kKernelHi; }
 
-    uint64_t flink{}, blink{};
-    if (!vmm::kread_trusted(p + l.links, &flink, 8)) return false;
-    if (!vmm::kread_trusted(p + l.links + 8, &blink, 8)) return false;
-    if (flink < 0xFFFF800000000000ull || blink < 0xFFFF800000000000ull) return false;
-    uint64_t back{};
-    if (!vmm::kread_trusted(flink + 8, &back, 8)) return false;
-    if (back != p + l.links) return false;
+bool kq(uint64_t a, uint64_t& out) { return vmm::kread_trusted(a, &out, sizeof out); }
+
+bool has_bytes(const uint8_t* hay, size_t n, const char* needle) {
+    size_t m = strlen(needle);
+    if (m > n) return false;
+    for (size_t i = 0; i + m <= n; ++i)
+        if (!memcmp(hay + i, needle, m)) return true;
+    return false;
+}
+
+bool validate_system_eprocess(uint64_t p) {
+    if (!in_kernel_va(p) || (p & 7)) return false;
+    uint8_t buf[0x600];
+    if (!vmm::kread_trusted(p, buf, sizeof buf)) return false;
+    if (!has_bytes(buf, sizeof buf, "System")) return false;
+    bool pid4 = false;
+    for (size_t i = 0; i + 8 <= sizeof buf; i += 8)
+        if (*(uint64_t*)(buf + i) == 4) { pid4 = true; break; }
+    return pid4;
+}
+
+bool pml4e_plausible(uint64_t cr3, uint64_t va) {
+    if (!in_kernel_va(cr3) || (cr3 & 0xFFF)) return false;
+    uint64_t e = 0;
+    if (!kq(cr3 + 8 * ((va >> 39) & 0x1FF), e)) return false;
+    if (!(e & 1)) return false;
+    uint64_t pfn = (e >> 12) & 0xFFFFFFFFFFull;
+    if (!pfn) return false;
+    if (!vmm::phys_is_ram(pfn << 12, 0x1000)) return false;
     return true;
 }
 
-const vmm::Layout kCand[] = {
-    { 0x1D0, 0x1D8, 0x338, 0x28, 0x2E0 },
-    { 0x440, 0x448, 0x5A8, 0x28, 0x550 },
-};
+// Image alaninda: onceki byte null, printable ASCII, 15 byte icinde null ile biten
+bool plausible_image_field(const uint8_t* buf, size_t off) {
+    if (off == 0 || buf[off - 1] != 0) return false;
+    size_t i = off;
+    while (i < off + 15 && buf[i]) {
+        if (buf[i] < 0x20 || buf[i] > 0x7E) return false;
+        ++i;
+    }
+    return i < off + 15;   // null ile kapandi
+}
 
 } // namespace
+
+static bool find_system_eprocess(uint64_t& out) {
+    uint64_t sym = 0;
+    if (vmm::export_rva("PsInitialSystemProcess", sym)) {
+        uint64_t p = 0;
+        if (kq(vmm::g_ntos + sym, p) && validate_system_eprocess(p)) { out = p; return true; }
+    }
+
+    std::vector<vmm::Section> secs;
+    if (!vmm::sections(secs)) return false;
+    constexpr size_t kChunk = 0x1000;
+    std::vector<uint8_t> buf(kChunk);
+
+    for (const auto& s : secs) {
+        if (!(s.chars & IMAGE_SCN_MEM_WRITE) || (s.chars & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (!s.size) continue;
+        const uint64_t lo = vmm::g_ntos + s.va;
+        const uint64_t hi = lo + s.size;
+        for (uint64_t page = lo & ~0xFFFull; page < hi; page += kChunk) {
+            size_t n = kChunk;
+            if (page + n > hi) n = static_cast<size_t>(hi - page);
+            if (!vmm::kread_trusted(page, buf.data(), n)) continue;
+            for (size_t off = 0; off + 8 <= n; off += 8) {
+                const uint64_t cand_addr = page + off;
+                if (cand_addr < lo || cand_addr + 8 > hi) continue;
+                uint64_t cand{};
+                memcpy(&cand, buf.data() + off, 8);
+                if (!in_kernel_va(cand) || (cand & 7)) continue;
+                if (validate_system_eprocess(cand)) { out = cand; return true; }
+            }
+        }
+    }
+    return false;
+}
+
+bool vmm::discover_offsets(uint64_t p) {
+    uint8_t buf[0x600];
+    if (!vmm::kread_trusted(p, buf, sizeof buf)) return false;
+    vmm::ProcOffsets o{};
+
+    // pid: 4 olan qword'lar arasinda, +0x28 DTB page-aligned + pml4e_plausible olan ilkini sec
+    for (size_t i = 0x100; i + 8 <= sizeof buf; i += 8) {
+        if (*(uint64_t*)(buf + i) != 4) continue;
+        uint64_t dtb = 0;
+        if (!kq(p + 0x28, dtb)) continue;
+        if (dtb & 0xFFF) continue;
+        if (!pml4e_plausible(dtb, vmm::g_ntos)) continue;
+        o.pid = (uint32_t)i;
+        break;
+    }
+    if (!o.pid) return false;
+
+    // image: "System\0" + plausible_image_field capraz dogrulama
+    for (size_t i = 0x100; i + 7 <= sizeof buf; ++i) {
+        if (!memcmp(buf + i, "System\0", 7) && plausible_image_field(buf, i)) {
+            o.image = (uint32_t)i;
+            break;
+        }
+    }
+    if (!o.image) return false;
+
+    // links: Flink kernel VA ve Flink->Blink == &entry olan LIST_ENTRY
+    for (size_t i = 0x100; i + 8 <= sizeof buf; i += 8) {
+        uint64_t fl = *(uint64_t*)(buf + i);
+        if (!in_kernel_va(fl) || (fl & 7)) continue;
+        uint64_t back = 0;
+        if (!kq(fl + 8, back)) continue;
+        if (back != p + i) continue;
+        o.links = (uint32_t)i;
+        break;
+    }
+    if (!o.links) return false;
+
+    vmm::g_off = o;
+    vmm::g_off_ready = true;
+    printf("[vmm] offsets pid=0x%X links=0x%X image=0x%X\n", o.pid, o.links, o.image);
+    return true;
+}
 
 bool vmm::init_system() {
 
     if (g_eprocess) return true;
     if (!g_ntos) return false;
 
-    uint64_t rva{};
-    if (export_rva("PsInitialSystemProcess", rva) && rva + 8 <= g_ntos_size) {
-        uint64_t ep{};
-        if (kread_trusted(g_ntos + rva, &ep, sizeof(ep)) && ep) {
-            for (const auto& l : kCand) {
-                if (!looks_eprocess(ep, l)) continue;
-                g_lay = l;
-                g_eprocess = ep;
-                printf("[+] System EPROCESS 0x%llx (layout pid 0x%llx links 0x%llx "
-                       "name 0x%llx dtb 0x%llx peb 0x%llx)\n",
-                       (unsigned long long)ep, (unsigned long long)l.pid,
-                       (unsigned long long)l.links, (unsigned long long)l.name,
-                       (unsigned long long)l.dtb, (unsigned long long)l.peb);
-                return true;
-            }
-            printf("[!] PsInitialSystemProcess points at 0x%llx but no known layout "
-                   "validates\n", (unsigned long long)ep);
-        }
-    }
+    uint64_t ep{};
+    if (!find_system_eprocess(ep)) return false;
+    g_eprocess = ep;
 
-    printf("[*] falling back to an ntoskrnl data-section scan for System\n");
-    std::vector<Section> secs;
-    if (!sections(secs)) return false;
-    constexpr size_t kChunk = 0x1000;
-    std::vector<uint8_t> buf(kChunk);
-
-    for (const auto& s : secs) {
-        if (!(s.chars & IMAGE_SCN_MEM_WRITE) || (s.chars & IMAGE_SCN_MEM_EXECUTE)) continue;
-        const uint64_t lo = g_ntos + s.va;
-        const uint64_t hi = lo + s.size;
-        for (uint64_t page = lo & ~0xFFFull; page < hi; page += kChunk) {
-            size_t n = kChunk;
-            if (page + n > hi) n = static_cast<size_t>(hi - page);
-            if (!kread_trusted(page, buf.data(), n)) continue;
-            for (size_t off = 0; off + 8 <= n; off += 8) {
-                const uint64_t cand_addr = page + off;
-                if (cand_addr < lo || cand_addr + 8 > hi) continue;
-                uint64_t cand{};
-                memcpy(&cand, buf.data() + off, 8);
-                if (cand < 0xFFFF800000000000ull || (cand & 7)) continue;
-                for (const auto& l : kCand) {
-                    if (!looks_eprocess(cand, l)) continue;
-                    g_lay = l;
-                    g_eprocess = cand;
-                    printf("[+] System EPROCESS 0x%llx (scan)\n", (unsigned long long)cand);
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
+    if (!discover_offsets(ep)) return false;
+    return true;
 }
 
 bool vmm::init_ntos() {
@@ -751,6 +817,12 @@ bool vmm::init_ntos() {
     if (!find_ntoskrnl(g_ntos, g_ntos_size)) {
         printf("[!] ntoskrnl base not found in SystemModuleInformation\n"
                "    (SeDebugPrivilege must be enabled or ImageBase reads as 0)\n");
+        return false;
+    }
+    uint16_t hdr{};
+    if (!kread_trusted(g_ntos, &hdr, sizeof hdr) || hdr != 0x5A4D) {
+        printf("[!] ntoskrnl base 0x%llx is not MZ (hdr=0x%04X)\n",
+               (unsigned long long)g_ntos, hdr);
         return false;
     }
     printf("[+] ntoskrnl base 0x%llx size 0x%llx\n",
@@ -821,74 +893,133 @@ static bool peb_has_module(uint64_t eprocess, uint64_t cr3, const char* want) {
     return false;
 }
 
-static void accept_candidate(uint64_t c, uint64_t o, uint64_t pid,
-                             uint64_t eproc, const char* how) {
-    vmm::g_gcr3 = c;
-    vmm::g_eprocess = eproc;
-    vmm::g_pid = static_cast<uint32_t>(pid);
-    vmm::g_ready = true;
-    vmm::g_dtb_ok = true;
-    vmm::g_lay.dtb = o;
-    if (!vmm::g_kcr3) vmm::g_kcr3 = c;
-    ++vmm::g_stamp;
-    printf("[+] attached pid %u eprocess 0x%llx dtb 0x%llx (+0x%llx) (%s)\n",
-           vmm::g_pid, (unsigned long long)eproc, (unsigned long long)c,
-           (unsigned long long)o, how);
+static bool find_module_in_ldr(uint64_t cr3, uint64_t ldr, const char* want,
+                               uint64_t& base, uint64_t& size) {
+    uint64_t head{}, cur{};
+    if (!read_cr3(cr3, ldr + off::Ldr_InLoadOrder, &head, 8)) return false;
+    if (head < vmm::kUserLo || head > vmm::kUserHi) return false;
+    if (!read_cr3(cr3, head, &cur, 8)) return false;
+
+    for (int g = 0; g < 512 && cur && cur != head; ++g) {
+        uint16_t nlen{};
+        uint64_t nbuf{}, dllbase{};
+        if (!read_cr3(cr3, cur + off::Ldr_BaseDllNameLen, &nlen, 2)) return false;
+        if (!read_cr3(cr3, cur + off::Ldr_BaseDllNameBuf, &nbuf, 8)) return false;
+        if (!read_cr3(cr3, cur + off::Ldr_DllBase, &dllbase, 8)) return false;
+        uint32_t imgsz32{};
+        if (!read_cr3(cr3, cur + off::Ldr_SizeOfImage, &imgsz32, 4)) return false;
+
+        if (nlen > 3 && nlen < 512 && nbuf >= vmm::kUserLo && nbuf <= vmm::kUserHi) {
+            wchar_t w[264]{};
+            const int c = static_cast<int>(nlen / 2);
+            if (c < 263 && read_cr3(cr3, nbuf, w, static_cast<size_t>(nlen))) {
+                char a[64]{};
+                for (int i = 0; i < c && i < 63; ++i)
+                    a[i] = w[i] < 128 ? static_cast<char>(w[i]) : '?';
+                if (_stricmp(a, want) == 0) {
+                    base = dllbase;
+                    size = static_cast<uint64_t>(imgsz32);
+                    return true;
+                }
+            }
+        }
+        if (!read_cr3(cr3, cur, &cur, 8)) return false;
+    }
+    return false;
 }
 
-bool vmm::attach(const wchar_t* image_name) {
-    if (!g_eprocess) return false;
-    reset_fail_count();
+static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
+    uint64_t dtb = 0;
+    if (!vmm::kread_trusted(eproc + off::Eproc_Dtb, &dtb, 8)) return false;
+    if (dtb & 0xFFF) return false;
+    if (!pml4e_plausible(dtb, vmm::g_ntos)) return false;
 
-    char want_full[256]{};
-    for (int i = 0; i < 255 && image_name[i]; ++i)
-        want_full[i] = static_cast<char>(image_name[i] > 0x7F ? '?' : image_name[i]);
-
-    char want15[256]{};
-    memcpy(want15, want_full, 14);
-    want15[14] = 0;
-
-    int names = 0, rejected = 0;
-    uint64_t cur = g_eprocess;
-    for (int guard = 0; guard < 4096; ++guard) {
-        uint64_t flink{};
-        if (!kread_trusted(cur + g_lay.links, &flink, 8) || !flink) break;
-        cur = flink - g_lay.links;
-
-        uint64_t pid{}; char name[256]{};
-        if (!kread_trusted(cur + g_lay.pid, &pid, 8)) break;
-        if (!kread_trusted(cur + g_lay.name, name, sizeof(name))) break;
-        if (_strnicmp(name, want15, strlen(want15)) != 0) continue;
-        if (pid == 0 || pid == 4) continue;
-        ++names;
-
-        bool matched = false;
-        for (uint64_t o = 0x20; o <= 0xF8; o += 8) {
-            uint64_t dtb{};
-            if (!kread_trusted(cur + o, &dtb, 8)) continue;
-            const uint64_t c = dtb & kPteMask;
-            if (!c) continue;
-
-            bool ntos_ok = false;
-            if (g_ntos) {
-                uint64_t kpa{};
-                ntos_ok = walk_va(c, g_ntos, kpa) == Walk::Ok && page_mz(kpa);
-            }
-            const bool peb_ok = peb_has_module(cur, c, want_full);
-            if (!ntos_ok && !peb_ok) continue;
-
-            accept_candidate(c, o, pid, cur,
-                ntos_ok && peb_ok ? "ntoskrnl + PEB module proven"
-                                  : peb_ok ? "PEB module proven" : "ntoskrnl proven only");
-            matched = true;
-            break;
-        }
-        if (matched) return true;
-        ++rejected;
+    // PEB adayi: +0x200..+0x600, user VA, translate edilebilir, LDR null degil
+    uint64_t peb = 0;
+    for (uint32_t o = 0x200; o + 8 <= 0x600; o += 8) {
+        uint64_t cand = 0;
+        if (!vmm::kread_trusted(eproc + o, &cand, 8)) continue;
+        if (cand < vmm::kUserLo || cand > vmm::kUserHi || (cand & 7)) continue;
+        uint64_t ldr = 0;
+        if (!read_cr3(dtb, cand + off::Peb_Ldr, &ldr, 8)) continue;
+        if (!ldr) continue;
+        peb = cand;
+        vmm::g_off.peb = o;
+        break;
     }
+    if (!peb) return false;
 
-    printf("[!] attach: %d name match(es), %d rejected, none usable\n", names, rejected);
+    // Ldr'de tam adla teyit, DllBase + SizeOfImage
+    uint64_t ldr = 0;
+    if (!read_cr3(dtb, peb + off::Peb_Ldr, &ldr, 8)) return false;
+    uint64_t base = 0, size = 0;
+    if (!find_module_in_ldr(dtb, ldr, "FortniteClient-Win64-Shipping.exe", base, size))
+        return false;
+    if (size < 0x04000000) return false;          // launcher'lari ele
+
+    // Capa 1: PEB->ImageBaseAddress == modul base
+    uint64_t peb_base = 0;
+    if (!read_cr3(dtb, peb + off::Peb_ImageBaseAddress, &peb_base, 8)) return false;
+    if (peb_base != base) return false;
+
+    t.eproc = eproc;
+    t.pid = pid;
+    t.cr3 = dtb;
+    t.base = base;
+    t.size = size;
+    return true;
+}
+
+bool vmm::find_process_by_prefix(const char* prefix, vmm::Target& t) {
+    if (!vmm::g_off_ready) return false;
+    uint64_t head = vmm::g_eprocess + vmm::g_off.links;
+    uint64_t cur = 0;
+    if (!vmm::kread_trusted(head, &cur, 8)) return false;
+    int n = 0, matches = 0;
+    while (cur && cur != head && n < 4096) {
+        uint64_t e = cur - vmm::g_off.links;
+        ++n;
+        char name[15] = {};
+        if (vmm::kread_trusted(e + vmm::g_off.image, name, 14) &&
+            !strncmp(name, prefix, 14)) {
+            uint64_t pid = 0;
+            if (kq(e + vmm::g_off.pid, pid) && pid >= 0x64 && pid < 0x100000) {
+                ++matches;
+                if (fill_target(e, static_cast<uint32_t>(pid), t)) return true;
+            }
+        }
+        if (!vmm::kread_trusted(cur, &cur, 8)) break;
+    }
+    printf("[vmm] walked %d processes, %d name matches\n", n, matches);
+    if (n < 50) printf("[vmm] WARN: short walk - links offset wrong\n");
+    if (n >= 50 && !matches) printf("[vmm] WARN: no match - process may be unlinked\n");
     return false;
+}
+
+bool vmm::attach() {
+    Target t{};
+    if (!find_process_by_prefix("FortniteClient-", t)) return false;
+
+    // Capa 2: ntoskrnl base'i hedef CR3 altinda MZ ile karsilanmali
+    uint16_t mz = 0;
+    if (!read_cr3(t.cr3, vmm::g_ntos, &mz, 2) || mz != 0x5A4D) return false;
+
+    vmm::g_target = t;
+    vmm::g_gcr3 = t.cr3;
+    vmm::g_eprocess = t.eproc;
+    vmm::g_pid = t.pid;
+    vmm::g_base = t.base;
+    vmm::g_size = t.size;
+    vmm::g_ready = true;
+    vmm::g_dtb_ok = true;
+    if (!vmm::g_kcr3) vmm::g_kcr3 = t.cr3;
+    ++vmm::g_stamp;
+
+    if (mem::active() == mem::backend::rpm && !mem::open_rpm(t.pid)) return false;
+
+    printf("[vmm] attached pid=%u base=0x%llX size=0x%llX\n",
+           t.pid, (unsigned long long)t.base, (unsigned long long)t.size);
+    return true;
 }
 
 void vmm::detach() { g_ready = false; g_gcr3 = 0; g_dtb_ok = false; ++g_stamp; }
@@ -965,35 +1096,12 @@ bool vmm::kwrite(uint64_t va, const void* buf, size_t len) {
 
 bool vmm::read(uint64_t va, void* buf, size_t len) {
     if (!g_ready || va < kUserLo || va > kUserHi) return false;
-    auto* p = static_cast<uint8_t*>(buf);
-    for (size_t i = 0; i < len;) {
-        uint64_t pa{};
-        const Walk st = walk_va(g_gcr3, va + i, pa);
-        if (st != Walk::Ok) { report_fail("read", g_gcr3, va + i, st); return false; }
-        size_t n = 0x1000 - ((va + i) & 0xFFF);
-        if (n > len - i) n = len - i;
-        if (!phys_read(pa, p + i, n)) {
-            report_fail("read(phys)", g_gcr3, va + i, Walk::PhysFail);
-            return false;
-        }
-        i += n;
-    }
-    return true;
+    return mem::read(va, buf, len);
 }
 
 bool vmm::write(uint64_t va, const void* buf, size_t len) {
     if (!g_ready || va < kUserLo || va > kUserHi) return false;
-    auto* p = static_cast<const uint8_t*>(buf);
-    for (size_t i = 0; i < len;) {
-        uint64_t pa{};
-        const Walk st = walk_va(g_gcr3, va + i, pa);
-        if (st != Walk::Ok) { report_fail("write", g_gcr3, va + i, st); return false; }
-        size_t n = 0x1000 - ((va + i) & 0xFFF);
-        if (n > len - i) n = len - i;
-        if (!r0::pwrite(pa, p + i, n)) return false;
-        i += n;
-    }
-    return true;
+    return mem::write(va, buf, len);
 }
 
 bool vmm::rd(uint64_t va, void* buf, size_t len) {

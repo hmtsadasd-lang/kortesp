@@ -193,6 +193,12 @@ void build_page_tables() {
         memcpy(p + (k_pdpt * 8) % kPageSz, &v, 8);
     }
     put_pde(kPdkPa, k_pd0, kKernPa);
+
+    // Map kernel VA 0xFFFF800000000000 via PDE[0] large page to kKernPa,
+    // and plant a valid PML4E at PA 0x20000000 so pml4e_plausible() passes
+    // for a fake DTB at EPROCESS+0x28.
+    put_pde(kPdkPa, 0, kKernPa);
+    kw64(0, (kPdptPa << 12) | 1);   // PML4E[0]: present, PFN=0x1000
 }
 
 // ---- FString encoding (inverse of esp::decode_fstring) -------------------
@@ -295,8 +301,9 @@ void build_graph() {
     wf32(O_HEALTH1 + off::Health_Max,     100.0f);
 
     // PEB / LDR / module list.
-    //   x64 PEB:  Ldr at +0x18
+    //   x64 PEB:  ImageBaseAddress at +0x10, Ldr at +0x18
     //   PEB_LDR_DATA: InLoadOrderModuleList at +0x10
+    w64(O_PEB + 0x10, uva(O_CLIENT));   // PEB->ImageBaseAddress
     w64(O_PEB + 0x18, uva(O_LDR));
     w64(O_LDR + 0x10, uva(O_MODLIST));
 
@@ -316,6 +323,18 @@ void build_graph() {
 
     // mock EPROCESS: PEB pointer at +g_lay.peb
     kw64(K_EPROCESS + vmm::g_lay.peb, uva(O_PEB));
+
+    // Fake DTB at +0x28 for discover_offsets() cross-validation (pml4e_plausible)
+    kw64(K_EPROCESS + 0x28, 0xFFFF800000000000ull);   // kernel VA, maps via PDE[0] large page
+
+    // Synthetic EPROCESS fields for discover_offsets().
+    // NOTE: These are deliberately NOT at the README layout values
+    // (pid 0x1D0, links 0x1D8, image 0x338) so that discover_offsets()
+    // must actually scan instead of matching hardcoded constants.
+    kw64(K_EPROCESS + 0x128, 4);                                                          // UniqueProcessId
+    kw64(K_EPROCESS + 0x1A0, kva(K_EPROCESS + 0x1A0));                                    // ActiveProcessLinks.Flink (self)
+    kw64(K_EPROCESS + 0x1A8, kva(K_EPROCESS + 0x1A0));                                    // ActiveProcessLinks.Blink (&entry)
+    kw64(K_EPROCESS + 0x2F0, 0x00006D6574737953ull);                                      // "System\0\0" ImageFileName
 }
 
 // ---- assertion plumbing --------------------------------------------------
@@ -344,6 +363,7 @@ bool run() {
     vmm::g_kcr3 = kPml4Pa;
     vmm::g_gcr3 = kPml4Pa;
     vmm::g_eprocess = kva(K_EPROCESS);
+    vmm::discover_offsets(vmm::g_eprocess);
     vmm::g_base = 0;
     vmm::g_size = 0;
     vmm::g_ready = true;
@@ -449,6 +469,8 @@ bool run() {
         esp::cfg.dist = false;
         esp::cfg.lines = false;
 
+        ov::detail::g_w = 1280;
+        ov::detail::g_h = 720;
         ov::begin();
         esp::draw();
         const int verts = ov::pending();

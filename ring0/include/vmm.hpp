@@ -58,6 +58,25 @@ struct Layout {
 };
 extern Layout g_lay;
 
+// Discovered EPROCESS field offsets (u32), filled by discover_offsets().
+struct ProcOffsets { uint32_t pid; uint32_t links; uint32_t image; uint32_t peb; };
+extern ProcOffsets g_off;
+extern bool g_off_ready;
+
+// Attach target: EPROCESS, pid, CR3, module base + size.
+struct Target {
+    uint64_t eproc{};
+    uint32_t pid{};
+    uint64_t cr3{};
+    uint64_t base{};
+    uint64_t size{};
+};
+extern Target g_target;
+
+bool discover_offsets(uint64_t system_eproc);
+bool find_process_by_prefix(const char* prefix, Target& t);
+bool attach();
+
 // A PE section of ntoskrnl, resolved by vmm::sections(). Windows headers are
 // deliberately kept out of this header; `chars` carries the raw
 // IMAGE_SCN_* Characteristics dword.
