@@ -1,0 +1,4 @@
+[!] enable_debug_privilege failed (module ImageBase will read 0)
+fortesp ring0
+[r0] init FAIL: no device handle
+[!] driver not present

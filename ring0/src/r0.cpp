@@ -1,6 +1,7 @@
 #include "r0.hpp"
 #include <windows.h>
 #include <winternl.h>
+#include <sddl.h>
 #include <csetjmp>
 #include "vmm.hpp"          // phys_is_ram guard for the MmMapIoSpace path
 #include "cloak.hpp"        // loader-list locator, primary driver-base source
@@ -259,6 +260,8 @@ using NtOpenSectionFn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTE
 using NtMapViewOfSectionFn = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR,
     SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
 using NtUnmapViewOfSectionFn = NTSTATUS(NTAPI*)(HANDLE, PVOID);
+using NtQuerySecurityObjectFn = NTSTATUS(NTAPI*)(HANDLE, SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, ULONG, PULONG);
 
 NtMapViewOfSectionFn nt_map_view = nullptr;
 NtUnmapViewOfSectionFn nt_unmap_view = nullptr;
@@ -342,6 +345,33 @@ bool enable_load_driver_privilege() {
     return true;
 }
 
+void print_section_dacl(HANDLE section, NtQuerySecurityObjectFn nt_query_security) {
+    ULONG needed = 0;
+    NTSTATUS st = nt_query_security(section, DACL_SECURITY_INFORMATION,
+                                    nullptr, 0, &needed);
+    if (st != static_cast<NTSTATUS>(0xC0000023) || !needed) {
+        printf("[!] NtQuerySecurityObject size query failed: NTSTATUS 0x%lx, %lu bytes\n",
+               (unsigned long)st, (unsigned long)needed);
+        return;
+    }
+    std::vector<uint8_t> sd(needed);
+    st = nt_query_security(section, DACL_SECURITY_INFORMATION,
+                           sd.data(), needed, &needed);
+    if (st < 0) {
+        printf("[!] NtQuerySecurityObject DACL query failed: NTSTATUS 0x%lx\n",
+               (unsigned long)st);
+        return;
+    }
+    PWSTR sddl = nullptr;
+    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd.data(), SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &sddl, nullptr)) {
+        printf("[!] DACL to SDDL conversion failed: error %lu\n", (unsigned long)GetLastError());
+        return;
+    }
+    printf("[*] PhysicalMemory DACL: %ls\n", sddl);
+    LocalFree(sddl);
+}
+
 void print_pmem_bytes(const char* tag, uint64_t pa, const uint8_t* b) {
     printf("[*] pmem 0x%llx (%s): %02x %02x %02x %02x %02x %02x %02x %02x "
            "%02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -362,7 +392,9 @@ bool pmem_probe() {
         GetProcAddress(ntdll, "NtMapViewOfSection")));
     nt_unmap_view = reinterpret_cast<NtUnmapViewOfSectionFn>(reinterpret_cast<void*>(
         GetProcAddress(ntdll, "NtUnmapViewOfSection")));
-    if (!nt_open || !nt_map_view || !nt_unmap_view) {
+    const auto nt_query_security = reinterpret_cast<NtQuerySecurityObjectFn>(
+        reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQuerySecurityObject")));
+    if (!nt_open || !nt_map_view || !nt_unmap_view || !nt_query_security) {
         printf("[!] PhysicalMemory native entry points not found\n");
         return false;
     }
@@ -373,16 +405,35 @@ bool pmem_probe() {
     name.Length = name.MaximumLength = static_cast<USHORT>(wcslen(path) * sizeof(wchar_t));
     OBJECT_ATTRIBUTES oa{};
     InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+
+    HANDLE control = nullptr;
+    const NTSTATUS cst = nt_open(&control, READ_CONTROL, &oa);
+    if (cst < 0) {
+        printf("[!] PhysicalMemory READ_CONTROL failed: NTSTATUS 0x%lx%s\n",
+               (unsigned long)cst,
+               cst == static_cast<NTSTATUS>(0xC0000022)
+                   ? " (access denied; DACL unavailable)" : "");
+    } else {
+        printf("[+] PhysicalMemory READ_CONTROL open succeeded\n");
+        print_section_dacl(control, nt_query_security);
+        CloseHandle(control);
+    }
+
+    HANDLE query = nullptr;
+    const NTSTATUS qst = nt_open(&query, SECTION_QUERY, &oa);
+    printf("[%s] PhysicalMemory SECTION_QUERY: NTSTATUS 0x%lx\n",
+           qst < 0 ? "!" : "+", (unsigned long)qst);
+    if (qst >= 0) CloseHandle(query);
+
     HANDLE section = nullptr;
-    const NTSTATUS ost = nt_open(&section, SECTION_MAP_READ | SECTION_QUERY, &oa);
+    const NTSTATUS ost = nt_open(&section, SECTION_MAP_READ, &oa);
+    printf("[%s] PhysicalMemory SECTION_MAP_READ: NTSTATUS 0x%lx\n",
+           ost < 0 ? "!" : "+", (unsigned long)ost);
     if (ost < 0) {
-        printf("[!] NtOpenSection(PhysicalMemory) failed: NTSTATUS 0x%lx%s\n",
-               (unsigned long)ost,
-               ost == static_cast<NTSTATUS>(0xC0000061)
-                   ? " (privilege not held; path closed)"
-                   : ost == static_cast<NTSTATUS>(0xC0000022)
-                       ? " (modern Windows blocks user-mode access; section-view backend unavailable)"
-                       : "");
+        if (ost == static_cast<NTSTATUS>(0xC0000061))
+            printf("[!] mapping privilege not held; no mapping attempted\n");
+        else if (ost == static_cast<NTSTATUS>(0xC0000022))
+            printf("[!] SECTION_MAP_READ access denied; no mapping attempted\n");
         return false;
     }
 
