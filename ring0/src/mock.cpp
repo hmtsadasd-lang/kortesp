@@ -193,12 +193,6 @@ void build_page_tables() {
         memcpy(p + (k_pdpt * 8) % kPageSz, &v, 8);
     }
     put_pde(kPdkPa, k_pd0, kKernPa);
-
-    // Map kernel VA 0xFFFF800000000000 via PDE[0] large page to kKernPa,
-    // and plant a valid PML4E at PA 0x20000000 so pml4e_plausible() passes
-    // for a fake DTB at EPROCESS+0x28.
-    put_pde(kPdkPa, 0, kKernPa);
-    kw64(0, (kPdptPa << 12) | 1);   // PML4E[0]: present, PFN=0x1000
 }
 
 // ---- FString encoding (inverse of esp::decode_fstring) -------------------
@@ -324,8 +318,8 @@ void build_graph() {
     // mock EPROCESS: PEB pointer at +g_lay.peb
     kw64(K_EPROCESS + vmm::g_lay.peb, uva(O_PEB));
 
-    // Fake DTB at +0x28 for discover_offsets() cross-validation (pml4e_plausible)
-    kw64(K_EPROCESS + 0x28, 0xFFFF800000000000ull);   // kernel VA, maps via PDE[0] large page
+    // Fake DTB at +0x28 for discover_offsets() cross-validation (fiziksel CR3, gerçek gibi)
+    kw64(K_EPROCESS + 0x28, kPml4Pa);   // 0x1000 - fiziksel, kernel VA degil
 
     // Synthetic EPROCESS fields for discover_offsets().
     // NOTE: These are deliberately NOT at the README layout values
@@ -363,6 +357,7 @@ bool run() {
     vmm::g_kcr3 = kPml4Pa;
     vmm::g_gcr3 = kPml4Pa;
     vmm::g_eprocess = kva(K_EPROCESS);
+    vmm::g_ntos = kKvaBase;   // discover_offsets() icin pml4e_plausible hedef
     vmm::discover_offsets(vmm::g_eprocess);
     vmm::g_base = 0;
     vmm::g_size = 0;

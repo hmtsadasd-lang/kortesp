@@ -696,12 +696,12 @@ bool validate_system_eprocess(uint64_t p) {
     return pid4;
 }
 
-bool pml4e_plausible(uint64_t cr3, uint64_t va) {
-    if (!in_kernel_va(cr3) || (cr3 & 0xFFF)) return false;
+bool pml4e_plausible(uint64_t cr3_pa, uint64_t va) {
+    if (!cr3_pa || (cr3_pa & 0xFFF)) return false;
     uint64_t e = 0;
-    if (!kq(cr3 + 8 * ((va >> 39) & 0x1FF), e)) return false;
+    if (!r0::pread(cr3_pa + 8 * ((va >> 39) & 0x1FF), &e, 8)) return false;
     if (!(e & 1)) return false;
-    uint64_t pfn = (e >> 12) & 0xFFFFFFFFFFull;
+    const uint64_t pfn = (e >> 12) & 0xFFFFFFFFFFull;
     if (!pfn) return false;
     if (!vmm::phys_is_ram(pfn << 12, 0x1000)) return false;
     return true;
@@ -759,18 +759,6 @@ bool vmm::discover_offsets(uint64_t p) {
     if (!vmm::kread_trusted(p, buf, sizeof buf)) return false;
     vmm::ProcOffsets o{};
 
-    // pid: 4 olan qword'lar arasinda, +0x28 DTB page-aligned + pml4e_plausible olan ilkini sec
-    for (size_t i = 0x100; i + 8 <= sizeof buf; i += 8) {
-        if (*(uint64_t*)(buf + i) != 4) continue;
-        uint64_t dtb = 0;
-        if (!kq(p + 0x28, dtb)) continue;
-        if (dtb & 0xFFF) continue;
-        if (!pml4e_plausible(dtb, vmm::g_ntos)) continue;
-        o.pid = (uint32_t)i;
-        break;
-    }
-    if (!o.pid) return false;
-
     // image: "System\0" + plausible_image_field capraz dogrulama
     for (size_t i = 0x100; i + 7 <= sizeof buf; ++i) {
         if (!memcmp(buf + i, "System\0", 7) && plausible_image_field(buf, i)) {
@@ -791,6 +779,13 @@ bool vmm::discover_offsets(uint64_t p) {
         break;
     }
     if (!o.links) return false;
+
+    // pid: 4 olan ilk hizali qword'u al (System EPROCESS'in kendi pid'i 4'dur).
+    // links zaten LIST_ENTRY ile dogrulanmistir; DTB +0x28 gecerligi ayrı kontrol edilmistir.
+    for (size_t i = 0x100; i + 8 <= sizeof buf; i += 8) {
+        if (*(uint64_t*)(buf + i) == 4) { o.pid = (uint32_t)i; break; }
+    }
+    if (!o.pid) return false;
 
     vmm::g_off = o;
     vmm::g_off_ready = true;
@@ -930,12 +925,14 @@ static bool find_module_in_ldr(uint64_t cr3, uint64_t ldr, const char* want,
 
 static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
     uint64_t dtb = 0;
-    if (!vmm::kread_trusted(eproc + off::Eproc_Dtb, &dtb, 8)) return false;
+    if (!vmm::kread_trusted(eproc + vmm::g_lay.dtb, &dtb, 8)) return false;
     if (dtb & 0xFFF) return false;
     if (!pml4e_plausible(dtb, vmm::g_ntos)) return false;
 
-    // PEB adayi: +0x200..+0x600, user VA, translate edilebilir, LDR null degil
+    // PEB adayi: +0x200..+0x600, user VA, translate edilebilir, LDR null degil.
+    // Bir adayda modül bulunamazsa bir sonraki adayi dene (decoy alanlara karsi).
     uint64_t peb = 0;
+    uint64_t base = 0, size = 0;
     for (uint32_t o = 0x200; o + 8 <= 0x600; o += 8) {
         uint64_t cand = 0;
         if (!vmm::kread_trusted(eproc + o, &cand, 8)) continue;
@@ -943,24 +940,25 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
         uint64_t ldr = 0;
         if (!read_cr3(dtb, cand + off::Peb_Ldr, &ldr, 8)) continue;
         if (!ldr) continue;
+
+        uint64_t ldr2 = 0;
+        if (!read_cr3(dtb, cand + off::Peb_Ldr, &ldr2, 8)) continue;
+        base = 0; size = 0;
+        if (!find_module_in_ldr(dtb, ldr2, "FortniteClient-Win64-Shipping.exe", base, size))
+            continue;   // bu aday degil, bir sonraki
+        if (size < 0x04000000) continue;          // launcher'lari ele
+
+        // Capa 1: PEB->ImageBaseAddress == modul base
+        uint64_t peb_base = 0;
+        if (!read_cr3(dtb, cand + off::Peb_ImageBaseAddress, &peb_base, 8)) continue;
+        if (peb_base != base) continue;
+
         peb = cand;
         vmm::g_off.peb = o;
+        vmm::g_lay.peb = o;
         break;
     }
     if (!peb) return false;
-
-    // Ldr'de tam adla teyit, DllBase + SizeOfImage
-    uint64_t ldr = 0;
-    if (!read_cr3(dtb, peb + off::Peb_Ldr, &ldr, 8)) return false;
-    uint64_t base = 0, size = 0;
-    if (!find_module_in_ldr(dtb, ldr, "FortniteClient-Win64-Shipping.exe", base, size))
-        return false;
-    if (size < 0x04000000) return false;          // launcher'lari ele
-
-    // Capa 1: PEB->ImageBaseAddress == modul base
-    uint64_t peb_base = 0;
-    if (!read_cr3(dtb, peb + off::Peb_ImageBaseAddress, &peb_base, 8)) return false;
-    if (peb_base != base) return false;
 
     t.eproc = eproc;
     t.pid = pid;
@@ -997,6 +995,7 @@ bool vmm::find_process_by_prefix(const char* prefix, vmm::Target& t) {
 }
 
 bool vmm::attach() {
+    reset_fail_count();
     Target t{};
     if (!find_process_by_prefix("FortniteClient-", t)) return false;
 
@@ -1010,12 +1009,13 @@ bool vmm::attach() {
     vmm::g_pid = t.pid;
     vmm::g_base = t.base;
     vmm::g_size = t.size;
-    vmm::g_ready = true;
     vmm::g_dtb_ok = true;
     if (!vmm::g_kcr3) vmm::g_kcr3 = t.cr3;
     ++vmm::g_stamp;
 
     if (mem::active() == mem::backend::rpm && !mem::open_rpm(t.pid)) return false;
+
+    vmm::g_ready = true;
 
     printf("[vmm] attached pid=%u base=0x%llX size=0x%llX\n",
            t.pid, (unsigned long long)t.base, (unsigned long long)t.size);

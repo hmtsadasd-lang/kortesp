@@ -142,7 +142,7 @@ bool init_kcr3();
 bool scan_kernel_cr3();
 void shutdown();
 
-bool attach(const wchar_t* image_name);
+bool attach();
 void detach();
 bool attached();
 uint32_t  pid();

@@ -19,9 +19,9 @@ namespace { constexpr double kTargetFps = 120.0; }
 
 struct CmdFlags {
     bool probe{ false }, esp_mode{ false }, cloak{ false };
-    bool cloak_restore{ false }, hide_symlink{ false }, kwtest{ false };
+    bool cloak_restore{ false }, cloak_dry{ false }, hide_symlink{ false }, kwtest{ false };
     bool only_ntos{ false }, only_eproc{ false }, dump_cr3{ false }, dtbscan{ false };
-    bool actors{ false }, raw{ false }, mock{ false };
+    bool dpatch{ false }, actors{ false }, raw{ false }, mock{ false };
     std::string backend;
     uint64_t raw_pa{ 0 };
     size_t   raw_len{ 16 };
@@ -66,6 +66,8 @@ static CmdFlags parse_cmd() {
         else if (!wcscmp(a, L"--backend") && i + 1 < argc) {
             f.backend = narrow(argv[++i]);
         }
+        else if (!wcscmp(a, L"--dpatch")) f.dpatch = true;
+        else if (!wcscmp(a, L"--cloak-dry")) f.cloak_dry = true;
     }
     LocalFree(argv);
     return f;
@@ -132,7 +134,7 @@ static bool raw_read(uint64_t pa, size_t len) {
     printf("[*] in RAM map: %s%s\n", in_ram ? "yes" : "NO",
            in_ram ? "" : " - reading anyway, that is what --raw is for");
     std::vector<uint8_t> b(len, 0xCC);
-    if (!r0::pread(pa, b.data(), len)) { printf("[!] IOCTL failed\n"); return false; }
+    if (!r0::phys_read_raw(pa, b.data(), len)) { printf("[!] IOCTL failed\n"); return false; }
     bool any = false;
     for (uint8_t v : b) any |= (v != 0);
     for (size_t i = 0; i < len; i += 16) {
@@ -165,6 +167,7 @@ static bool kwtest() {
     if (!vmm::kread_trusted(va, &back, sizeof(back))) return false;
     if (back != val) { printf("[!] read-back mismatch\n"); return false; }
     printf("[+] write-back read-back matches\n");
+    r0::g_write_ok = true;
     return true;
 }
 
@@ -207,6 +210,8 @@ int wmain() {
     if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
     if (f.only_ntos) { vmm::shutdown(); return 0; }
 
+    if (f.dpatch) { const bool ok = r0::patch_cached_map(); vmm::shutdown(); return ok ? 0 : 1; }
+
     if (!vmm::init_system()) { vmm::shutdown(); return 1; }
     if (f.only_eproc) { vmm::shutdown(); return 0; }
     if (f.dump_cr3) { const bool ok = vmm::dump_cr3(); vmm::shutdown(); return ok ? 0 : 1; }
@@ -219,6 +224,7 @@ int wmain() {
     }
 
     if (f.cloak_restore) { const bool ok = cloak::restore(); vmm::shutdown(); return ok ? 0 : 1; }
+    if (f.cloak_dry) { const bool ok = cloak::apply(false); vmm::shutdown(); return ok ? 0 : 1; }
     if (f.kwtest) { const bool ok = kwtest(); vmm::shutdown(); return ok ? 0 : 1; }
 
     if (f.cloak) {
