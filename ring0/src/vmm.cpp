@@ -231,7 +231,7 @@ void report_fail(const char* who, uint64_t cr3, uint64_t va, vmm::Walk st) {
     printf("[!] %s: walk stopped at %s cr3=0x%llx va=0x%llx%s\n", who,
            vmm::walk_name(st), (unsigned long long)cr3, (unsigned long long)va,
            st == vmm::Walk::PhysFail
-               ? "  <- driver/map problem (did --dpatch run?)" : "");
+               ? "  <- PT PFN: MmMapIoSpace does not support this read; section view required" : "");
 }
 
 bool va_canonical(uint64_t va) {

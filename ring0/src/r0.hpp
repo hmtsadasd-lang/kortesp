@@ -35,9 +35,12 @@ void shutdown();
 bool alive();
 void set_backend(const Backend* be);
 
+// MmMapIoSpace data-page backend. Active page-table PFN reads are rejected
+// on 26200 regardless of cache type and require the section-view backend.
 bool pread(uint64_t pa, void* buf, size_t len);
 bool pwrite(uint64_t pa, const void* buf, size_t len);
 bool phys_read_raw(uint64_t pa, void* buf, size_t len);
+bool pmem_probe();
 bool vwrite(uint64_t va, const void* buf, size_t len);
 bool vread(uint64_t va, void* buf, size_t len);
 
@@ -52,12 +55,9 @@ bool vread_ready();
 // The device object is untouched: an already-open handle keeps working.
 bool hide_symlink(const wchar_t* link);
 
-// Live-patch the loaded driver's MmMapIoSpace import to MmCached.
-//
-// On build 26200 MiFillSystemPtes refuses MmNonCached mappings of pages whose
-// PFN is owned as a page table, so every PML4/PDPTE/PDE/PTE read fails while
-// plain RAM reads fine. Must run BEFORE --cloak (it needs the driver still in
-// PsLoadedModuleList) and be re-run every boot (memory-only patch).
+// Live-patch the loaded driver's MmMapIoSpace import to MmCached for ordinary
+// data pages. Active page-table PFNs remain unsupported for both cache types.
+// Must run BEFORE --cloak (it needs the driver still in PsLoadedModuleList).
 bool patch_cached_map(bool dry_run = false, const char* step = nullptr);
 
 } // namespace r0

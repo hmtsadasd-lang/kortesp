@@ -22,7 +22,7 @@ struct CmdFlags {
     bool cloak_restore{ false }, cloak_dry{ false }, hide_symlink{ false }, kwtest{ false };
     bool only_ntos{ false }, only_eproc{ false }, dump_cr3{ false }, dtbscan{ false };
     bool dpatch{ false }, dpatch_dry{ false }, actors{ false }, raw{ false }, mock{ false };
-    bool kvread{ false };
+    bool kvread{ false }, pmem{ false };
     std::string backend;
     std::string dpatch_step;
     uint64_t raw_pa{ 0 };
@@ -70,6 +70,7 @@ static CmdFlags parse_cmd() {
         else if (!wcscmp(a, L"--backend") && i + 1 < argc) {
             f.backend = narrow(argv[++i]);
         }
+        else if (!wcscmp(a, L"--pmem")) f.pmem = true;
         else if (!wcscmp(a, L"--dpatch")) f.dpatch = true;
         else if (!wcscmp(a, L"--dpatch-dry")) { f.dpatch = true; f.dpatch_dry = true; }
         else if (!wcscmp(a, L"--dpatch-step") && i + 1 < argc) {
@@ -264,6 +265,17 @@ int wmain() {
     if (f.only_ntos) { vmm::shutdown(); return 0; }
 
     if (f.kvread) { const bool ok = kvread(f.kvread_va, f.kvread_len); vmm::shutdown(); return ok ? 0 : 1; }
+
+    if (f.pmem) {
+        if (!vmm::init_pte_base()) {
+            printf("[!] PTE self-map base not proven - cannot identify the current PML4\n");
+            vmm::shutdown();
+            return 1;
+        }
+        const bool ok = r0::pmem_probe();
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
 
     if (f.dpatch) {
         if (!vmm::init_pte_base()) {

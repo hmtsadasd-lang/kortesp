@@ -6,7 +6,7 @@ set PATH=%W64DK%\bin;%PATH%
 if not exist out mkdir out
 
 echo Building fortesp_r0.exe (MinGW-w64)...
-"%W64DK%\bin\g++.exe" -std=c++17 -O2 -municode -mwindows -Wall -Wextra ^
+"%W64DK%\bin\g++.exe" -std=c++17 -O2 -municode -mconsole -Wall -Wextra ^
     -Wno-unused-parameter -Wno-cast-function-type ^
     -Iinclude -Isrc ^
     -o out\fortesp_r0.exe ^
