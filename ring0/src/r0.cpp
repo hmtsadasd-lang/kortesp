@@ -1142,8 +1142,11 @@ bool patch_cached_map(bool dry_run, const char* step) {
         const uint64_t pxe = b + ((ppe & kMask48) >> 9);
         const uint64_t idx = (b >> 39) & 0x1FF;
         uint64_t e{};
-        if (vread(pxe + idx * 8, &e, 8) && (e & 1))
+        if (vread(pxe + idx * 8, &e, 8) && (e & 1)) {
             pml4_pa = e & vmm::kPteMask;
+            printf("[*] current-process PML4 self-map entry VA 0x%llx = 0x%llx\n",
+                   (unsigned long long)(pxe + idx * 8), (unsigned long long)e);
+        }
     }
 
     struct T { uint64_t pa; const char* tag; bool must; };
@@ -1154,9 +1157,13 @@ bool patch_cached_map(bool dry_run, const char* step) {
     bool all = true;
     for (const T& tc : tests) {
         uint8_t b[16]{};
-        const bool ok = tc.pa && pread(tc.pa, b, sizeof(b));
-        printf("[*] phys read 0x%llx (%-14s): %s  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+        const bool in_ram = tc.pa && vmm::phys_is_ram(tc.pa, sizeof(b));
+        const bool ok = tc.pa && phys_read_raw(tc.pa, b, sizeof(b));
+        const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        printf("[*] phys read 0x%llx (%-14s): %s  in_ram=%s error=%lu  "
+               "%02x %02x %02x %02x %02x %02x %02x %02x\n",
                (unsigned long long)tc.pa, tc.tag, ok ? "OK" : "FAIL",
+               in_ram ? "yes" : "no", (unsigned long)err,
                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
         if (tc.must && !ok) all = false;
     }
