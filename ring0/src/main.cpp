@@ -266,7 +266,11 @@ int wmain() {
     if (f.kvread) { const bool ok = kvread(f.kvread_va, f.kvread_len); vmm::shutdown(); return ok ? 0 : 1; }
 
     if (f.dpatch) {
-        vmm::init_pte_base();
+        if (!vmm::init_pte_base()) {
+            printf("[!] PTE self-map base not proven - nothing written\n");
+            vmm::shutdown();
+            return 1;
+        }
         const bool ok = r0::patch_cached_map(
             f.dpatch_dry, f.dpatch_step.empty() ? nullptr : f.dpatch_step.c_str());
         vmm::shutdown();

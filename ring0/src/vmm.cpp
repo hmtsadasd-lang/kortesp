@@ -718,6 +718,8 @@ bool vmm::init_pte_base() {
     std::vector<uint8_t> buf(kChunk + kTail);
     for (const auto& s : secs) {
         if (!(s.chars & IMAGE_SCN_MEM_EXECUTE) || !s.size) continue;
+        if (s.chars & IMAGE_SCN_MEM_DISCARDABLE) continue;
+        if (!(s.chars & IMAGE_SCN_MEM_NOT_PAGED)) continue;
         const uint64_t lo = g_ntos + s.va;
         const uint64_t hi = lo + s.size;
         for (uint64_t page = lo; page < hi; page += kChunk) {

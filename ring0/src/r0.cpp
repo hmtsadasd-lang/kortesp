@@ -239,6 +239,8 @@ bool pread(uint64_t pa, void* buf, size_t len) {
 
 bool pwrite(uint64_t pa, const void* buf, size_t len) {
     if (!g_be) return false;
+    if (!len) return true;
+    if (!vmm::phys_is_ram(pa, len)) return false;
     return g_be->write(pa, buf, len);
 }
 
@@ -335,7 +337,8 @@ bool hide_symlink(const wchar_t* link) {
 // pages are read-only, and a kernel-VA memmove into them bugchecks. Import
 // descriptors and name thunks are walked in the on-disk image (this image
 // discards INIT at runtime); only the validated, resident IAT slot is read
-// from kernel memory. An int3 run outside .pdata receives the stub:
+// from kernel memory. An int3 run outside the .pdata section receives the
+// stub; unwind metadata is not rewritten or treated as a safety guarantee:
 //
 //   41 b8 01 00 00 00   mov  $1,%r8d        ; CacheType = MmCached
 //   e9 <rel32>          jmp  real           ; 11-byte form when in range
@@ -409,11 +412,19 @@ bool find_driver_base(uint64_t& base, uint32_t& size) {
         // FORTESP_DRIVER_IMAGE / FORTESP_IMAGE), not a hardcoded string: the
         // loader and the cloak must agree on the same image.
         const char* want = cloak::driver_image();
+        const char* leaf = want;
+        for (const char* p = want; *p; ++p)
+            if (*p == '\\' || *p == '/') leaf = p + 1;
         char lwant[128]{};
-        for (size_t k = 0; want[k] && k < sizeof(lwant) - 1; ++k)
-            lwant[k] = (want[k] >= 'A' && want[k] <= 'Z')
-                     ? static_cast<char>(want[k] + 32) : want[k];
-        if (!*lwant || !strstr(lower, lwant)) continue;
+        for (size_t k = 0; leaf[k] && k < sizeof(lwant) - 1; ++k)
+            lwant[k] = (leaf[k] >= 'A' && leaf[k] <= 'Z')
+                     ? static_cast<char>(leaf[k] + 32) : leaf[k];
+        const size_t lower_len = strlen(lower);
+        const size_t want_len = strlen(lwant);
+        if (!want_len || lower_len < want_len) continue;
+        const char* tail = lower + lower_len - want_len;
+        if (strcmp(tail, lwant) != 0 ||
+            (tail != lower && tail[-1] != '\\' && tail[-1] != '/')) continue;
         uint64_t ib{}; uint32_t isz{};
         memcpy(&ib, &buf[off + 0x10], 8);
         memcpy(&isz, &buf[off + 0x18], 4);
@@ -441,11 +452,22 @@ struct DrvPe {
     uint32_t size{};
 };
 
+bool read_drv_pages(uint64_t va, void* out, size_t len) {
+    for (size_t i = 0; i < len;) {
+        uint64_t pa = 0;
+        if (!vmm::safe_translate(va + i, pa)) return false;
+        size_t n = 0x1000 - ((va + i) & 0xFFF);
+        if (n > len - i) n = len - i;
+        i += n;
+    }
+    return vread(va, out, len);
+}
+
 bool read_drv_pe(uint64_t base, DrvPe& pe) {
-    if (!vread(base, &pe.dos, sizeof(pe.dos))) return false;
+    if (!read_drv_pages(base, &pe.dos, sizeof(pe.dos))) return false;
     if (pe.dos.e_magic != 0x5A4D) return false;
     if (pe.dos.e_lfanew < 0x40 || pe.dos.e_lfanew > 0x1000) return false;
-    if (!vread(base + pe.dos.e_lfanew, &pe.nt, sizeof(pe.nt))) return false;
+    if (!read_drv_pages(base + pe.dos.e_lfanew, &pe.nt, sizeof(pe.nt))) return false;
     if (pe.nt.Signature != 0x4550) return false;
     if (pe.nt.OptionalHeader.Magic != 0x20B) return false;
 
@@ -459,7 +481,7 @@ bool read_drv_pe(uint64_t base, DrvPe& pe) {
 
     const uint64_t off = base + pe.dos.e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) + opt;
     std::vector<IMAGE_SECTION_HEADER> raw(n);
-    if (!vread(off, raw.data(), raw.size() * sizeof(IMAGE_SECTION_HEADER))) return false;
+    if (!read_drv_pages(off, raw.data(), raw.size() * sizeof(IMAGE_SECTION_HEADER))) return false;
 
     pe.secs.clear();
     for (const auto& s : raw) {
@@ -480,8 +502,7 @@ bool read_drv_pe(uint64_t base, DrvPe& pe) {
 bool sec_resident(const DrvSection& s) {
     if (!(s.chars & IMAGE_SCN_MEM_READ)) return false;
     if (s.chars & IMAGE_SCN_MEM_DISCARDABLE) return false;
-    if (!(s.chars & IMAGE_SCN_MEM_NOT_PAGED)) return false;
-    return true;
+    return true; // NOT_PAGED is only a hint; G1 proves the live PTE is present.
 }
 
 bool sec_code_resident(const DrvSection& s) {
@@ -512,18 +533,24 @@ bool sec_span(const DrvPe& pe, const DrvSection& s, uint32_t& sz) {
 bool find_iat_slot(uint64_t base, const DrvPe& pe, uint64_t real_map,
                    uint64_t patched_to, uint64_t& slot, uint32_t& slot_rva,
                    bool& already_patched) {
-    wchar_t sysdir[MAX_PATH]{};
-    const UINT sn = GetSystemDirectoryW(sysdir, MAX_PATH);
     const char* image = cloak::driver_image();
-    if (!sn || sn >= MAX_PATH || !image || !*image) return false;
+    if (!image || !*image) return false;
     const int wn = MultiByteToWideChar(CP_UTF8, 0, image, -1, nullptr, 0);
-    if (wn <= 1 || wn > 128) return false;
+    if (wn <= 1 || wn > MAX_PATH) return false;
     std::wstring wide(static_cast<size_t>(wn), L'\0');
     if (!MultiByteToWideChar(CP_UTF8, 0, image, -1, wide.data(), wn)) return false;
     wide.pop_back();
-    std::wstring path = sysdir;
-    path += L"\\drivers\\";
-    path += wide;
+    std::wstring path;
+    if (strchr(image, '\\') || strchr(image, '/')) {
+        path = wide;
+    } else {
+        wchar_t sysdir[MAX_PATH]{};
+        const UINT sn = GetSystemDirectoryW(sysdir, MAX_PATH);
+        if (!sn || sn >= MAX_PATH) return false;
+        path = sysdir;
+        path += L"\\drivers\\";
+        path += wide;
+    }
     if (path.size() >= MAX_PATH) return false;
 
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -659,7 +686,7 @@ bool find_iat_slot(uint64_t base, const DrvPe& pe, uint64_t real_map,
 
     uint64_t imp = 0;
     const uint64_t candidate = base + hit_rva;
-    if (!vread(candidate, &imp, 8)) return false;
+    if (!read_drv_pages(candidate, &imp, 8)) return false;
     if (imp != real_map && (!patched_to || imp != patched_to)) {
         printf("[!] descriptor IAT value 0x%llx is outside the accepted set "
                "{MmMapIoSpace 0x%llx, stub 0x%llx}\n",
@@ -695,7 +722,7 @@ bool find_existing_stub(uint64_t base, const DrvPe& pe, uint64_t real_map, StubS
             size_t n = sz - off;
             if (n > kChunk) n = kChunk;
             if (n + 0x40 <= sz - off) n += 0x40;   // overlap for split stubs
-            if (!vread(base + s.va + off, buf.data(), n)) break;
+            if (!read_drv_pages(base + s.va + off, buf.data(), n)) break;
 
             for (size_t i = 0; i + 11 <= n; ++i) {
                 const bool rel = buf[i] == 0x41 && buf[i + 1] == 0xB8 &&
@@ -730,9 +757,10 @@ bool find_existing_stub(uint64_t base, const DrvPe& pe, uint64_t real_map, StubS
     return false;
 }
 
-// Locate an uninterrupted 0xCC run of at least `need` bytes inside a resident
-// read-only executable section other than .pdata, wholly within one page.
-// The highest RVA wins because padding lives at the section tail.
+// Locate an uninterrupted 0xCC run of at least `need` bytes inside a read-only
+// executable section other than the .pdata section, wholly within one page.
+// This does not rewrite unwind metadata; the highest RVA wins because padding
+// lives at the section tail.
 bool find_cc_run(uint64_t base, const DrvPe& pe, size_t need, StubSite& best) {
     constexpr size_t kChunk = 0x10000;
     std::vector<uint8_t> buf(kChunk + 0x40);
@@ -747,7 +775,7 @@ bool find_cc_run(uint64_t base, const DrvPe& pe, size_t need, StubSite& best) {
             size_t n = sz - off;
             if (n > kChunk) n = kChunk;
             if (n + 0x40 <= sz - off) n += 0x40;   // overlap for split runs
-            if (!vread(base + s.va + off, buf.data(), n)) break;
+            if (!read_drv_pages(base + s.va + off, buf.data(), n)) break;
 
             size_t i = 0;
             while (i < n) {
@@ -993,6 +1021,12 @@ bool patch_cached_map(bool dry_run, const char* step) {
     printf("[+] G2 RO sections: stub rva 0x%x chars 0x%lx; IAT rva 0x%x chars 0x%lx\n",
            stub_sec->va, (unsigned long)stub_sec->chars,
            slot_sec->va, (unsigned long)slot_sec->chars);
+    if (!(stub_sec->chars & IMAGE_SCN_MEM_NOT_PAGED) ||
+        !(slot_sec->chars & IMAGE_SCN_MEM_NOT_PAGED)) {
+        printf("[*] NOT_PAGED clear (stub=%d, IAT=%d); G1/live-page reads prove presence\n",
+               !(stub_sec->chars & IMAGE_SCN_MEM_NOT_PAGED) ? 0 : 1,
+               !(slot_sec->chars & IMAGE_SCN_MEM_NOT_PAGED) ? 0 : 1);
+    }
 
     // Hard gate: a foreign build or a slot pointing somewhere else is a
     // refusal, never a "best effort" write.
@@ -1023,8 +1057,9 @@ bool patch_cached_map(bool dry_run, const char* step) {
         printf("[!] stub page is not present through the PTE self-map - refusing\n");
         return false;
     }
-    printf("[+] G1 PTE present: slot 0x%llx -> PA 0x%llx; stub 0x%llx -> PA 0x%llx\n",
-           (unsigned long long)slot, (unsigned long long)slot_pa,
+    printf("[+] G1 PTE present: IAT slot VA 0x%llx -> PA 0x%llx\n",
+           (unsigned long long)slot, (unsigned long long)slot_pa);
+    printf("[+] G1 PTE present: stub VA 0x%llx -> PA 0x%llx\n",
            (unsigned long long)site.va, (unsigned long long)stub_pa);
     printf("[+] G3 write mapping: kernel self-map translation + physical pwrite; "
            "no RO virtual write or TLB modification\n");
@@ -1075,8 +1110,15 @@ bool patch_cached_map(bool dry_run, const char* step) {
                 // read-back was stale. Put the original pointer back.
                 uint64_t cur{};
                 if (vread(slot, &cur, 8) && cur != imp) {
-                    pwrite(slot_pa, &imp, 8);
-                    printf("[*] original import pointer restored\n");
+                    uint64_t restored = 0;
+                    if (pwrite(slot_pa, &imp, 8) &&
+                        vread(slot, &restored, 8) && restored == imp) {
+                        printf("[*] original import pointer restored and verified\n");
+                    } else {
+                        printf("[!] import rollback NOT verified; expected 0x%llx, "
+                               "last read 0x%llx - inspect the slot manually\n",
+                               (unsigned long long)imp, (unsigned long long)cur);
+                    }
                 }
                 return false;
             }
