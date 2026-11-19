@@ -67,12 +67,15 @@ extern ProcOffsets g_off;
 extern bool g_off_ready;
 
 // Attach target: EPROCESS, pid, CR3, module base + size.
+// peb_ok is false when page-table translation (read_cr3) is unavailable
+// on this driver/build (e.g. Win11 26200 PT-page physical reads refused).
 struct Target {
     uint64_t eproc{};
     uint32_t pid{};
     uint64_t cr3{};
     uint64_t base{};
     uint64_t size{};
+    bool     peb_ok{};
 };
 extern Target g_target;
 

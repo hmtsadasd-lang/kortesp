@@ -1098,10 +1098,11 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
     if (!pml4e_plausible(dtb, vmm::g_ntos)) return false;
 
     // PEB adayi: +0x200..+0x600, user VA, translate edilebilir, LDR null degil.
-    // Bir adayda modül bulunamazsa bir sonraki adayi dene (decoy alanlara karsi).
+    // Bir adayda modul bulunamazsa bir sonraki adayi dene (decoy alanlara karsi).
     uint64_t peb = 0;
     uint64_t base = 0, size = 0;
-    for (uint32_t o = 0x200; o + 8 <= 0x600; o += 8) {
+    bool peb_ok = false;
+    for (uint32_t o = 0x200; o + 8 <= 0x600 && !peb_ok; o += 8) {
         uint64_t cand = 0;
         if (!vmm::kread_trusted(eproc + o, &cand, 8)) continue;
         if (cand < vmm::kUserLo || cand > vmm::kUserHi || (cand & 7)) continue;
@@ -1124,15 +1125,15 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
         peb = cand;
         vmm::g_off.peb = o;
         vmm::g_lay.peb = o;
-        break;
+        peb_ok = true;
     }
-    if (!peb) return false;
 
     t.eproc = eproc;
     t.pid = pid;
     t.cr3 = dtb;
     t.base = base;
     t.size = size;
+    t.peb_ok = peb_ok;
     return true;
 }
 
@@ -1167,9 +1168,15 @@ bool vmm::attach() {
     Target t{};
     if (!find_process_by_prefix("FortniteClient-", t)) return false;
 
-    // Capa 2: ntoskrnl base'i hedef CR3 altinda MZ ile karsilanmali
+    // Capa 2: ntoskrnl base'i hedef CR3 altinda MZ ile karsilanmali.
+    // read_cr3() fisik sayfa tablosu yaylasar; Win11 26200'de surucunun
+    // fisik-okuma IOCTL'i PT sayfalarini reddeder (487). Basarisiz olsa da
+    // hedefi surekli tut: DTB guvenilmez olarak isaretlenir, base/size bilinmez.
     uint16_t mz = 0;
-    if (!read_cr3(t.cr3, vmm::g_ntos, &mz, 2) || mz != 0x5A4D) return false;
+    bool cr3_ok = read_cr3(t.cr3, vmm::g_ntos, &mz, 2) && mz == 0x5A4D;
+    if (!cr3_ok) {
+        printf("[!] CR3 MZ probe failed (PT-page physical reads refused) - DTB UNVERIFIED\n");
+    }
 
     vmm::g_target = t;
     vmm::g_gcr3 = t.cr3;
@@ -1177,7 +1184,7 @@ bool vmm::attach() {
     vmm::g_pid = t.pid;
     vmm::g_base = t.base;
     vmm::g_size = t.size;
-    vmm::g_dtb_ok = true;
+    vmm::g_dtb_ok = cr3_ok;
     if (!vmm::g_kcr3) vmm::g_kcr3 = t.cr3;
     ++vmm::g_stamp;
 
@@ -1185,8 +1192,9 @@ bool vmm::attach() {
 
     vmm::g_ready = true;
 
-    printf("[vmm] attached pid=%u base=0x%llX size=0x%llX\n",
-           t.pid, (unsigned long long)t.base, (unsigned long long)t.size);
+    printf("[vmm] attached pid=%u base=0x%llX size=0x%llX peb_ok=%s\n",
+           t.pid, (unsigned long long)t.base, (unsigned long long)t.size,
+           t.peb_ok ? "yes" : "no");
     return true;
 }
 
