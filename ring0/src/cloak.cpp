@@ -198,8 +198,20 @@ bool apply(bool commit) {
         printf("[!] cloak not initialised\n");
         return false;
     }
-    if (!r0::g_write_ok) {
+    if (commit && !r0::g_write_ok) {
         printf("[!] kernel write path not proven - refusing cloak\n");
+        return false;
+    }
+    if (!r0::vread_ready()) {
+        printf("[!] kernel-VA read not proven - refusing cloak\n");
+        return false;
+    }
+    if (!vmm::g_ntos) {
+        printf("[!] ntoskrnl base unknown - refusing cloak\n");
+        return false;
+    }
+    if (!vmm::g_pte_base) {
+        printf("[!] PTE self-map base not proven - refusing cloak\n");
         return false;
     }
     if (!g_head && !find_head(g_head)) {

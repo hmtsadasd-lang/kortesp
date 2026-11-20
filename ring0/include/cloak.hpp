@@ -42,16 +42,4 @@ bool module_base(uint64_t& base, uint32_t& size);
 void set_driver_image(const char* name);
 const char* driver_image();
 
-// Diagnostics for the dry run.
-struct Plan {
-    uint64_t head{};        // &PsLoadedModuleList
-    uint64_t entry{};       // our KLDR_DATA_TABLE_ENTRY
-    uint64_t load_prev{};   // InLoadOrderLinks.Blink
-    uint64_t load_next{};   // InLoadOrderLinks.Flink
-    uint64_t dll_base{};    // DllBase of the matched entry
-    bool     found{};
-};
-
-const Plan& plan();
-
 } // namespace cloak

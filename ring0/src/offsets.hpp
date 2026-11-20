@@ -10,11 +10,11 @@
 namespace off {
 
 // ---- absolute RVAs from the client module base --------------------------
-constexpr uintptr_t GEngine  = 0x1C9DC1D8;   // VERIFIED
+constexpr uintptr_t GEngine  = 0x1C8E2F48;   // VERIFIED - cheatoffsets 43.00/43.10CL
 constexpr uintptr_t GObjects = 0x1C966F18;   // VERIFIED
 
 // ---- UEngine -> world ---------------------------------------------------
-constexpr uintptr_t Engine_GameViewportClient = 0xC0;   // VERIFIED
+constexpr uintptr_t Engine_GameViewportClient = 0xB70;   // VERIFIED - cheatoffsets 43.10CL
 constexpr uintptr_t Viewport_World            = 0x78;   // VERIFIED
 
 // ---- UWorld -------------------------------------------------------------

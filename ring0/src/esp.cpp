@@ -261,9 +261,31 @@ void draw_entity(const Pov& v, const Entity& e, int my_team) {
 
 bool refresh_world() {
     uint64_t engine{}, vp{}, world{};
-    if (!vmm::rd(vmm::base() + off::GEngine, &engine, sizeof(engine)) || !ok(engine)) return false;
-    if (!vmm::rd(engine + off::Engine_GameViewportClient, &vp, sizeof(vp)) || !ok(vp)) return false;
-    if (!vmm::rd(vp + off::Viewport_World, &world, sizeof(world)) || !ok(world)) return false;
+    uint64_t engine_addr = vmm::base() + off::GEngine;
+    if (!vmm::rd(engine_addr, &engine, sizeof(engine))) {
+        printf("[!] refresh_world: ReadProcessMemory failed for GEngine addr 0x%llx\n",
+               (unsigned long long)engine_addr);
+        return false;
+    }
+    printf("[!] refresh_world: GEngine addr 0x%llx -> value 0x%llx\n",
+           (unsigned long long)engine_addr, (unsigned long long)engine);
+    if (!ok(engine)) return false;
+    if (!vmm::rd(engine + off::Engine_GameViewportClient, &vp, sizeof(vp))) {
+        printf("[!] refresh_world: ReadProcessMemory failed for GameViewport addr 0x%llx\n",
+               (unsigned long long)(engine + off::Engine_GameViewportClient));
+        return false;
+    }
+    printf("[!] refresh_world: GameViewport addr 0x%llx -> value 0x%llx\n",
+           (unsigned long long)(engine + off::Engine_GameViewportClient), (unsigned long long)vp);
+    if (!ok(vp)) return false;
+    if (!vmm::rd(vp + off::Viewport_World, &world, sizeof(world))) {
+        printf("[!] refresh_world: ReadProcessMemory failed for World addr 0x%llx\n",
+               (unsigned long long)(vp + off::Viewport_World));
+        return false;
+    }
+    printf("[!] refresh_world: World addr 0x%llx -> value 0x%llx\n",
+           (unsigned long long)(vp + off::Viewport_World), (unsigned long long)world);
+    if (!ok(world)) return false;
     g_world = world;
     return true;
 }

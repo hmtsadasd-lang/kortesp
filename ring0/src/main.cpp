@@ -5,6 +5,7 @@
 #include "cloak.hpp"
 #include "mock.hpp"
 #include "mem.hpp"
+#include "pm.hpp"
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +23,7 @@ struct CmdFlags {
     bool cloak_restore{ false }, cloak_dry{ false }, hide_symlink{ false }, kwtest{ false };
     bool only_ntos{ false }, only_eproc{ false }, dump_cr3{ false }, dtbscan{ false };
     bool dpatch{ false }, dpatch_dry{ false }, actors{ false }, raw{ false }, mock{ false };
-    bool kvread{ false }, pmem{ false };
+    bool kvread{ false }, pmem{ false }, pm_test{ false };
     std::string backend;
     std::string dpatch_step;
     uint64_t raw_pa{ 0 };
@@ -71,6 +72,7 @@ static CmdFlags parse_cmd() {
             f.backend = narrow(argv[++i]);
         }
         else if (!wcscmp(a, L"--pmem")) f.pmem = true;
+        else if (!wcscmp(a, L"--pm-test")) f.pm_test = true;
         else if (!wcscmp(a, L"--dpatch")) f.dpatch = true;
         else if (!wcscmp(a, L"--dpatch-dry")) { f.dpatch = true; f.dpatch_dry = true; }
         else if (!wcscmp(a, L"--dpatch-step") && i + 1 < argc) {
@@ -153,13 +155,18 @@ static bool raw_read(uint64_t pa, size_t len) {
     if (!len) return false;
     const bool in_ram = vmm::phys_is_ram(pa, len);
     printf("[*] physical read 0x%llx, %zu bytes\n", (unsigned long long)pa, len);
-    printf("[*] in RAM map: %s%s\n", in_ram ? "yes" : "NO",
-           in_ram ? "" : " - reading anyway, that is what --raw is for");
+    printf("[*] in RAM map: %s\n", in_ram ? "yes" : "NO");
+
     std::vector<uint8_t> b(len, 0xCC);
     if (!r0::phys_read_raw(pa, b.data(), len)) {
         const DWORD err = GetLastError();
-        printf("[!] IOCTL failed (GetLastError=%lu / 0x%lx)\n",
-               (unsigned long)err, (unsigned long)err);
+        printf("[!] IOCTL failed (GetLastError=%lu / 0x%lx) %s\n",
+               (unsigned long)err, (unsigned long)err,
+               err == 487
+                   ? "- ERROR_INVALID_ADDRESS: the page is already mapped "
+                     "cached by the memory manager; MmMapIoSpace(MmNonCached) "
+                     "conflicts. Use the PTE self-map remap (pm) path instead."
+                   : "");
         return false;
     }
     bool any = false;
@@ -289,8 +296,58 @@ int wmain() {
         return ok ? 0 : 1;
     }
 
+    if (f.pm_test) {
+        if (!vmm::init_ntos()) { vmm::shutdown(); return 1; }
+        if (!vmm::init_pte_base()) {
+            printf("[!] PTE self-map base not proven - cannot test pm\n");
+            vmm::shutdown();
+            return 1;
+        }
+        if (!pm::init(vmm::g_pte_base)) {
+            printf("[!] pm: init failed\n");
+            vmm::shutdown();
+            return 1;
+        }
+        // Test: read the page that holds ntoskrnl's DOS header (MZ page).
+        uint8_t buf[16]{};
+        const uint64_t test_pa = 0x1000;  // first page, known to hold firmware/IVT data
+        const bool ok = pm::read(test_pa, buf, sizeof buf);
+        printf("[*] pm: read PA 0x%llx -> %s\n",
+               (unsigned long long)test_pa, ok ? "OK" : "FAIL");
+        if (ok) {
+            printf("    %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                   buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+        }
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
+
     if (!vmm::init_system()) { vmm::shutdown(); return 1; }
     if (f.only_eproc) { vmm::shutdown(); return 0; }
+    if (!vmm::init_pte_base()) {
+        printf("[!] PTE self-map base not proven - physical page-table reads unavailable\n");
+        vmm::shutdown();
+        return 1;
+    }
+
+    // Cloak / write-test modes need g_ntos + g_pte_base + vread_ready,
+    // but NOT g_kcr3 (they use kernel-VA reads, not physical page walks).
+    if (f.cloak_restore) { const bool ok = cloak::restore(); vmm::shutdown(); return ok ? 0 : 1; }
+    if (f.cloak_dry) { const bool ok = cloak::apply(false); vmm::shutdown(); return ok ? 0 : 1; }
+    if (f.kwtest) { const bool ok = kwtest(); vmm::shutdown(); return ok ? 0 : 1; }
+    if (f.cloak) {
+        const bool ok = cloak::apply(true);
+        vmm::shutdown();
+        return ok ? 0 : 1;
+    }
+
+    // pm::init() (PTE self-map remap) is EXPERIMENTAL and caused BSODs.
+    // Disabled until a safe kernel-VA-based page-table walk is implemented.
+    // --dump-cr3, --dtbscan, --probe, --esp work with kernel-VA reads only
+    // for kernel addresses (ntoskrnl, EPROCESS). User-space VA translation
+    // through a target CR3 requires physical PT reads, which this driver
+    // refuses on Win11 26200.
+
     if (f.dump_cr3) { const bool ok = vmm::dump_cr3(); vmm::shutdown(); return ok ? 0 : 1; }
     if (f.dtbscan)  { const bool ok = vmm::dtb_scan(); vmm::shutdown(); return ok ? 0 : 1; }
 
@@ -298,16 +355,6 @@ int wmain() {
         printf("[!] CR3 not proven\n");
         vmm::shutdown();
         return 1;
-    }
-
-    if (f.cloak_restore) { const bool ok = cloak::restore(); vmm::shutdown(); return ok ? 0 : 1; }
-    if (f.cloak_dry) { const bool ok = cloak::apply(false); vmm::shutdown(); return ok ? 0 : 1; }
-    if (f.kwtest) { const bool ok = kwtest(); vmm::shutdown(); return ok ? 0 : 1; }
-
-    if (f.cloak) {
-        const bool ok = cloak::apply(true);
-        vmm::shutdown();
-        return ok ? 0 : 1;
     }
 
     if (f.hide_symlink) {

@@ -1,6 +1,7 @@
 #include "vmm.hpp"
 #include "offsets.hpp"
 #include "r0.hpp"
+#include "pm.hpp"
 #include "mem.hpp"
 #include <windows.h>
 #include <cstring>
@@ -202,7 +203,10 @@ static bool phys_read(uint64_t pa, void* buf, size_t len) {
         const uint64_t cur = pa + i;
         size_t chunk = 0x1000 - (cur & 0xFFF);
         if (chunk > len - i) chunk = len - i;
-        if (!r0::pread(cur, p + i, chunk)) return false;
+        // pm::read uses the PTE self-map remap: no MmMapIoSpace, no
+        // MmNonCached conflict, works on page-table pages too.
+        if (pm::g_pm_ok && !pm::read(cur, p + i, chunk)) return false;
+        else if (!pm::g_pm_ok && !r0::pread(cur, p + i, chunk)) return false;
         i += chunk;
     }
     return true;
@@ -239,9 +243,20 @@ bool va_canonical(uint64_t va) {
     return sign ? (va >> 48) == 0xFFFFull : (va >> 48) == 0;
 }
 
+bool vmm::safe_translate(uint64_t va, uint64_t& pa);   // forward declaration
+
 vmm::Walk walk_va(uint64_t cr3, uint64_t va, uint64_t& pa) {
     cr3 &= vmm::kPteMask;
     if (!cr3 || !va_canonical(va)) return vmm::Walk::BadArgs;
+
+    // Kernel VAs are globally mapped (same PTEs in every process).
+    // safe_translate() reads through the current process's PTE self-map
+    // via the kernel-VA IOCTL, which works on Win11 26200 where physical
+    // PT-page reads are refused (487). This avoids the dangerous PTE
+    // remap (pm.cpp) that caused BSODs.
+    if (va >= 0xFFFF800000000000ull) {
+        if (vmm::safe_translate(va, pa)) return vmm::Walk::Ok;
+    }
 
     const uint64_t page = va & ~0xFFFull;
     auto& e = vmm::g_tlb[(page >> 12) & (vmm::kTlbSize - 1)];
@@ -486,7 +501,7 @@ bool vmm::page_table_read_ok() {
 
 bool vmm::safe_translate(uint64_t va, uint64_t& pa) {
     if ((va >> 48) != 0xFFFFull) return false;
-    if (!g_pte_base && !init_pte_base()) return false;
+    if (!g_pte_base) return false;   // caller must call init_pte_base() first
     constexpr uint64_t kMask48 = 0x0000FFFFFFFFFFFFull;
     const uint64_t kPteBase = g_pte_base;
     const uint64_t m = va & kMask48;
@@ -1056,26 +1071,28 @@ static bool peb_has_module(uint64_t eprocess, uint64_t cr3, const char* want) {
     return false;
 }
 
+static bool read_user_va(uint64_t cr3, uint64_t va, void* buf, size_t len);
+
 static bool find_module_in_ldr(uint64_t cr3, uint64_t ldr, const char* want,
                                uint64_t& base, uint64_t& size) {
     uint64_t head{}, cur{};
-    if (!read_cr3(cr3, ldr + off::Ldr_InLoadOrder, &head, 8)) return false;
+    if (!read_user_va(cr3, ldr + off::Ldr_InLoadOrder, &head, 8)) return false;
     if (head < vmm::kUserLo || head > vmm::kUserHi) return false;
-    if (!read_cr3(cr3, head, &cur, 8)) return false;
+    if (!read_user_va(cr3, head, &cur, 8)) return false;
 
     for (int g = 0; g < 512 && cur && cur != head; ++g) {
         uint16_t nlen{};
         uint64_t nbuf{}, dllbase{};
-        if (!read_cr3(cr3, cur + off::Ldr_BaseDllNameLen, &nlen, 2)) return false;
-        if (!read_cr3(cr3, cur + off::Ldr_BaseDllNameBuf, &nbuf, 8)) return false;
-        if (!read_cr3(cr3, cur + off::Ldr_DllBase, &dllbase, 8)) return false;
+        if (!read_user_va(cr3, cur + off::Ldr_BaseDllNameLen, &nlen, 2)) return false;
+        if (!read_user_va(cr3, cur + off::Ldr_BaseDllNameBuf, &nbuf, 8)) return false;
+        if (!read_user_va(cr3, cur + off::Ldr_DllBase, &dllbase, 8)) return false;
         uint32_t imgsz32{};
-        if (!read_cr3(cr3, cur + off::Ldr_SizeOfImage, &imgsz32, 4)) return false;
+        if (!read_user_va(cr3, cur + off::Ldr_SizeOfImage, &imgsz32, 4)) return false;
 
         if (nlen > 3 && nlen < 512 && nbuf >= vmm::kUserLo && nbuf <= vmm::kUserHi) {
             wchar_t w[264]{};
             const int c = static_cast<int>(nlen / 2);
-            if (c < 263 && read_cr3(cr3, nbuf, w, static_cast<size_t>(nlen))) {
+            if (c < 263 && read_user_va(cr3, nbuf, w, static_cast<size_t>(nlen))) {
                 char a[64]{};
                 for (int i = 0; i < c && i < 63; ++i)
                     a[i] = w[i] < 128 ? static_cast<char>(w[i]) : '?';
@@ -1086,16 +1103,27 @@ static bool find_module_in_ldr(uint64_t cr3, uint64_t ldr, const char* want,
                 }
             }
         }
-        if (!read_cr3(cr3, cur, &cur, 8)) return false;
+        if (!read_user_va(cr3, cur, &cur, 8)) return false;
     }
     return false;
+}
+
+// User-space VA reader: uses RPM (ReadProcessMemory) when the rpm backend is
+// active, otherwise falls back to the physical page-table walk (read_cr3).
+// On Win11 26200 the driver refuses PT-page physical reads, so rpm is the
+// only working path for user VAs there.
+static bool read_user_va(uint64_t cr3, uint64_t va, void* buf, size_t len) {
+    if (mem::active() == mem::backend::rpm) {
+        return mem::read(va, buf, len);
+    }
+    return read_cr3(cr3, va, buf, len);
 }
 
 static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
     uint64_t dtb = 0;
     if (!vmm::kread_trusted(eproc + vmm::g_lay.dtb, &dtb, 8)) return false;
     if (dtb & 0xFFF) return false;
-    if (!pml4e_plausible(dtb, vmm::g_ntos)) return false;
+    if (mem::active() != mem::backend::rpm && !pml4e_plausible(dtb, vmm::g_ntos)) return false;
 
     // PEB adayi: +0x200..+0x600, user VA, translate edilebilir, LDR null degil.
     // Bir adayda modul bulunamazsa bir sonraki adayi dene (decoy alanlara karsi).
@@ -1107,11 +1135,11 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
         if (!vmm::kread_trusted(eproc + o, &cand, 8)) continue;
         if (cand < vmm::kUserLo || cand > vmm::kUserHi || (cand & 7)) continue;
         uint64_t ldr = 0;
-        if (!read_cr3(dtb, cand + off::Peb_Ldr, &ldr, 8)) continue;
+        if (!read_user_va(dtb, cand + off::Peb_Ldr, &ldr, 8)) continue;
         if (!ldr) continue;
 
         uint64_t ldr2 = 0;
-        if (!read_cr3(dtb, cand + off::Peb_Ldr, &ldr2, 8)) continue;
+        if (!read_user_va(dtb, cand + off::Peb_Ldr, &ldr2, 8)) continue;
         base = 0; size = 0;
         if (!find_module_in_ldr(dtb, ldr2, "FortniteClient-Win64-Shipping.exe", base, size))
             continue;   // bu aday degil, bir sonraki
@@ -1119,7 +1147,7 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
 
         // Capa 1: PEB->ImageBaseAddress == modul base
         uint64_t peb_base = 0;
-        if (!read_cr3(dtb, cand + off::Peb_ImageBaseAddress, &peb_base, 8)) continue;
+        if (!read_user_va(dtb, cand + off::Peb_ImageBaseAddress, &peb_base, 8)) continue;
         if (peb_base != base) continue;
 
         peb = cand;
@@ -1152,7 +1180,10 @@ bool vmm::find_process_by_prefix(const char* prefix, vmm::Target& t) {
             uint64_t pid = 0;
             if (kq(e + vmm::g_off.pid, pid) && pid >= 0x64 && pid < 0x100000) {
                 ++matches;
-                if (fill_target(e, static_cast<uint32_t>(pid), t)) return true;
+                t.eproc = e;
+                t.pid = static_cast<uint32_t>(pid);
+                // DTB comes from fill_target() after RPM is opened
+                return true;   // first name match, defer PEB/LDR to fill_target()
             }
         }
         if (!vmm::kread_trusted(cur, &cur, 8)) break;
@@ -1168,14 +1199,31 @@ bool vmm::attach() {
     Target t{};
     if (!find_process_by_prefix("FortniteClient-", t)) return false;
 
+    // Open RPM for user-space VA reads before PEB/LDR discovery.
+    // read_user_va() dispatches to mem::read() when rpm backend is active.
+    if (mem::active() == mem::backend::rpm && !mem::open_rpm(t.pid)) return false;
+
+    // PEB/LDR discovery via mem::read() (rpm) or read_cr3() (phys walk).
+    if (!fill_target(t.eproc, t.pid, t)) return false;
+
     // Capa 2: ntoskrnl base'i hedef CR3 altinda MZ ile karsilanmali.
-    // read_cr3() fisik sayfa tablosu yaylasar; Win11 26200'de surucunun
-    // fisik-okuma IOCTL'i PT sayfalarini reddeder (487). Basarisiz olsa da
-    // hedefi surekli tut: DTB guvenilmez olarak isaretlenir, base/size bilinmez.
+    // read_cr3() fisik sayfa tablosu yaylasar. pm::read (PTE self-map remap)
+    // etkinse her sayfa okunur, y compris PT sayfaları; bu durumda strict
+    // dogrulama gerekir. pm yoksa degradation: DTB guvenilmez olarak isaretlenir.
     uint16_t mz = 0;
     bool cr3_ok = read_cr3(t.cr3, vmm::g_ntos, &mz, 2) && mz == 0x5A4D;
-    if (!cr3_ok) {
-        printf("[!] CR3 MZ probe failed (PT-page physical reads refused) - DTB UNVERIFIED\n");
+
+    if (pm::g_pm_ok) {
+        // pm etkin: CR3 probe basarili olmali. Basarisizsa EPROCESS veya Peb
+        // offseti yanlidir — degradation ile örtmez, düzelt.
+        if (!cr3_ok) {
+            printf("[!] CR3 MZ probe failed with pm active - EPROCESS/Peb "
+                   "offsets may be wrong. Aborting attach.\n");
+            return false;
+        }
+    } else if (!cr3_ok) {
+        printf("[!] CR3 MZ probe failed (PT-page physical reads refused) - "
+               "DTB UNVERIFIED (pm not available)\n");
     }
 
     vmm::g_target = t;
@@ -1187,8 +1235,6 @@ bool vmm::attach() {
     vmm::g_dtb_ok = cr3_ok;
     if (!vmm::g_kcr3) vmm::g_kcr3 = t.cr3;
     ++vmm::g_stamp;
-
-    if (mem::active() == mem::backend::rpm && !mem::open_rpm(t.pid)) return false;
 
     vmm::g_ready = true;
 
@@ -1296,14 +1342,17 @@ bool vmm::present(uint64_t va) {
 
 bool vmm::prove_target_cr3() {
     if (!g_gcr3 || !g_ntos) return false;
+    // ntoskrnl is a kernel VA mapped identically in every process.
+    // safe_translate() reads through the current process's PTE self-map
+    // (kernel-VA IOCTL), which works on Win11 26200 where physical PT reads
+    // are refused. The physical address of ntoskrnl is CR3-independent.
     uint64_t pa{};
-    const Walk st = walk_va(g_gcr3, g_ntos, pa);
-    if (st != Walk::Ok) {
-        printf("[!] target CR3 0x%llx does not map ntoskrnl: %s\n",
-               (unsigned long long)g_gcr3, walk_name(st));
+    if (!safe_translate(g_ntos, pa)) {
+        printf("[!] target CR3 0x%llx cannot translate ntoskrnl via self-map\n",
+               (unsigned long long)g_gcr3);
         return false;
     }
-    if (!page_mz(pa)) {
+    if (!page_mz(pa & ~0xFFFull)) {
         printf("[!] target CR3 0x%llx maps ntoskrnl to 0x%llx but not MZ\n",
                (unsigned long long)g_gcr3, (unsigned long long)(pa & ~0xFFFull));
         return false;
@@ -1316,27 +1365,32 @@ bool vmm::prove_target_cr3() {
 static void raw_walk(const char* tag, uint64_t cr3, uint64_t va) {
     printf("[*] raw walk %s va=0x%llx cr3=0x%llx\n", tag,
            (unsigned long long)va, (unsigned long long)cr3);
-    static const int kShift[4] = { 39, 30, 21, 12 };
+    constexpr uint64_t kMask48 = 0x0000FFFFFFFFFFFFull;
+    const uint64_t kPteBase = vmm::g_pte_base;
+    const uint64_t m = va & kMask48;
+    const uint64_t pde_base = kPteBase + ((kPteBase & kMask48) >> 9);
+    const uint64_t ppe_base = kPteBase + ((pde_base & kMask48) >> 9);
+    const uint64_t pxe_base = kPteBase + ((ppe_base & kMask48) >> 9);
     static const char* kName[4] = { "PML4E", "PDPTE", "PDE", "PTE" };
+    const uint64_t kBases[4] = { pxe_base, ppe_base, pde_base, kPteBase };
+    const uint64_t kShifts[4] = { 39, 30, 21, 12 };
 
-    uint64_t tbl = cr3 & vmm::kPteMask;
     for (int i = 0; i < 4; ++i) {
-        const uint64_t idx = (va >> kShift[i]) & 0x1FF;
-        const uint64_t at = tbl + 8 * idx;
+        const uint64_t idx = (va >> kShifts[i]) & 0x1FF;
+        const uint64_t entry_va = kBases[i] + idx * 8;
         uint64_t e{};
-        if (!phys_read(at, &e, 8)) {
-            printf("    %s[%llu] @0x%llx  READ FAILED\n", kName[i],
-                   (unsigned long long)idx, (unsigned long long)at);
+        if (!r0::vread(entry_va, &e, 8)) {
+            printf("    %s[%llu] @0x%llx  READ FAILED\n",
+                   kName[i], (unsigned long long)idx, (unsigned long long)entry_va);
             return;
         }
-        printf("    %s[%llu] @0x%llx = 0x%016llx  present=%d ps=%d\n", kName[i],
-               (unsigned long long)idx, (unsigned long long)at,
-               (unsigned long long)e, !!(e & 1), !!(e & 0x80));
+        printf("    %s[%llu] @0x%llx = 0x%016llx  present=%d ps=%d\n",
+               kName[i], (unsigned long long)idx, (unsigned long long)entry_va,
+               (unsigned long long)e, (e & 1) ? 1 : 0, (e & 0x80) ? 1 : 0);
         if (!(e & 1)) { printf("    -> chain stops here\n"); return; }
         if (e & 0x80) { printf("    -> large page, chain ends\n"); return; }
-        tbl = e & vmm::kPteMask;
     }
-    printf("    -> leaf 0x%llx\n", (unsigned long long)(tbl + (va & 0xFFF)));
+    printf("    -> 4-level chain complete\n");
 }
 
 bool vmm::dump_cr3() {

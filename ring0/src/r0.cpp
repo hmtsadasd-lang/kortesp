@@ -201,8 +201,8 @@ bool init() {
         return fail("read path unstable - two reads of 0x0 differ");
     printf("[r0] direction proven: 0x9B0C1F40=read 0x9B0C1F44=write\n");
 
-    // 2. Yazma yolu, okuma yolu kanitlanana kadar kapali.
-    g_write_ok = false;
+    // 2. Okuma yolu kanitlandi, ayni IOCTL cifti yazma icin de kullanilir.
+    g_write_ok = true;
     g_be = &g_be_local;
     return true;
 }
