@@ -141,7 +141,9 @@ bool find_our_driver() {
     uint64_t flink{};
     if (!safe_read(g_head, &flink, 8)) return false;
     uint64_t cur = flink;
+    int seen = 0;
     for (int guard = 0; cur && cur != g_head && guard < 4096; ++guard) {
+        ++seen;
         uint64_t dll_base{}, cur_flink{}, name_buf{};
         uint16_t nlen{};
         if (!safe_read(cur + 0x30, &dll_base, 8)) break;
@@ -163,6 +165,8 @@ bool find_our_driver() {
                 for (size_t i = 0; tail[i] && i < sizeof(ltail) - 1; ++i)
                     ltail[i] = (tail[i] >= 'A' && tail[i] <= 'Z')
                              ? static_cast<char>(tail[i] + 32) : tail[i];
+                printf("[cloak] entry 0x%llx base=0x%llx name='%s'\n",
+                       (unsigned long long)cur, (unsigned long long)dll_base, ltail);
                 if (strlen(ltail) == wl && memcmp(ltail, lwant, wl) == 0) {
                     g_our_base = dll_base;
                     return true;
@@ -171,6 +175,11 @@ bool find_our_driver() {
         }
         cur = cur_flink;
     }
+    if (cur == g_head)
+        printf("[cloak] walked %d modules - end of PsLoadedModuleList\n", seen);
+    else
+        printf("[cloak] walk stopped early at 0x%llx after %d modules (head=0x%llx)\n",
+               (unsigned long long)cur, seen, (unsigned long long)g_head);
     return false;
 }
 

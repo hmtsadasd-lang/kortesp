@@ -4,6 +4,8 @@
 #include "pm.hpp"
 #include "mem.hpp"
 #include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -196,6 +198,14 @@ uint64_t vmm::phys_ram_end() {
     return g_ram.empty() ? 0x100000000ull : g_ram.back().second;
 }
 
+static void log_phys_io_failure(const char* backend, uint64_t pa,
+                                size_t got, size_t wanted, DWORD err) {
+    static unsigned seen = 0;
+    if (seen++ >= 8) return;
+    printf("[rd] backend=%s pa=0x%llx err=%lu got=%zu/%zu\n",
+           backend, (unsigned long long)pa, (unsigned long)err, got, wanted);
+}
+
 static bool phys_read(uint64_t pa, void* buf, size_t len) {
     if (!len || !buf) return false;
     auto* p = static_cast<uint8_t*>(buf);
@@ -203,10 +213,14 @@ static bool phys_read(uint64_t pa, void* buf, size_t len) {
         const uint64_t cur = pa + i;
         size_t chunk = 0x1000 - (cur & 0xFFF);
         if (chunk > len - i) chunk = len - i;
-        // pm::read uses the PTE self-map remap: no MmMapIoSpace, no
-        // MmNonCached conflict, works on page-table pages too.
-        if (pm::g_pm_ok && !pm::read(cur, p + i, chunk)) return false;
-        else if (!pm::g_pm_ok && !r0::pread(cur, p + i, chunk)) return false;
+        SetLastError(ERROR_SUCCESS);
+        const bool ok = pm::g_pm_ok ? pm::read(cur, p + i, chunk)
+                                    : r0::pread(cur, p + i, chunk);
+        if (!ok) {
+            log_phys_io_failure(pm::g_pm_ok ? "pm" : "phys-ioctl",
+                                cur, i, len, GetLastError());
+            return false;
+        }
         i += chunk;
     }
     return true;
@@ -1113,11 +1127,12 @@ static bool find_module_in_ldr(uint64_t cr3, uint64_t ldr, const char* want,
 // On Win11 26200 the driver refuses PT-page physical reads, so rpm is the
 // only working path for user VAs there.
 static bool read_user_va(uint64_t cr3, uint64_t va, void* buf, size_t len) {
-    if (mem::active() == mem::backend::rpm) {
-        return mem::read(va, buf, len);
-    }
+    if (mem::active() == mem::backend::rpm) return mem::read(va, buf, len);
     return read_cr3(cr3, va, buf, len);
 }
+
+static bool read_section_base(uint64_t eproc, uint64_t& base_out);
+static bool validate_image_base(uint64_t base, uint64_t dtb, uint64_t& size_out);
 
 static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
     uint64_t dtb = 0;
@@ -1125,35 +1140,71 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
     if (dtb & 0xFFF) return false;
     if (mem::active() != mem::backend::rpm && !pml4e_plausible(dtb, vmm::g_ntos)) return false;
 
-    // PEB adayi: +0x200..+0x600, user VA, translate edilebilir, LDR null degil.
-    // Bir adayda modul bulunamazsa bir sonraki adayi dene (decoy alanlara karsi).
-    uint64_t peb = 0;
-    uint64_t base = 0, size = 0;
+    // rpm backend: kullanici VA okumalari icin bu PID'in handle'i gerekli.
+    if (mem::active() == mem::backend::rpm && !mem::open_rpm(pid)) {
+        printf("[!] fill_target: open_rpm(%u) failed\n", pid);
+        return false;
+    }
+
+    // 1) KPROCESS.SectionBaseAddress (+0x520) - tercih edilen taban.
+    uint64_t sec_base = 0, base = 0, size = 0;
+    bool sec_ok = read_section_base(eproc, sec_base) &&
+                  validate_image_base(sec_base, dtb, size);
+    if (sec_ok) {
+        printf("[vmm] SectionBaseAddress=0x%llx size=0x%llx (MZ/PE32+ ok)\n",
+               (unsigned long long)sec_base, (unsigned long long)size);
+        base = sec_base;
+    } else {
+        printf("[!] SectionBaseAddress invalid (raw=0x%llx) - PEB/LDR fallback\n",
+               (unsigned long long)sec_base);
+    }
+
+    // 2) PEB.ImageBaseAddress ve LDR tabanini karsilastir (bilgi + fallback).
+    uint64_t peb_base = 0, ldr_base = 0, ldr_size = 0;
     bool peb_ok = false;
-    for (uint32_t o = 0x200; o + 8 <= 0x600 && !peb_ok; o += 8) {
-        uint64_t cand = 0;
-        if (!vmm::kread_trusted(eproc + o, &cand, 8)) continue;
-        if (cand < vmm::kUserLo || cand > vmm::kUserHi || (cand & 7)) continue;
+    auto try_peb = [&](uint64_t cand, uint32_t o) {
+        if (cand < vmm::kUserLo || cand > vmm::kUserHi || (cand & 7)) return;
         uint64_t ldr = 0;
-        if (!read_user_va(dtb, cand + off::Peb_Ldr, &ldr, 8)) continue;
-        if (!ldr) continue;
-
-        uint64_t ldr2 = 0;
-        if (!read_user_va(dtb, cand + off::Peb_Ldr, &ldr2, 8)) continue;
-        base = 0; size = 0;
-        if (!find_module_in_ldr(dtb, ldr2, "FortniteClient-Win64-Shipping.exe", base, size))
-            continue;   // bu aday degil, bir sonraki
-        if (size < 0x04000000) continue;          // launcher'lari ele
-
-        // Capa 1: PEB->ImageBaseAddress == modul base
-        uint64_t peb_base = 0;
-        if (!read_user_va(dtb, cand + off::Peb_ImageBaseAddress, &peb_base, 8)) continue;
-        if (peb_base != base) continue;
-
-        peb = cand;
+        if (!read_user_va(dtb, cand + off::Peb_Ldr, &ldr, 8) || !ldr) return;
+        uint64_t pb = 0, lb = 0, ls = 0;
+        if (!read_user_va(dtb, cand + off::Peb_ImageBaseAddress, &pb, 8) || !pb) return;
+        if (!find_module_in_ldr(dtb, ldr, "FortniteClient-Win64-Shipping.exe", lb, ls))
+            return;
+        if (ls < 0x04000000) return;   // launcher/stub ele
+        peb_base = pb; ldr_base = lb; ldr_size = ls;
         vmm::g_off.peb = o;
         vmm::g_lay.peb = o;
         peb_ok = true;
+    };
+    uint64_t pd = 0;
+    if (vmm::kread_trusted(eproc + off::Eproc_Peb, &pd, 8))
+        try_peb(pd, static_cast<uint32_t>(off::Eproc_Peb));
+    for (uint32_t o = 0x200; o + 8 <= 0x600 && !peb_ok; o += 8) {
+        if (o == off::Eproc_Peb) continue;
+        uint64_t cand = 0;
+        if (vmm::kread_trusted(eproc + o, &cand, 8)) try_peb(cand, o);
+    }
+    if (peb_ok) {
+        printf("[vmm] PEB.ImageBaseAddress=0x%llx LDR.base=0x%llx LDR.size=0x%llx\n",
+               (unsigned long long)peb_base, (unsigned long long)ldr_base,
+               (unsigned long long)ldr_size);
+        if (sec_ok && peb_base != sec_base)
+            printf("[!] PEB.ImageBaseAddress != SectionBaseAddress\n");
+    } else {
+        printf("[!] PEB/LDR module not found\n");
+    }
+
+    if (!sec_ok) {
+        if (!peb_ok || !validate_image_base(ldr_base, dtb, size)) return false;
+        base = ldr_base;
+        printf("[vmm] taban PEB/LDR'dan: base=0x%llx size=0x%llx\n",
+               (unsigned long long)base, (unsigned long long)size);
+    }
+
+    if (off::GEngine >= size) {
+        printf("[!] GEngine off 0x%llx >= SizeOfImage 0x%llx - aday elendi\n",
+               (unsigned long long)off::GEngine, (unsigned long long)size);
+        return false;
     }
 
     t.eproc = eproc;
@@ -1165,8 +1216,121 @@ static bool fill_target(uint64_t eproc, uint32_t pid, vmm::Target& t) {
     return true;
 }
 
-bool vmm::find_process_by_prefix(const char* prefix, vmm::Target& t) {
+static void narrow_ansi(const wchar_t* w, char* out, size_t n) {
+    if (!n) return;
+    const int r = WideCharToMultiByte(CP_ACP, 0, w, -1, out, (int)n, nullptr, nullptr);
+    if (r <= 0) out[0] = 0;
+}
+
+// Aday surec kimligi: PPID, thread sayisi, tam yol, working set.
+static void print_process_details(uint32_t pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+            if (pe.th32ProcessID != pid) continue;
+            char image[64]{};
+            narrow_ansi(pe.szExeFile, image, sizeof(image));
+            printf("[vmm]  ppid=%u threads=%u exe='%s'\n",
+                   pe.th32ParentProcessID, pe.cntThreads, image);
+            break;
+        }
+        CloseHandle(snap);
+    }
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return;
+    wchar_t path[MAX_PATH]{};
+    DWORD len = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, path, &len)) {
+        char ansi[MAX_PATH * 2]{};
+        narrow_ansi(path, ansi, sizeof(ansi));
+        printf("[vmm]  path='%s'\n", ansi);
+    }
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (K32GetProcessMemoryInfo(h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                sizeof(pmc)))
+        printf("[vmm]  working_set=0x%llx\n",
+               (unsigned long long)pmc.WorkingSetSize);
+    CloseHandle(h);
+}
+
+struct WindowSearch { const wchar_t* want; };
+
+static BOOL CALLBACK window_cb(HWND hwnd, LPARAM lp) {
+    auto* ws = reinterpret_cast<WindowSearch*>(lp);
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return TRUE;
+    wchar_t title[256]{};
+    const int n = GetWindowTextW(hwnd, title, 255);
+    wchar_t cls[128]{};
+    GetClassNameW(hwnd, cls, 127);
+    if ((n > 0 && wcsstr(title, ws->want)) || !wcscmp(cls, L"UnrealWindow")) {
+        char atitle[512]{}, acls[256]{};
+        narrow_ansi(title, atitle, sizeof(atitle));
+        narrow_ansi(cls, acls, sizeof(acls));
+        printf("[vmm]  window hwnd=0x%llx pid=%u title='%s' class='%s'\n",
+               (unsigned long long)(uintptr_t)hwnd, pid, atitle, acls);
+    }
+    return TRUE;
+}
+
+static void print_fortnite_windows() {
+    WindowSearch ws{ L"Fortnite" };
+    EnumWindows(window_cb, reinterpret_cast<LPARAM>(&ws));
+}
+
+struct ProcessCandidate {
+    uint64_t eproc{};
+    uint32_t pid{};
+    uint64_t dtb{};
+    uint64_t working_set{};
+    uint64_t create_time{};
+    char image[16]{};
+};
+
+static uint64_t section_base_offset();
+
+static bool query_target_metadata(uint32_t pid, uint64_t& working_set, uint64_t& create_time) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+
+    wchar_t path[MAX_PATH]{};
+    DWORD path_len = MAX_PATH;
+    if (!QueryFullProcessImageNameW(h, 0, path, &path_len)) {
+        CloseHandle(h);
+        return false;
+    }
+    const wchar_t* image = wcsrchr(path, L'\\');
+    image = image ? image + 1 : path;
+    if (_wcsicmp(image, L"FortniteClient-Win64-Shipping.exe") != 0) {
+        CloseHandle(h);
+        return false;
+    }
+
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const bool ok = K32GetProcessMemoryInfo(
+                        h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) &&
+                    GetProcessTimes(h, &created, &exited, &kernel, &user) &&
+                    pmc.WorkingSetSize >= 200ull * 1024 * 1024;
+    CloseHandle(h);
+    if (!ok) return false;
+
+    ULARGE_INTEGER c{};
+    c.LowPart = created.dwLowDateTime;
+    c.HighPart = created.dwHighDateTime;
+    working_set = pmc.WorkingSetSize;
+    create_time = c.QuadPart;
+    return create_time != 0;
+}
+
+static bool find_processes_by_prefix(const char* prefix, std::vector<ProcessCandidate>& out) {
     if (!vmm::g_off_ready) return false;
+    uint64_t sb_off = section_base_offset();
+    if (!sb_off) sb_off = off::Eproc_SectionBase;
     uint64_t head = vmm::g_eprocess + vmm::g_off.links;
     uint64_t cur = 0;
     if (!vmm::kread_trusted(head, &cur, 8)) return false;
@@ -1174,37 +1338,131 @@ bool vmm::find_process_by_prefix(const char* prefix, vmm::Target& t) {
     while (cur && cur != head && n < 4096) {
         uint64_t e = cur - vmm::g_off.links;
         ++n;
-        char name[15] = {};
-        if (vmm::kread_trusted(e + vmm::g_off.image, name, 14) &&
-            !strncmp(name, prefix, 14)) {
+        char name[16] = {};
+        if (vmm::kread_trusted(e + vmm::g_off.image, name, sizeof(name) - 1) &&
+            strncmp(name, prefix, strlen(prefix) < 14 ? strlen(prefix) : 14) == 0) {
             uint64_t pid = 0;
             if (kq(e + vmm::g_off.pid, pid) && pid >= 0x64 && pid < 0x100000) {
                 ++matches;
-                t.eproc = e;
-                t.pid = static_cast<uint32_t>(pid);
-                // DTB comes from fill_target() after RPM is opened
-                return true;   // first name match, defer PEB/LDR to fill_target()
+                ProcessCandidate c{};
+                c.eproc = e;
+                c.pid = static_cast<uint32_t>(pid);
+                strncpy(c.image, name, sizeof(c.image) - 1);
+                uint64_t section_base = 0;
+                if (query_target_metadata(c.pid, c.working_set, c.create_time) &&
+                    vmm::kread_trusted(e + sb_off, &section_base, 8) && section_base &&
+                    vmm::kread_trusted(e + vmm::g_lay.dtb, &c.dtb, 8) && c.dtb) {
+                    out.push_back(c);
+                }
             }
         }
         if (!vmm::kread_trusted(cur, &cur, 8)) break;
     }
-    printf("[vmm] walked %d processes, %d name matches\n", n, matches);
+    printf("[vmm] walked %d processes, %d %s matches\n", n, matches, prefix);
     if (n < 50) printf("[vmm] WARN: short walk - links offset wrong\n");
-    if (n >= 50 && !matches) printf("[vmm] WARN: no match - process may be unlinked\n");
+    return !out.empty();
+}
+
+// EPROCESS'tan SectionBaseAddress'ini oku (KPROCESS.SectionBaseAddress, +0x520).
+// KPROCESS.SectionBaseAddress offsetini PsGetProcessSectionBaseAddress
+// sökümünden çöz: 48 8B 81/89 disp32 (mov rax,[rcx+disp32]) + C3.
+static uint64_t section_base_offset() {
+    static uint64_t cached = 0;
+    if (cached) return cached;
+    uint64_t rva = 0;
+    if (!vmm::export_rva("PsGetProcessSectionBaseAddress", rva)) {
+        printf("[!] PsGetProcessSectionBaseAddress export not found\n");
+        return 0;
+    }
+    if (!vmm::g_ntos || rva + 16 > vmm::g_ntos_size) return 0;
+    uint8_t b[16]{};
+    if (!vmm::kread_trusted(vmm::g_ntos + rva, b, sizeof(b))) return 0;
+    printf("[vmm] PsGetProcessSectionBaseAddress bytes: "
+           "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    if (b[0] == 0x48 && b[1] == 0x8B && (b[2] == 0x81 || b[2] == 0x89)) {
+        uint32_t d = 0;
+        memcpy(&d, b + 3, 4);
+        if (d >= 0x100 && d < 0x1000) cached = d;
+    }
+    return cached;
+}
+
+static bool read_section_base(uint64_t eproc, uint64_t& base_out) {
+    uint64_t off_sb = section_base_offset();
+    if (!off_sb) off_sb = off::Eproc_SectionBase;
+    uint64_t sb = 0;
+    if (!vmm::kread_trusted(eproc + off_sb, &sb, 8)) {
+        printf("[!] SectionBaseAddress kread failed at 0x%llx\n",
+               (unsigned long long)(eproc + off_sb));
+        return false;
+    }
+    printf("[vmm] SectionBaseAddress raw=0x%llx (offset 0x%llx)\n",
+           (unsigned long long)sb, (unsigned long long)off_sb);
+    if (sb < vmm::kUserLo || sb > vmm::kUserHi || (sb & 7)) return false;
+    base_out = sb;
+    return true;
+}
+
+// Imaj dogrulama: MZ + PE + SizeOfImage + offset < SizeOfImage.
+static bool validate_image_base(uint64_t base, uint64_t dtb, uint64_t& size_out) {
+    uint16_t mz = 0;
+    if (!read_user_va(dtb, base, &mz, 2) || mz != 0x5A4D) return false;
+
+    uint32_t lfanew = 0;
+    if (!read_user_va(dtb, base + 0x3C, &lfanew, 4)) return false;
+    if (lfanew < 0x40 || lfanew > 0x1000) return false;
+
+    uint16_t magic = 0;
+    if (!read_user_va(dtb, base + lfanew + 0x18, &magic, 2)) return false;
+    if (magic != 0x20B) return false;  // PE32+
+
+    uint32_t size = 0;
+    if (!read_user_va(dtb, base + lfanew + 0x50, &size, 4)) return false;  // PE32+ SizeOfImage (optional+0x38)
+    if (size < 0x1000 || size > (1u << 30)) return false;  // Fortnite ~456 MB
+
+    size_out = size;
+    return true;
+}
+
+bool vmm::find_process_by_prefix(const char* prefix, vmm::Target& t) {
+    std::vector<ProcessCandidate> cands;
+    if (!find_processes_by_prefix(prefix, cands)) return false;
+
+    print_fortnite_windows();
+
+    size_t best = 0;
+    for (size_t i = 1; i < cands.size(); ++i) {
+        if (cands[i].working_set > cands[best].working_set) best = i;
+    }
+    if (cands.size() > 1) {
+        for (const auto& c : cands) {
+            printf("[pick] contender pid=%u ws=%llu MB\n",
+                   c.pid, (unsigned long long)(c.working_set / 1024 / 1024));
+        }
+    }
+
+    const auto& c = cands[best];
+    printf("[pick] pid=%u ws=%llu MB name=FortniteClient-Win64-Shipping.exe\n",
+           c.pid, (unsigned long long)(c.working_set / 1024 / 1024));
+    printf("[vmm] candidate pid=%u eproc=0x%llx dtb=0x%llx image='%s'\n",
+           c.pid, (unsigned long long)c.eproc, (unsigned long long)c.dtb, c.image);
+    print_process_details(c.pid);
+    if (fill_target(c.eproc, c.pid, t)) {
+        t.create_time = c.create_time;
+        printf("[vmm] selected pid=%u base=0x%llx size=0x%llx\n",
+               t.pid, (unsigned long long)t.base, (unsigned long long)t.size);
+        return true;
+    }
+    printf("[vmm] selected process failed image validation\n");
     return false;
 }
 
 bool vmm::attach() {
     reset_fail_count();
     Target t{};
+    // fill_target() opens the RPM handle for the selected pid (rpm backend).
     if (!find_process_by_prefix("FortniteClient-", t)) return false;
-
-    // Open RPM for user-space VA reads before PEB/LDR discovery.
-    // read_user_va() dispatches to mem::read() when rpm backend is active.
-    if (mem::active() == mem::backend::rpm && !mem::open_rpm(t.pid)) return false;
-
-    // PEB/LDR discovery via mem::read() (rpm) or read_cr3() (phys walk).
-    if (!fill_target(t.eproc, t.pid, t)) return false;
 
     // Capa 2: ntoskrnl base'i hedef CR3 altinda MZ ile karsilanmali.
     // read_cr3() fisik sayfa tablosu yaylasar. pm::read (PTE self-map remap)

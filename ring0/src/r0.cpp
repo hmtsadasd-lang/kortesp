@@ -99,8 +99,13 @@ bool do_read(uint64_t pa, void* out, size_t len) {
     memcpy(buf.data() + 0x08, &pa, 8);
     DWORD got = 0;
     if (!DeviceIoControl(g_dev, kPhysRead, buf.data(), (DWORD)buf.size(),
-                         buf.data(), (DWORD)buf.size(), &got, nullptr))
+                         buf.data(), (DWORD)buf.size(), &got, nullptr)) {
+        const DWORD err = GetLastError();
+        printf("[rd] backend=phys-ioctl pa=0x%llx err=%lu got=%lu/%zu\n",
+               (unsigned long long)pa, (unsigned long)err, (unsigned long)got, len);
+        SetLastError(err);
         return false;
+    }
     memcpy(out, buf.data() + kPhysHdr, len);
     return true;
 }

@@ -1,0 +1,31 @@
+fortesp ring0
+[r0] direction proven: 0x9B0C1F40=read 0x9B0C1F44=write
+[+] driver ok
+[+] physical map: 5 range(s), 0x3ed87e000 usable bytes (loader list)
+[+] kernel-VA read path proven
+[+] ntoskrnl base 0xfffff802ea800000 size 0x1450000
+[vmm] offsets pid=0x1D0 links=0x1D8 image=0x338
+[*] pte base candidate 0xffff918000000000 (18 of 18 site(s))
+[+] pte base self-map proof: private VA 0x150ad890000 -> pte 0x80000003c88bd867 -> pa 0x3c88bd000
+[+] PTE self-map base 0xffff918000000000 (validated)
+[+] kernel CR3 0x1ae000 (EPROCESS +0x28, stored 0x00000000001ae000)
+[vmm] walked 366 processes, 1 FortniteClient- matches
+[vmm]  window hwnd=0x260b7c pid=8240 title='C:\dev\fortesp\ring0\out\FortniteClient-Test.exe' class='ConsoleWindowClass'
+[vmm]  window hwnd=0x20ef4 pid=3564 title='Fortnite CR3 IOCTL hardening · OpenCode' class='Chrome_WidgetWin_1'
+[vmm]  window hwnd=0x409d0 pid=1388 title='Epic Games Launcher' class='UnrealWindow'
+[vmm] candidate pid=8240 eproc=0xffffe109b27c7080 dtb=0x1b5e5000 image='FortniteClient'
+[vmm]  ppid=16240 threads=1 exe='FortniteClient-Test.exe'
+[vmm]  path='C:\dev\fortesp\ring0\out\FortniteClient-Test.exe'
+[vmm]  working_set=0x64d000
+[vmm] PsGetProcessSectionBaseAddress bytes: 48 8b 81 b0 02 00 00 c3
+[vmm] SectionBaseAddress raw=0x7ff660c30000 (offset 0x2b0)
+[vmm] SectionBaseAddress=0x7ff660c30000 size=0x6f000 (MZ/PE32+ ok)
+[!] read_user_va RPM failed: va=0x20103a2d018 len=8 GetLastError=299 VQEx=48 State=FREE Type=? Protect=0x1 AllocBase=0x0 RegionSize=0x5372443000
+[!] read_user_va RPM failed: va=0x2010372d018 len=8 GetLastError=299 VQEx=48 State=FREE Type=? Protect=0x1 AllocBase=0x0 RegionSize=0x5372743000
+[!] read_user_va RPM failed: va=0x50 len=8 GetLastError=299 VQEx=48 State=FREE Type=? Protect=0x1 AllocBase=0x0 RegionSize=0x7ffe0000
+[!] read_user_va RPM failed: va=0x7fffffff0018 len=8 GetLastError=998 VQEx=0 State=? Type=? Protect=0x0 AllocBase=0x0 RegionSize=0x0
+[!] read_user_va RPM failed: va=0x10300000018 len=8 GetLastError=299 VQEx=48 State=FREE Type=? Protect=0x1 AllocBase=0x0 RegionSize=0x15175e70000
+[!] PEB/LDR module not found
+[!] GEngine off 0x1c8e2f48 >= SizeOfImage 0x6f000 - aday elendi
+[vmm] no candidate passed image validation
+[!] Fortnite not found

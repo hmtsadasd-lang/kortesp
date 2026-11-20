@@ -75,6 +75,7 @@ struct Target {
     uint64_t cr3{};
     uint64_t base{};
     uint64_t size{};
+    uint64_t create_time{};
     bool     peb_ok{};
 };
 extern Target g_target;
@@ -152,6 +153,7 @@ void shutdown();
 bool attach();
 void detach();
 bool attached();
+bool ensure_attached();
 uint32_t  pid();
 uint64_t  base();
 uint64_t  size();
